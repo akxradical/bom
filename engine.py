@@ -1,1143 +1,830 @@
 """
-Automated BOM Generation System v2.0
-7-page Streamlit app with full learning system
-Author: Ayush Kamle
+BOM Generation Engine v2.0
+──────────────────────────
+Tier 1  : Exact / close match from Pump_Master_List database
+Tier 2  : Physics-backed classification + material selection
+Learning: Feedback logger, pattern learner, classifier corrector,
+          weight calibrator — all persisted to learning_data.json
+
+Author  : Ayush Kamle
+Stack   : Pure Python — pandas, openpyxl, re, math, json
+No external ML libraries. No API keys.
 """
 
-import streamlit as st
+import os, re, math, json, datetime
 import pandas as pd
-import time
-import json
-from engine import (
-    load_db, extract_pdf_text, parse_specs,
-    generate_bom, export_bom_excel, calc_specific_speed,
-    get_store, log_feedback, log_correction, log_pattern,
-)
+from io import BytesIO
 
 # ─────────────────────────────────────────────────────────────────
-# PAGE CONFIG
+# PATHS
 # ─────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="BOM Generator",
-    page_icon="⚙️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+_DIR     = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(_DIR, "Component_Library_COMPLETE.xlsx")
+LRN_PATH = os.path.join(_DIR, "learning_data.json")
 
-# ─────────────────────────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-html,body,[class*="css"]{ font-family:'IBM Plex Sans',sans-serif; }
-#MainMenu,footer,header{ visibility:hidden; }
-.stApp{ background:#0d1117; color:#e6edf3; }
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 1 — DATABASE LOADER
+# ═══════════════════════════════════════════════════════════════════
 
-[data-testid="stSidebar"]{
-    background:#161b22;
-    border-right:1px solid #30363d;
+def load_db():
+    return {
+        "pumps":      pd.read_excel(DB_PATH, sheet_name="Pump_Master_List"),
+        "comps":      pd.read_excel(DB_PATH, sheet_name="Component_Library"),
+        "mats":       pd.read_excel(DB_PATH, sheet_name="Material_Database"),
+        "vendors":    pd.read_excel(DB_PATH, sheet_name="Vendor_Database"),
+        "bom_tpl":    pd.read_excel(DB_PATH, sheet_name="BOM_Templates",          header=4),
+        "physics":    pd.read_excel(DB_PATH, sheet_name="Physics_Parameters",     header=4),
+        "mat_compat": pd.read_excel(DB_PATH, sheet_name="Material_Compatibility", header=4),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 2 — LEARNING DATA STORE
+# ═══════════════════════════════════════════════════════════════════
+
+_DEFAULT = {
+    "feedback":      [],
+    "patterns":      [],
+    "corrections":   [],
+    "weight_calibs": {},
+    "stats": {
+        "total_sessions": 0,
+        "tier1_hits":     0,
+        "tier2_hits":     0,
+        "corrections":    0,
+        "patterns_added": 0,
+    },
 }
 
-/* cards */
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-.card-green{background:#0d1f0d;border:1px solid #238636;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-.card-blue{background:#0d1b2a;border:1px solid #1f6feb;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-.card-orange{background:#1f1200;border:1px solid #d29922;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-.card-red{background:#1f0d0d;border:1px solid #da3633;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-.card-purple{background:#130d1f;border:1px solid #8957e5;border-radius:8px;padding:20px 24px;margin-bottom:16px;}
-
-/* metric tiles */
-.metric-tile{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;text-align:center;}
-.metric-value{font-family:'IBM Plex Mono',monospace;font-size:26px;font-weight:600;color:#58a6ff;}
-.metric-label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;margin-top:4px;}
-
-/* tier badges */
-.badge-t1{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;background:#0d4429;color:#3fb950;border:1px solid #238636;font-family:'IBM Plex Mono',monospace;}
-.badge-t2{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;background:#0d1b2a;color:#79c0ff;border:1px solid #1f6feb;font-family:'IBM Plex Mono',monospace;}
-.badge-learn{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;background:#130d1f;color:#d2a8ff;border:1px solid #8957e5;font-family:'IBM Plex Mono',monospace;}
-
-.sec-hdr{font-size:12px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;border-bottom:1px solid #30363d;padding-bottom:6px;}
-.spec-tag{display:inline-block;background:#1f2937;border:1px solid #374151;border-radius:4px;padding:2px 8px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#60a5fa;margin:2px;}
-.kv-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #21262d;}
-.kv-lbl{color:#8b949e;font-size:12px;}
-.kv-val{color:#e6edf3;font-family:'IBM Plex Mono',monospace;font-size:12px;}
-.kv-val-blue{color:#58a6ff;font-family:'IBM Plex Mono',monospace;font-size:12px;}
-
-.logo-text{font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;color:#58a6ff;}
-.logo-sub{font-size:10px;color:#8b949e;letter-spacing:1.5px;text-transform:uppercase;}
-
-.stButton>button{background:#238636;color:white;border:none;border-radius:6px;font-weight:500;width:100%;}
-.stButton>button:hover{background:#2ea043;}
-.stDownloadButton>button{background:#1f6feb;color:white;border:none;border-radius:6px;font-weight:500;width:100%;}
-
-[data-testid="stFileUploader"]{background:#161b22;border:2px dashed #30363d;border-radius:8px;}
-.stTextInput input,.stNumberInput input,.stSelectbox select{background:#161b22!important;border:1px solid #30363d!important;color:#e6edf3!important;border-radius:6px!important;font-family:'IBM Plex Mono',monospace!important;}
-.stTabs [data-baseweb="tab"]{background:transparent;color:#8b949e;}
-.stTabs [aria-selected="true"]{color:#58a6ff;border-bottom:2px solid #58a6ff;}
-
-/* learning bar */
-.lrn-bar-bg{background:#21262d;border-radius:4px;height:8px;margin-top:4px;}
-.lrn-bar-fill{background:#3fb950;border-radius:4px;height:8px;}
-</style>
-""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────
-# SESSION STATE
-# ─────────────────────────────────────────────────────────────────
-def _init():
-    D = {
-        "page":          "upload",
-        "specs":         {},
-        "raw_text":      "",
-        "pdf_name":      "",
-        "bom_df":        None,
-        "tier":          None,
-        "match_info":    None,
-        "calc_summary":  None,
-        "db":            None,
-        "store":         None,
-        "confirmed":     False,
-    }
-    for k, v in D.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-_init()
-
-
-# ─────────────────────────────────────────────────────────────────
-# CACHED LOADERS
-# ─────────────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def _load_db():
-    return load_db()
-
-def _kv(label, val, blue=False):
-    cls = "kv-val-blue" if blue else "kv-val"
-    st.markdown(
-        f'<div class="kv-row"><span class="kv-lbl">{label}</span>'
-        f'<span class="{cls}">{val}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-def _metric(label, value):
-    return (
-        f'<div class="metric-tile">'
-        f'<div class="metric-value">{value}</div>'
-        f'<div class="metric-label">{label}</div>'
-        f'</div>'
-    )
-
-
-# ─────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="logo-text">⚙ BOM GEN</div>', unsafe_allow_html=True)
-    st.markdown('<div class="logo-sub">Automated Bill of Materials v2.0</div>',
-                unsafe_allow_html=True)
-    st.markdown("---")
-
-    pages = {
-        "upload":   "📄  Upload Datasheet",
-        "review":   "🔍  Review Specs",
-        "generate": "⚙️   Generate BOM",
-        "output":   "📋  BOM Output",
-        "learn":    "🧠  Confirm & Learn",
-        "stats":    "📊  Learning Stats",
-        "database": "🗄️   Database Explorer",
-    }
-    for pid, lbl in pages.items():
-        active = st.session_state.page == pid
-        if st.button(lbl, key=f"nav_{pid}",
-                     use_container_width=True,
-                     type="primary" if active else "secondary"):
-            st.session_state.page = pid
-            st.rerun()
-
-    st.markdown("---")
-
-    try:
-        db    = _load_db()
-        store = get_store()
-        st.session_state.db    = db
-        st.session_state.store = store
-
-        st.markdown(
-            f'<div style="font-size:11px;color:#8b949e;line-height:2.2;">'
-            f'<b style="color:#58a6ff">{len(db["pumps"])}</b> pumps in database<br>'
-            f'<b style="color:#58a6ff">{len(db["comps"])}</b> components catalogued<br>'
-            f'<b style="color:#3fb950">{store["stats"]["total_sessions"]}</b> sessions confirmed<br>'
-            f'<b style="color:#d2a8ff">{store["stats"]["corrections"]}</b> corrections learned<br>'
-            f'<b style="color:#d2a8ff">{store["stats"]["patterns_added"]}</b> patterns added'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-    except Exception as e:
-        st.error(f"DB error: {e}")
-
-    st.markdown("---")
-    st.markdown(
-        '<div style="font-size:10px;color:#484f58;text-align:center;">'
-        'Rule-Based Classification Engine<br>'
-        'Physics-Backed BOM Generator<br>'
-        'Learning System v2.0</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 1 — UPLOAD
-# ═══════════════════════════════════════════════════════════════════
-if st.session_state.page == "upload":
-    st.markdown("## 📄 Upload Equipment Datasheet")
-
-    col1, col2 = st.columns([3, 2])
-
-    with col1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">PDF Upload</div>', unsafe_allow_html=True)
-
-        uploaded = st.file_uploader(
-            "Drop a pump datasheet or GA drawing PDF",
-            type=["pdf"],
-            help="Digital PDFs work best. Scanned drawings — use Manual Entry.",
-        )
-        if uploaded:
-            st.session_state.pdf_name = uploaded.name
-            with st.spinner("Extracting text from PDF..."):
-                text, err = extract_pdf_text(uploaded.read())
-
-            if err:
-                st.error(f"PDF read error: {err}")
-            elif not text.strip():
-                st.warning("No text extracted — scanned PDF. Use Manual Entry →")
-            else:
-                st.success(f"✅ Extracted {len(text.split())} words")
-                st.session_state.raw_text = text
-
-                store = st.session_state.store or get_store()
-                learned_pats = store.get("patterns", [])
-
-                with st.spinner("Parsing specifications..."):
-                    specs = parse_specs(text, learned_pats)
-                st.session_state.specs = specs
-
-                found = {k: v for k, v in specs.items() if v is not None}
-                st.markdown("**Extracted specs:**")
-                for k, v in found.items():
-                    st.markdown(
-                        f'<span class="spec-tag">{k}: {v}</span>',
-                        unsafe_allow_html=True,
-                    )
-
-                if st.button("Continue to Review →", type="primary"):
-                    st.session_state.page = "review"
-                    st.rerun()
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">Manual Entry</div>', unsafe_allow_html=True)
-
-        with st.form("manual"):
-            flow  = st.number_input("Flow (m³/h)",  min_value=0.0, step=1.0)
-            head  = st.number_input("Head (m)",      min_value=0.0, step=1.0)
-            speed = st.number_input("Speed (RPM)",   min_value=0,   value=1450, step=50)
-            motor = st.number_input("Motor (kW)",    min_value=0.0, step=1.0)
-            temp  = st.number_input("Temp (°C)",     min_value=0.0, value=30.0, step=5.0)
-            fluid = st.selectbox("Fluid", [
-                "Clear Water","Caustic Liquor (Alumina)",
-                "Live Steam Condensate","Process Condensate",
-                "Slurry","Dilute Sulphuric Acid","Crude Oil",
-                "Seawater","Cooling Water","Boiler Feed Water",
-            ])
-            model  = st.text_input("Model (optional)")
-            stages = st.number_input("Stages", min_value=1, value=1)
-            sub    = st.form_submit_button("Use These Specs →")
-            if sub:
-                dens = {
-                    "Clear Water":1000,"Caustic Liquor (Alumina)":1244,
-                    "Live Steam Condensate":930,"Process Condensate":990,
-                    "Slurry":1300,"Dilute Sulphuric Acid":1050,
-                    "Crude Oil":870,"Seawater":1025,
-                    "Cooling Water":998,"Boiler Feed Water":950,
-                }.get(fluid,1000)
-                st.session_state.specs = {
-                    "flow_m3h":    flow  or None,
-                    "head_m":      head  or None,
-                    "speed_rpm":   speed or None,
-                    "motor_kw":    motor or None,
-                    "temp_c":      temp,
-                    "fluid":       fluid,
-                    "density_kgm3":dens,
-                    "stages":      stages,
-                    "model":       model.strip() or None,
-                }
-                st.session_state.page = "review"
-                st.rerun()
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 2 — REVIEW SPECS
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "review":
-    st.markdown("## 🔍 Review & Confirm Specifications")
-
-    specs = st.session_state.specs
-    if not specs:
-        st.warning("No specs loaded.")
-        if st.button("← Back to Upload"):
-            st.session_state.page = "upload"
-            st.rerun()
-        st.stop()
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown('<div class="card-blue">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">Hydraulic Parameters</div>', unsafe_allow_html=True)
-        flow  = st.number_input("Flow Rate (m³/h) *",
-                    value=float(specs.get("flow_m3h") or 0.0), min_value=0.0, step=1.0)
-        head  = st.number_input("Total Head (m) *",
-                    value=float(specs.get("head_m") or 0.0),   min_value=0.0, step=1.0)
-        speed = st.number_input("Speed (RPM)",
-                    value=int(specs.get("speed_rpm") or 1450),  min_value=0, step=50)
-        motor = st.number_input("Motor Power (kW)",
-                    value=float(specs.get("motor_kw") or 0.0), min_value=0.0, step=1.0)
-
-        if flow > 0 and head > 0:
-            Ns = calc_specific_speed(flow, head, speed or 1450)
-            cls_txt = ("Radial — HSC type" if Ns < 1500
-                       else "Mixed flow — VTP type" if Ns < 4000
-                       else "Axial flow")
-            st.markdown(
-                f'<div style="margin-top:10px;padding:10px;background:#0d1f0d;'
-                f'border-radius:6px;border:1px solid #238636;">'
-                f'<span style="color:#3fb950;font-family:IBM Plex Mono;font-size:13px;">'
-                f'Ns = {Ns:.0f} (US units)</span><br>'
-                f'<span style="color:#8b949e;font-size:11px;">{cls_txt}</span></div>',
-                unsafe_allow_html=True,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div class="card-blue">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">Service Parameters</div>', unsafe_allow_html=True)
-        fluid_opts = [
-            "Clear Water","Caustic Liquor (Alumina)",
-            "Live Steam Condensate","Process Condensate",
-            "Slurry","Dilute Sulphuric Acid","Crude Oil",
-            "Seawater","Cooling Water","Boiler Feed Water","Other",
-        ]
-        cur_fluid = specs.get("fluid","Clear Water")
-        if cur_fluid not in fluid_opts:
-            fluid_opts.insert(0, cur_fluid)
-        fluid  = st.selectbox("Fluid / Service",
-                     fluid_opts, index=fluid_opts.index(cur_fluid))
-        temp   = st.number_input("Operating Temperature (°C)",
-                     value=float(specs.get("temp_c") or 30.0), min_value=0.0, step=5.0)
-        dens_d = {"Clear Water":1000,"Caustic Liquor (Alumina)":1244,
-                  "Live Steam Condensate":930,"Process Condensate":990,
-                  "Slurry":1300,"Dilute Sulphuric Acid":1050,
-                  "Crude Oil":870,"Seawater":1025}
-        dens   = st.number_input("Fluid Density (kg/m³)",
-                     value=float(specs.get("density_kgm3") or dens_d.get(fluid,1000)),
-                     min_value=500.0, step=10.0)
-        stages = st.number_input("No. of Stages",
-                     value=int(specs.get("stages") or 1), min_value=1)
-        model  = st.text_input("Pump Model (optional)",
-                     value=str(specs.get("model") or ""))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Preview Tier 1 match
-    db = st.session_state.db
-    if db:
-        from engine import tier1_match
-        test = {"flow_m3h":flow or None,"head_m":head or None,
-                "model":model,"fluid":fluid}
-        pr, ps, pt = tier1_match(test, db)
-        if pr is not None and ps >= 30:
-            st.markdown(
-                f'<div class="card-green">'
-                f'<span class="badge-t1">TIER 1 — DATABASE MATCH</span>&nbsp;&nbsp;'
-                f'<b style="color:#3fb950">{pr["Model"]}</b><br>'
-                f'<span style="color:#8b949e;font-size:12px;">'
-                f'Score: {ps}/100 | Type: {pt}</span></div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="card-blue">'
-                '<span class="badge-t2">TIER 2 — PHYSICS MODE</span><br>'
-                '<span style="color:#8b949e;font-size:12px;">'
-                'No database match — BOM will be calculated from engineering formulas.'
-                '</span></div>',
-                unsafe_allow_html=True,
-            )
-
-    ca, cb = st.columns(2)
-    with ca:
-        if st.button("← Back", use_container_width=True):
-            st.session_state.page = "upload"
-            st.rerun()
-    with cb:
-        if st.button("Generate BOM →", type="primary", use_container_width=True):
-            st.session_state.specs = {
-                "flow_m3h":    float(flow)  if flow  > 0 else None,
-                "head_m":      float(head)  if head  > 0 else None,
-                "speed_rpm":   int(speed)   if speed > 0 else None,
-                "motor_kw":    float(motor) if motor > 0 else None,
-                "temp_c":      float(temp),
-                "fluid":       str(fluid),
-                "density_kgm3":float(dens),
-                "stages":      int(stages),
-                "model":       model.strip() or None,
-            }
-            st.session_state.confirmed = False
-            st.session_state.page = "generate"
-            st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 3 — GENERATE
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "generate":
-    st.markdown("## ⚙️ Generating BOM...")
-
-    specs = st.session_state.specs
-    db    = st.session_state.db
-    store = st.session_state.store or get_store()
-
-    if not specs or not db:
-        st.error("Missing specs or database.")
-        st.stop()
-
-    prog   = st.progress(0)
-    status = st.empty()
-
-    steps = [
-        (10,  "Loading database..."),
-        (25,  "Checking database for exact match..."),
-        (50,  "Calculating specific speed & pump type..."),
-        (65,  "Checking learned corrections..."),
-        (80,  "Selecting materials from compatibility matrix..."),
-        (92,  "Building BOM from templates..."),
-        (100, "Complete ✓"),
-    ]
-    for pct, msg in steps:
-        prog.progress(pct)
-        status.markdown(
-            f'<p style="color:#8b949e;font-family:IBM Plex Mono;font-size:13px;">'
-            f'{msg}</p>',
-            unsafe_allow_html=True,
-        )
-        time.sleep(0.25)
-
-    try:
-        bom, tier, mi, cs = generate_bom(specs, db, store)
-        st.session_state.bom_df       = bom
-        st.session_state.tier         = tier
-        st.session_state.match_info   = mi
-        st.session_state.calc_summary = cs
-        st.success(
-            f"✅ BOM generated — {len(bom)} components | "
-            f"{'Tier 1 (Database Match)' if tier=='tier1' else 'Tier 2 (Physics Calculated)'}"
-        )
-        time.sleep(0.4)
-        st.session_state.page = "output"
-        st.rerun()
-    except Exception as e:
-        import traceback
-        st.error(f"Generation error: {e}")
-        st.code(traceback.format_exc())
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 4 — BOM OUTPUT
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "output":
-
-    bom  = st.session_state.bom_df
-    tier = st.session_state.tier
-    mi   = st.session_state.match_info
-    cs   = st.session_state.calc_summary
-    specs= st.session_state.specs
-
-    if bom is None:
-        st.warning("No BOM yet.")
-        st.stop()
-
-    st.markdown("## 📋 Bill of Materials")
-
-    if tier == "tier1":
-        st.markdown(
-            f'<div class="card-green">'
-            f'<span class="badge-t1">TIER 1 — DATABASE MATCH</span>&nbsp;&nbsp;'
-            f'<b style="color:#3fb950;font-size:14px;">{mi["model"]}</b><br>'
-            f'<span style="color:#8b949e;font-size:12px;">'
-            f'Score: {mi["score"]}/100 | Type: {mi["match_type"]} | ID: {mi["pump_id"]}'
-            f'</span></div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        lrn_note = " | <span style='color:#d2a8ff'>⚡ Learned correction applied</span>" \
-                   if (cs or {}).get("learned_correction") else ""
-        st.markdown(
-            f'<div class="card-blue">'
-            f'<span class="badge-t2">TIER 2 — PHYSICS CALCULATED</span>&nbsp;&nbsp;'
-            f'<b style="color:#79c0ff;font-size:14px;">{(cs or {}).get("pump_type","")}</b><br>'
-            f'<span style="color:#8b949e;font-size:12px;">'
-            f'Ns = {(cs or {}).get("specific_speed_Ns","")} | '
-            f'Template: {(cs or {}).get("template_used","")} | '
-            f'Seal: {(cs or {}).get("seal_plan","")}'
-            f'{lrn_note}</span></div>',
-            unsafe_allow_html=True,
-        )
-
-    # Metrics row
-    wts  = (cs or {}).get("weights", {})
-    mkw  = specs.get("motor_kw") or (cs or {}).get("motor_kw_calc","—")
-    tw   = wts.get("total_kg","—") if wts else "—"
-
-    cols = st.columns(5)
-    for col, (lbl, val) in zip(cols, [
-        ("Components",   len(bom)),
-        ("Flow",         f"{specs.get('flow_m3h','—')} m³/h"),
-        ("Head",         f"{specs.get('head_m','—')} m"),
-        ("Motor",        f"{mkw} kW"),
-        ("Total Weight", f"{tw} kg"),
-    ]):
-        col.markdown(
-            f'<div class="metric-tile">'
-            f'<div class="metric-value">{val}</div>'
-            f'<div class="metric-label">{lbl}</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-
-    tab1, tab2, tab3 = st.tabs(["📋 BOM Table", "📊 Summary", "🔧 Calculations"])
-
-    with tab1:
-        fc1, fc2 = st.columns([2, 2])
-        with fc1:
-            cats = ["All"] + sorted(bom["Category"].dropna().unique().tolist()) \
-                   if "Category" in bom.columns else ["All"]
-            cat_f = st.selectbox("Category", cats)
-        with fc2:
-            req_col = "Req_Type" if "Req_Type" in bom.columns else None
-            if req_col:
-                reqs  = ["All"] + sorted(bom[req_col].dropna().unique().tolist())
-                req_f = st.selectbox("Required Type", reqs)
-            else:
-                req_f = "All"
-
-        disp = bom.copy()
-        if cat_f != "All" and "Category" in disp.columns:
-            disp = disp[disp["Category"] == cat_f]
-        if req_f != "All" and req_col:
-            disp = disp[disp[req_col] == req_f]
-
-        key_cols = ["No","Component_ID","Category","Description",
-                    "MOC","Material_Spec","Qty","Qty_Per_Unit",
-                    "Weight_kg","Vendor_Name","Req_Type","Source"]
-        show = [c for c in key_cols if c in disp.columns]
-        st.dataframe(disp[show], use_container_width=True, height=430, hide_index=True)
-        st.caption(f"{len(disp)} of {len(bom)} components shown")
-
-    with tab2:
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Input Specifications</div>',
-                        unsafe_allow_html=True)
-            for k, v in {
-                "Flow":        f"{specs.get('flow_m3h','—')} m³/h",
-                "Head":        f"{specs.get('head_m','—')} m",
-                "Speed":       f"{specs.get('speed_rpm','—')} rpm",
-                "Motor":       f"{specs.get('motor_kw','—')} kW",
-                "Temperature": f"{specs.get('temp_c','—')} °C",
-                "Fluid":       specs.get('fluid','—'),
-                "Density":     f"{specs.get('density_kgm3','—')} kg/m³",
-                "Stages":      specs.get('stages','—'),
-            }.items():
-                _kv(k, v)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with sc2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Weight Breakdown</div>',
-                        unsafe_allow_html=True)
-            if wts:
-                for k, v in wts.items():
-                    _kv(k.replace("_"," ").title(), f"{v} kg", blue=True)
-            else:
-                st.markdown('<p style="color:#8b949e;font-size:12px;">'
-                            'Weight from database record.</p>',
-                            unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with tab3:
-        if tier == "tier2" and cs:
-            sc1, sc2 = st.columns(2)
-            with sc1:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown('<div class="sec-hdr">Engineering Calculation Trace</div>',
-                            unsafe_allow_html=True)
-                for k, v in {
-                    "Specific Speed (Ns)":    cs.get("specific_speed_Ns","—"),
-                    "Pump Classification":    cs.get("pump_type","—"),
-                    "Template Used":          cs.get("template_used","—"),
-                    "Motor kW (calculated)":  f"{cs.get('motor_kw_calc','—')} kW",
-                    "Pump Efficiency":        f"{cs.get('eta_pump_assumed','—')}%",
-                    "Learned Correction":     cs.get("learned_correction","None applied"),
-                }.items():
-                    _kv(k, str(v), blue=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with sc2:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.markdown('<div class="sec-hdr">Material Selection</div>',
-                            unsafe_allow_html=True)
-                _kv("Material Rule",  cs.get("material_rule","—"))
-                _kv("Fluid Matched",  cs.get("fluid_matched","—"))
-                moc = cs.get("moc", {})
-                for k, v in {
-                    "Casing":       moc.get("Casing_MOC","—"),
-                    "Impeller":     moc.get("Impeller_MOC","—"),
-                    "Shaft":        moc.get("Shaft_MOC","—"),
-                    "Shaft Sleeve": moc.get("Shaft_Sleeve_MOC","—"),
-                    "Seal Plan":    moc.get("Seal_Plan","—"),
-                }.items():
-                    _kv(k, str(v))
-                st.markdown("</div>", unsafe_allow_html=True)
-        else:
-            st.markdown(
-                '<div class="card-green">'
-                '<b style="color:#3fb950">Tier 1 — Direct database lookup.</b><br>'
-                '<span style="color:#8b949e;font-size:13px;">'
-                'BOM retrieved from Component_Library. No physics calculation needed.'
-                '</span></div>',
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("---")
-
-    ec1, ec2, ec3 = st.columns([2, 2, 1])
-    with ec1:
+def get_store():
+    if os.path.exists(LRN_PATH):
         try:
-            buf = export_bom_excel(bom, specs, tier, mi, cs)
-            fn  = f"BOM_{specs.get('model','') or 'calculated'}_{pd.Timestamp.now().strftime('%d%b%Y')}.xlsx"
-            st.download_button("⬇ Download Excel", buf, fn,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
-        except Exception as e:
-            st.error(f"Export error: {e}")
-    with ec2:
-        csv = bom.to_csv(index=False)
-        st.download_button("⬇ Download CSV", csv,
-            f"BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.csv",
-            "text/csv", use_container_width=True)
-    with ec3:
-        if st.button("🧠 Confirm & Learn", use_container_width=True):
-            st.session_state.page = "learn"
-            st.rerun()
+            with open(LRN_PATH) as f:
+                data = json.load(f)
+            for k, v in _DEFAULT.items():
+                if k not in data:
+                    data[k] = v
+            return data
+        except Exception:
+            pass
+    return {k: (v.copy() if isinstance(v, dict) else list(v))
+            for k, v in _DEFAULT.items()}
 
-    if st.button("🔄 New BOM", use_container_width=False):
-        for k in ["specs","bom_df","tier","match_info","calc_summary",
-                  "raw_text","pdf_name","confirmed"]:
-            st.session_state[k] = {} if k == "specs" else None
-        st.session_state.page = "upload"
-        st.rerun()
+def _save(store):
+    try:
+        with open(LRN_PATH, "w") as f:
+            json.dump(store, f, indent=2, default=str)
+    except Exception:
+        pass
 
+# ── Public learning functions ────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 5 — CONFIRM & LEARN
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "learn":
-
-    bom  = st.session_state.bom_df
-    tier = st.session_state.tier
-    cs   = st.session_state.calc_summary
-    mi   = st.session_state.match_info
-    specs= st.session_state.specs
-
-    st.markdown("## 🧠 Confirm & Learn")
-    st.markdown(
-        '<p style="color:#8b949e;">Review the generated BOM. '
-        'Correct anything wrong. The system learns from your corrections '
-        'and improves future outputs.</p>',
-        unsafe_allow_html=True,
-    )
-
-    if bom is None:
-        st.warning("Generate a BOM first.")
-        st.stop()
-
-    if st.session_state.confirmed:
-        st.markdown(
-            '<div class="card-green">'
-            '<b style="color:#3fb950;font-size:15px;">✓ Session Confirmed & Saved</b><br>'
-            '<span style="color:#8b949e;font-size:13px;">'
-            'The learning store has been updated. View stats on the Learning Stats page.'
-            '</span></div>',
-            unsafe_allow_html=True,
-        )
-        if st.button("← Back to Output"):
-            st.session_state.page = "output"
-            st.rerun()
-        st.stop()
-
-    st.markdown('<div class="sec-hdr">Current BOM Summary</div>', unsafe_allow_html=True)
-    st.dataframe(
-        bom[["No","Category","Description","MOC","Qty","Weight_kg","Source"]
-            if all(c in bom.columns for c in ["Description","MOC"])
-            else bom.columns[:7]].head(10),
-        use_container_width=True, hide_index=True, height=280,
-    )
-
-    st.markdown("---")
-
-    # ── Section A: Confirm pump type ─────────────────────────────
-    st.markdown('<div class="card-purple">', unsafe_allow_html=True)
-    st.markdown(
-        '<span class="badge-learn">SECTION A</span>&nbsp;&nbsp;'
-        '<b style="color:#d2a8ff">Pump Type Confirmation</b>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    current_type = ((cs or {}).get("pump_type","") or
-                    (mi or {}).get("model","Unknown"))
-
-    pump_types = [
-        "Horizontal Split Casing",
-        "Horizontal Split Casing — High Head",
-        "Horizontal Slurry Pump",
-        "Vertical Turbine Pump",
-        "Vertical Turbine Pump VS6 (Condensate)",
-        "Vertical Sump Pump",
-        "Vertical Submersible",
-        "Multistage Centrifugal (BFW)",
-        "Other",
-    ]
-    if current_type and current_type not in pump_types:
-        pump_types.insert(0, current_type)
-
-    confirmed_type = st.selectbox(
-        "Confirm or correct the pump type classification:",
-        pump_types,
-        index=pump_types.index(current_type) if current_type in pump_types else 0,
-    )
-    type_notes = st.text_input("Notes on type correction (optional)",
-                               placeholder="e.g. Ns was 1600 but client specified HSC due to site layout")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Section B: MOC Confirmation ──────────────────────────────
-    st.markdown('<div class="card-purple">', unsafe_allow_html=True)
-    st.markdown(
-        '<span class="badge-learn">SECTION B</span>&nbsp;&nbsp;'
-        '<b style="color:#d2a8ff">Material of Construction Confirmation</b>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    moc_base = (cs or {}).get("moc", {}) or {}
-    bc1, bc2 = st.columns(2)
-    with bc1:
-        c_casing  = st.text_input("Casing MOC",
-            value=str(moc_base.get("Casing_MOC","ASTM A216 WCB")))
-        c_imp     = st.text_input("Impeller MOC",
-            value=str(moc_base.get("Impeller_MOC","CF8M SS316")))
-        c_shaft   = st.text_input("Shaft MOC",
-            value=str(moc_base.get("Shaft_MOC","EN19/SS410")))
-        c_seal    = st.text_input("Seal Plan",
-            value=str(moc_base.get("Seal_Plan","Plan 11")))
-    with bc2:
-        c_sleeve  = st.text_input("Shaft Sleeve MOC",
-            value=str(moc_base.get("Shaft_Sleeve_MOC","SS410")))
-        c_wring   = st.text_input("Wear Ring MOC",
-            value=str(moc_base.get("Wear_Ring_MOC","A487 CA6M")))
-        c_fastener= st.text_input("Fastener MOC",
-            value=str(moc_base.get("Fastener_MOC","A193 B7")))
-        c_seal_type=st.text_input("Seal Type",
-            value=str(moc_base.get("Seal_Type","Mechanical Seal")))
-
-    confirmed_moc = {
-        "Casing_MOC": c_casing, "Impeller_MOC": c_imp,
-        "Shaft_MOC": c_shaft,   "Shaft_Sleeve_MOC": c_sleeve,
-        "Wear_Ring_MOC": c_wring, "Seal_Plan": c_seal,
-        "Seal_Type": c_seal_type, "Fastener_MOC": c_fastener,
-    }
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Section C: Weight Confirmation ───────────────────────────
-    st.markdown('<div class="card-purple">', unsafe_allow_html=True)
-    st.markdown(
-        '<span class="badge-learn">SECTION C</span>&nbsp;&nbsp;'
-        '<b style="color:#d2a8ff">Weight Confirmation (calibrates future predictions)</b>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    wts_base = (cs or {}).get("weights", {}) or {}
-    wc1, wc2 = st.columns(2)
-    with wc1:
-        wp  = st.number_input("Actual Pump Weight (kg)",
-                value=float(wts_base.get("pump_kg",0) or 0), min_value=0.0, step=10.0)
-        wm  = st.number_input("Actual Motor Weight (kg)",
-                value=float(wts_base.get("motor_kg",0) or 0), min_value=0.0, step=10.0)
-    with wc2:
-        wb  = st.number_input("Actual Baseplate Weight (kg)",
-                value=float(wts_base.get("baseplate_kg",0) or 0), min_value=0.0, step=10.0)
-        wt  = st.number_input("Actual Total Package Weight (kg)",
-                value=float(wts_base.get("total_kg",0) or 0), min_value=0.0, step=10.0)
-
-    confirmed_weights = {
-        "pump_kg": wp or None, "motor_kg": wm or None,
-        "baseplate_kg": wb or None, "total_kg": wt or None,
-    }
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Section D: Parser pattern correction ─────────────────────
-    st.markdown('<div class="card-purple">', unsafe_allow_html=True)
-    st.markdown(
-        '<span class="badge-learn">SECTION D</span>&nbsp;&nbsp;'
-        '<b style="color:#d2a8ff">Teach Parser a New Pattern (optional)</b>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<p style="color:#8b949e;font-size:12px;">'
-        'If the PDF parser missed a value, teach it here. '
-        'Example: field=motor_kw, snippet="BKW 60.4", correct=60.4</p>',
-        unsafe_allow_html=True,
-    )
-    pc1, pc2, pc3 = st.columns(3)
-    with pc1:
-        p_field = st.selectbox("Field that was missed", [
-            "—", "flow_m3h","head_m","speed_rpm","motor_kw",
-            "temp_c","density_kgm3","stages",
-        ])
-    with pc2:
-        p_snippet = st.text_input("Text snippet from PDF",
-            placeholder="BKW 60.4 kW")
-    with pc3:
-        p_correct = st.text_input("Correct value",
-            placeholder="60.4")
-    p_notes = st.text_input("Notes", placeholder="BKW = shaft power in this manufacturer's format")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Engineer notes & confirm ──────────────────────────────────
-    eng_notes = st.text_area("General notes / observations (optional)",
-                    placeholder="Overall quality of BOM, what was wrong, any special observations...")
-
-    st.markdown("---")
-
-    # Type correction logging
-    if tier == "tier2" and cs:
-        orig_type = cs.get("pump_type","")
-        if confirmed_type != orig_type and orig_type:
-            st.markdown(
-                f'<div class="card-orange">'
-                f'⚠️ <b style="color:#d29922;">Type correction detected:</b><br>'
-                f'<span style="color:#8b949e;font-size:12px;">'
-                f'System said: <b>{orig_type}</b> → You corrected to: '
-                f'<b>{confirmed_type}</b><br>'
-                f'This will be remembered for similar duty points.</span></div>',
-                unsafe_allow_html=True,
-            )
-
-    col_conf, col_skip = st.columns(2)
-    with col_conf:
-        if st.button("✅ Confirm & Save to Learning Store",
-                     type="primary", use_container_width=True):
-            try:
-                # Save pattern if provided
-                if p_field != "—" and p_snippet and p_correct:
-                    log_pattern(p_field, "", p_correct, p_snippet, p_notes)
-
-                # Save type correction if changed
-                if tier == "tier2" and cs:
-                    orig = cs.get("pump_type","")
-                    if confirmed_type != orig and orig:
-                        log_correction(specs, orig, confirmed_type, type_notes)
-
-                # Save full feedback
-                log_feedback(
-                    specs, bom, tier,
-                    confirmed_type, confirmed_moc,
-                    confirmed_weights, eng_notes,
-                )
-
-                # Refresh store
-                st.session_state.store    = get_store()
-                st.session_state.confirmed = True
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"Error saving: {e}")
-
-    with col_skip:
-        if st.button("Skip — Back to Output", use_container_width=True):
-            st.session_state.page = "output"
-            st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 6 — LEARNING STATS
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "stats":
-    st.markdown("## 📊 Learning Statistics")
-
+def log_feedback(specs, bom_df, tier,
+                 confirmed_pump_type, confirmed_moc,
+                 confirmed_weights, engineer_notes=""):
+    """Called when engineer clicks Confirm & Learn."""
     store = get_store()
-    stats = store.get("stats", {})
+    ns    = _ns_from_specs(specs)
+    store["feedback"].append({
+        "ts":        datetime.datetime.now().isoformat(),
+        "specs":     {k: v for k, v in specs.items() if v is not None},
+        "tier":      tier,
+        "pump_type": confirmed_pump_type,
+        "moc":       confirmed_moc,
+        "weights":   confirmed_weights,
+        "bom_rows":  len(bom_df),
+        "notes":     engineer_notes,
+        "ns":        ns,
+    })
+    store["stats"]["total_sessions"] += 1
+    if tier == "tier1": store["stats"]["tier1_hits"] += 1
+    else:               store["stats"]["tier2_hits"] += 1
 
-    # Top metrics
-    m1, m2, m3, m4, m5 = st.columns(5)
-    for col, (lbl, val, color) in zip(
-        [m1,m2,m3,m4,m5],
-        [
-            ("Total Sessions",    stats.get("total_sessions",0), "#58a6ff"),
-            ("Tier 1 Hits",       stats.get("tier1_hits",0),     "#3fb950"),
-            ("Tier 2 Hits",       stats.get("tier2_hits",0),     "#79c0ff"),
-            ("Corrections Made",  stats.get("corrections",0),    "#d2a8ff"),
-            ("Patterns Learned",  stats.get("patterns_added",0), "#ffa657"),
-        ]
-    ):
-        col.markdown(
-            f'<div class="metric-tile">'
-            f'<div class="metric-value" style="color:{color}">{val}</div>'
-            f'<div class="metric-label">{lbl}</div></div>',
-            unsafe_allow_html=True,
+    _update_weight_calibs(store, confirmed_pump_type,
+                          confirmed_weights, specs)
+    _save(store)
+
+
+def log_pattern(field, bad_value, correct_value,
+                raw_text_snippet, notes=""):
+    """Engineer teaches the parser a new extraction pattern."""
+    store = get_store()
+    store["patterns"].append({
+        "ts":      datetime.datetime.now().isoformat(),
+        "field":   field,
+        "bad":     str(bad_value),
+        "correct": str(correct_value),
+        "snippet": raw_text_snippet[:200],
+        "notes":   notes,
+    })
+    store["stats"]["patterns_added"] += 1
+    _save(store)
+
+
+def log_correction(specs, wrong_type, correct_type, notes=""):
+    """Engineer overrides Tier 2 pump classification."""
+    store = get_store()
+    store["corrections"].append({
+        "ts":          datetime.datetime.now().isoformat(),
+        "ns":          _ns_from_specs(specs),
+        "fluid":       (specs.get("fluid") or ""),
+        "flow":        specs.get("flow_m3h"),
+        "head":        specs.get("head_m"),
+        "wrong_type":  wrong_type,
+        "correct_type":correct_type,
+        "notes":       notes,
+    })
+    store["stats"]["corrections"] += 1
+    _save(store)
+
+
+def get_learned_correction(Ns, fluid):
+    """
+    Check if a previous engineer correction covers this Ns + fluid.
+    Returns correct_type string or None.
+    Match criteria: Ns within ±30%, fluid keyword overlap.
+    """
+    store   = get_store()
+    fl      = (fluid or "").lower()
+    for corr in reversed(store.get("corrections", [])):
+        c_ns = corr.get("ns")
+        c_fl = (corr.get("fluid") or "").lower()
+        ns_match = (
+            c_ns is None or Ns is None or
+            (Ns > 0 and abs(c_ns - Ns) / max(Ns, 1) < 0.30)
         )
+        fl_match = any(w in c_fl for w in fl.split()[:3]) or \
+                   any(w in fl   for w in c_fl.split()[:3])
+        if ns_match and fl_match and corr.get("correct_type"):
+            return corr["correct_type"]
+    return None
 
-    st.markdown("---")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📝 Feedback History",
-        "🔧 Corrections",
-        "🔬 Parser Patterns",
-        "⚖️ Weight Calibration",
-    ])
+# ── Weight calibration ───────────────────────────────────────────
 
-    with tab1:
-        fb = store.get("feedback", [])
-        if not fb:
-            st.info("No sessions confirmed yet. Generate a BOM and click 'Confirm & Learn'.")
-        else:
-            rows = []
-            for f in reversed(fb[-30:]):
-                rows.append({
-                    "Timestamp":   f.get("ts","")[:16].replace("T"," "),
-                    "Pump Type":   f.get("pump_type",""),
-                    "Tier":        f.get("tier",""),
-                    "Ns":          f.get("ns",""),
-                    "Flow m³/h":   (f.get("specs") or {}).get("flow_m3h",""),
-                    "Head m":      (f.get("specs") or {}).get("head_m",""),
-                    "BOM Rows":    f.get("bom_rows",""),
-                    "Notes":       f.get("notes",""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                         hide_index=True, height=350)
+def _update_weight_calibs(store, pump_type, weights, specs):
+    if not weights:
+        return
+    pt  = (pump_type or "").lower()[:20]
+    kw  = float(specs.get("motor_kw") or 30)
+    if pt not in store["weight_calibs"]:
+        store["weight_calibs"][pt] = {
+            "pump_coeff": 1.0, "motor_coeff": 1.0,
+            "n_samples": 0,   "last_updated": None,
+        }
+    cal = store["weight_calibs"][pt]
+    n   = cal["n_samples"] + 1
 
-            # Tier distribution bar
-            t1h = stats.get("tier1_hits",0)
-            t2h = stats.get("tier2_hits",0)
-            tot = t1h + t2h
-            if tot > 0:
-                st.markdown("**Tier Distribution**")
-                t1pct = int(t1h/tot*100)
-                t2pct = 100 - t1pct
-                st.markdown(
-                    f'<div style="display:flex;gap:8px;align-items:center;margin-top:8px;">'
-                    f'<span style="color:#3fb950;font-size:12px;width:80px;">Tier 1: {t1h}</span>'
-                    f'<div style="flex:1;background:#21262d;border-radius:4px;height:12px;">'
-                    f'<div style="background:#3fb950;width:{t1pct}%;border-radius:4px;height:12px;"></div></div>'
-                    f'<span style="color:#3fb950;font-size:12px;">{t1pct}%</span></div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f'<div style="display:flex;gap:8px;align-items:center;margin-top:4px;">'
-                    f'<span style="color:#79c0ff;font-size:12px;width:80px;">Tier 2: {t2h}</span>'
-                    f'<div style="flex:1;background:#21262d;border-radius:4px;height:12px;">'
-                    f'<div style="background:#1f6feb;width:{t2pct}%;border-radius:4px;height:12px;"></div></div>'
-                    f'<span style="color:#79c0ff;font-size:12px;">{t2pct}%</span></div>',
-                    unsafe_allow_html=True,
-                )
+    pred_pump  = _base_pump_wt(pt, kw)
+    pred_motor = _base_motor_wt(kw)
+    act_pump   = float(weights.get("pump_kg",  0) or 0)
+    act_motor  = float(weights.get("motor_kg", 0) or 0)
 
-    with tab2:
-        corrs = store.get("corrections", [])
-        if not corrs:
-            st.info("No corrections logged yet.")
-        else:
-            rows = []
-            for c in reversed(corrs):
-                rows.append({
-                    "Timestamp":    c.get("ts","")[:16].replace("T"," "),
-                    "Ns":           c.get("ns",""),
-                    "Fluid":        c.get("fluid",""),
-                    "Flow m³/h":    c.get("flow",""),
-                    "Head m":       c.get("head",""),
-                    "Was Wrong":    c.get("wrong_type",""),
-                    "Corrected To": c.get("correct_type",""),
-                    "Notes":        c.get("notes",""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                         hide_index=True, height=300)
-            st.markdown(
-                '<div class="card-blue">'
-                '<b style="color:#79c0ff;">How corrections are used:</b><br>'
-                '<span style="color:#8b949e;font-size:12px;">'
-                'When a new pump comes in with Ns within ±30% of a corrected case '
-                'and same fluid category, the system applies the corrected pump type '
-                'instead of the formula-based classification.</span></div>',
-                unsafe_allow_html=True,
-            )
+    if pred_pump  > 0 and act_pump  > 0:
+        r = act_pump / pred_pump
+        cal["pump_coeff"]  = (cal["pump_coeff"]  * (n-1) + r) / n
+    if pred_motor > 0 and act_motor > 0:
+        r = act_motor / pred_motor
+        cal["motor_coeff"] = (cal["motor_coeff"] * (n-1) + r) / n
 
-    with tab3:
-        pats = store.get("patterns", [])
-        if not pats:
-            st.info("No parser patterns added yet. Use 'Confirm & Learn → Section D'.")
-        else:
-            rows = []
-            for p in reversed(pats):
-                rows.append({
-                    "Timestamp": p.get("ts","")[:16].replace("T"," "),
-                    "Field":     p.get("field",""),
-                    "Snippet":   p.get("snippet","")[:60],
-                    "Correct Value": p.get("correct",""),
-                    "Notes":     p.get("notes",""),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                         hide_index=True, height=250)
-            st.markdown(
-                '<div class="card-blue">'
-                '<b style="color:#79c0ff;">How patterns are used:</b><br>'
-                '<span style="color:#8b949e;font-size:12px;">'
-                'When a PDF is uploaded, the parser tries these learned patterns '
-                'in addition to the built-in regex rules. Useful for manufacturer-specific '
-                'terminology like "BKW" (shaft power) or "Q_rated" (flow).</span></div>',
-                unsafe_allow_html=True,
-            )
+    cal["n_samples"]    = n
+    cal["last_updated"] = datetime.datetime.now().isoformat()
 
-    with tab4:
-        calibs = store.get("weight_calibs", {})
-        if not calibs:
-            st.info("No weight calibrations yet. Confirm sessions with actual weights to calibrate.")
-        else:
-            rows = []
-            for pt, cal in calibs.items():
-                rows.append({
-                    "Pump Type Key":    pt,
-                    "Pump Coefficient": round(cal.get("pump_coeff",1.0),4),
-                    "Motor Coefficient":round(cal.get("motor_coeff",1.0),4),
-                    "Samples":          cal.get("n_samples",0),
-                    "Pump Drift %":     f"{(cal.get('pump_coeff',1.0)-1)*100:+.1f}%",
-                    "Motor Drift %":    f"{(cal.get('motor_coeff',1.0)-1)*100:+.1f}%",
-                    "Last Updated":     (cal.get("last_updated","")[:16] or "").replace("T"," "),
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.markdown(
-                '<div class="card-blue">'
-                '<b style="color:#79c0ff;">How calibration works:</b><br>'
-                '<span style="color:#8b949e;font-size:12px;">'
-                'Each time you confirm actual weights, the system computes the ratio '
-                '(actual ÷ predicted) and updates a running average coefficient per pump type. '
-                'A coefficient of 1.08 means the formula consistently under-predicts by 8% '
-                'for that type — future predictions are scaled up automatically.</span></div>',
-                unsafe_allow_html=True,
-            )
+def _base_pump_wt(pt, kw):
+    if "slurry"  in pt: return 1.8  * kw**0.85
+    if "turbine" in pt: return 0.45 * kw**0.9 * 6**0.3
+    if "sump"    in pt: return 0.9  * kw**0.85
+    return 2.1 * kw**0.72
 
-    st.markdown("---")
-    if st.button("🗑 Reset Learning Store", type="secondary"):
-        confirm_reset = st.checkbox("I confirm — reset all learned data")
-        if confirm_reset:
-            import os
-            from engine import LRN_PATH
-            if os.path.exists(LRN_PATH):
-                os.remove(LRN_PATH)
-            st.session_state.store = get_store()
-            st.success("Learning store reset.")
-            st.rerun()
+def _base_motor_wt(kw):
+    return 6.2 * kw**0.80 if kw > 200 else 8.5 * kw**0.75
+
+def _ns_from_specs(specs):
+    Q = specs.get("flow_m3h")
+    H = specs.get("head_m")
+    n = specs.get("speed_rpm") or 1450
+    if Q and H and Q > 0 and H > 0:
+        try:   return round(calc_specific_speed(Q, H, n), 1)
+        except Exception: pass
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PAGE 7 — DATABASE EXPLORER
+# SECTION 3 — PDF TEXT EXTRACTION
 # ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "database":
-    st.markdown("## 🗄️ Database Explorer")
 
-    db = st.session_state.db
-    if not db:
-        st.error("Database not loaded.")
-        st.stop()
+def extract_pdf_text(file_bytes):
+    try:
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for p in pdf.pages:
+                t = p.extract_text()
+                if t:
+                    pages.append(t)
+        return "\n".join(pages), None
+    except Exception as e:
+        return "", str(e)
 
-    tp, tc, tm, tv = st.tabs([
-        f"Pumps ({len(db['pumps'])})",
-        f"Components ({len(db['comps'])})",
-        f"Materials ({len(db['mats'])})",
-        f"Vendors ({len(db['vendors'])})",
-    ])
 
-    with tp:
-        st.markdown("### Pump Master List")
-        srch = st.text_input("Search", placeholder="model, manufacturer, type...")
-        pumps = db["pumps"].copy()
-        if srch:
-            mask = pumps.astype(str).apply(
-                lambda col: col.str.contains(srch, case=False, na=False)
-            ).any(axis=1)
-            pumps = pumps[mask]
-        st.dataframe(pumps, use_container_width=True, hide_index=True)
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 4 — SPEC PARSER  (with learned patterns)
+# ═══════════════════════════════════════════════════════════════════
 
-        # Type distribution
-        tc_counts = db["pumps"]["Type"].value_counts()
-        st.markdown("**Type Distribution**")
-        for ptype, cnt in tc_counts.items():
-            bw = int(cnt / max(tc_counts) * 200)
-            st.markdown(
-                f'<div style="display:flex;align-items:center;margin:3px 0;gap:8px;">'
-                f'<span style="color:#8b949e;font-size:12px;width:220px;">{ptype}</span>'
-                f'<div style="background:#1f6feb;height:14px;width:{bw}px;border-radius:3px;"></div>'
-                f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">{cnt}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+_PATTERNS = {
+    "flow_m3h": [
+        r"(?:[Rr]ated\s+)?(?:[Vv]olumetric\s+)?[Ff]low\s*(?:[Rr]ate|[Cc]apacity)?\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
+        r"[Cc]apacity\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
+        r"[Ff]low\s*[:\-=]?\s*(\d+\.?\d*)\s*m\xb3/h",
+        r"\bQ\s*[=:\-]\s*(\d+\.?\d*)\s*m3",
+        r"(\d+\.?\d*)\s*m3/hr",
+        r"\b(\d{3,5}\.?\d*)\s*LPM\b",
+        r"\b(\d{3,5}\.?\d*)\s*L/[Mm]in\b",
+    ],
+    "head_m": [
+        r"[Pp]ump\s+[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"[Tt]otal\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"[Bb]owl\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"\bH\s*[=:\-]\s*(\d+\.?\d*)\s*m\b",
+        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"(\d{1,3}\.?\d*)\s*[Mm]tr\b",
+    ],
+    "speed_rpm": [
+        r"[Ff]ull\s+[Ll]oad\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"[Rr]ated\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"[Ss]peed\s*[:\-=]?\s*(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"[Mm]otor\s+[Ss]peed.*?(\d{3,4})",
+    ],
+    "motor_kw": [
+        r"[Mm]otor\s+[Rr]ating\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Nn]ominal\s+[Pp]ower\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Rr]ated\s+[Oo]utput.*?(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Pp]rime\s*[Mm]over\s+[Pp]ower.*?(\d+\.?\d*)",
+        r"(\d+\.?\d*)\s*[Kk][Ww]\s+(?:motor|Motor|MOTOR|nameplate)",
+        r"(?:motor|Motor|MOTOR).*?(\d+\.?\d*)\s*[Kk][Ww]",
+        r"(\d+\.?\d*)\s*[Hh][Pp]\b",           # HP — converted below
+    ],
+    "temp_c": [
+        r"[Oo]p(?:erating)?\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
+        r"[Pp]rocess\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
+        r"[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0][Cc]",
+        r"(\d{2,3})\s*[Dd]eg\.?\s*[Cc]\b",
+        r"(\d{2,3})\s*[°\xb0][Cc]\b",
+    ],
+    "density_kgm3": [
+        r"[Dd]ensity\s*[:\-=]?\s*(\d{3,4}\.?\d*)\s*kg",
+        r"[Ss]pecific\s+[Gg]ravity\s*[:\-=]?\s*(\d\.?\d+)",
+        r"\bSG\s*[=:\-]\s*(\d\.?\d+)\b",
+        r"\bS\.G\.\s*[=:\-]\s*(\d\.?\d+)\b",
+        r"\b\xce\xb1\s*[=:\-]\s*(\d{3,4}\.?\d*)\s*kg",
+    ],
+    "stages": [
+        r"[Nn]o\.?\s+[Oo]f\s+[Ss]tages?\s*[:\-=]?\s*(\d+)",
+        r"(\d+)\s*[Ss]tage\s+[Pp]ump",
+        r"(\d+)[- ][Ss]tage\b",
+    ],
+}
 
-    with tc:
-        st.markdown("### Component Library")
-        cs1, cs2 = st.columns([2,1])
-        with cs1:
-            csrch = st.text_input("Search components", placeholder="category, material, vendor...")
-        with cs2:
-            pf = ["All"] + db["pumps"]["Model"].tolist()
-            pfilt = st.selectbox("Filter by pump", pf)
-        comps = db["comps"].copy()
-        if csrch:
-            mask = comps.astype(str).apply(
-                lambda col: col.str.contains(csrch, case=False, na=False)
-            ).any(axis=1)
-            comps = comps[mask]
-        if pfilt != "All":
-            comps = comps[comps["Pump_Model_Compatibility"].str.contains(
-                pfilt, case=False, na=False)]
-        st.dataframe(
-            comps[["Component_ID","Component_Name","Category",
-                   "Material_Spec","Weight_kg","Vendor_Name",
-                   "Pump_Model_Compatibility"]],
-            use_container_width=True, hide_index=True, height=400,
-        )
+_FLUID_MAP = [
+    ("live steam condensate",  "Live Steam Condensate"),
+    ("steam condensate",       "Live Steam Condensate"),
+    ("process condensate",     "Process Condensate"),
+    ("condensate",             "Process Condensate"),
+    ("caustic liquor",         "Caustic Liquor (Alumina)"),
+    ("alumina liquor",         "Caustic Liquor (Alumina)"),
+    ("caustic soda",           "Caustic Soda"),
+    ("caustic",                "Caustic Liquor"),
+    ("sulphuric acid",         "Dilute Sulphuric Acid"),
+    ("sulfuric acid",          "Dilute Sulphuric Acid"),
+    ("hydrochloric acid",      "Hydrochloric Acid"),
+    ("acid",                   "Dilute Acid"),
+    ("slurry",                 "Slurry"),
+    ("seawater",               "Seawater"),
+    ("sea water",              "Seawater"),
+    ("sw-lift",                "Seawater"),
+    ("brine",                  "Seawater"),
+    ("crude oil",              "Crude Oil"),
+    ("boiler feed",            "Boiler Feed Water"),
+    ("cooling water",          "Cooling Water"),
+    ("clear water",            "Clear Water"),
+    ("clean water",            "Clear Water"),
+    ("raw water",              "Clear Water"),
+    ("drinking water",         "Clear Water"),
+    ("water",                  "Clear Water"),
+]
 
-    with tm:
-        st.markdown("### Material Database")
-        st.dataframe(db["mats"], use_container_width=True, hide_index=True)
+_DENSITY_DEFAULTS = {
+    "Slurry":                   1300,
+    "Caustic Liquor (Alumina)": 1244,
+    "Caustic Liquor":           1200,
+    "Live Steam Condensate":     930,
+    "Process Condensate":        990,
+    "Dilute Sulphuric Acid":    1050,
+    "Seawater":                 1025,
+    "Boiler Feed Water":         950,
+    "Crude Oil":                 870,
+    "Cooling Water":             998,
+    "Clear Water":              1000,
+}
 
-    with tv:
-        st.markdown("### Vendor Database")
-        st.dataframe(db["vendors"], use_container_width=True, hide_index=True)
+_SANITY = {
+    "flow_m3h":     (0,    100000),
+    "head_m":       (0.5,    2000),
+    "speed_rpm":    (200,   10000),
+    "motor_kw":     (0.1,    5000),
+    "temp_c":       (-10,     600),
+    "density_kgm3": (500,    5000),
+    "stages":       (1,        30),
+}
+
+def parse_specs(text, learned_patterns=None):
+    specs = {}
+    t  = text.replace("\n", " ").replace("  ", " ")
+    tl = t.lower()
+
+    for field, patterns in _PATTERNS.items():
+        for p in patterns:
+            try:
+                m = re.search(p, t)
+                if not m:
+                    continue
+                val = float(m.group(1))
+                # Conversions
+                if field == "flow_m3h" and ("LPM" in p or "L/[Mm]in" in p):
+                    val = round(val / 1000 * 60, 2)
+                if field == "motor_kw" and "[Hh][Pp]" in p:
+                    val = round(val * 0.7457, 2)
+                if field == "density_kgm3" and val < 5:
+                    val = round(val * 1000, 1)
+                lo, hi = _SANITY.get(field, (None, None))
+                if lo is not None and not (lo < val < hi):
+                    continue
+                specs[field] = val
+                break
+            except Exception:
+                continue
+
+    # Apply learned patterns
+    if learned_patterns:
+        for lp in learned_patterns:
+            fld     = lp.get("field")
+            snippet = lp.get("snippet","")
+            if fld and snippet and fld not in specs:
+                words = snippet.split()[:3]
+                key   = re.escape(" ".join(words))
+                try:
+                    m = re.search(key + r".*?(\d+\.?\d*)", t, re.IGNORECASE)
+                    if m:
+                        specs[fld] = float(m.group(1))
+                except Exception:
+                    pass
+
+    # Fluid
+    for kw, name in _FLUID_MAP:
+        if kw in tl:
+            specs["fluid"] = name
+            break
+    if "fluid" not in specs:
+        specs["fluid"] = "Clear Water"
+
+    # Density default
+    if "density_kgm3" not in specs:
+        specs["density_kgm3"] = _DENSITY_DEFAULTS.get(specs["fluid"], 1000)
+
+    # Model
+    for p in [
+        r"[Pp]ump\s+[Mm]odel\s*[:\-=]?\s*([A-Za-z0-9][A-Za-z0-9\-\/\. ]{3,25})",
+        r"[Mm]odel\s*[:\-\/=]?\s*([A-Z][A-Z0-9\-\/]{3,20})",
+    ]:
+        m = re.search(p, t)
+        if m:
+            val = m.group(1).strip().rstrip(".,;")
+            if len(val) >= 4:
+                specs["model"] = val
+                break
+
+    # Manufacturer
+    for mfr in ["Flowserve","KSB","Metso","Sulzer","Wilo","Jyoti",
+                "Kirloskar","Grundfos","Ebara","Xylem","Andritz","Weir"]:
+        if mfr.lower() in tl:
+            specs["manufacturer"] = mfr
+            break
+
+    return specs
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 5 — TIER 1  (database match)
+# ═══════════════════════════════════════════════════════════════════
+
+def tier1_match(specs, db):
+    pumps = db["pumps"].copy().dropna(subset=["Flow_m3h","Head_m"])
+    Q     = specs.get("flow_m3h")
+    H     = specs.get("head_m")
+    model = (specs.get("model") or "").upper().strip()
+    mfr   = (specs.get("manufacturer") or "").lower().strip()
+
+    if not Q and not H and not model:
+        return None, 0, "no_specs"
+
+    best_row, best_score, best_type = None, 0, "none"
+
+    for _, row in pumps.iterrows():
+        score    = 0
+        db_model = str(row["Model"]).upper()
+        db_mfr   = str(row["Manufacturer"]).lower()
+
+        if model:
+            m1 = re.sub(r"[\s\-\/]","", model)
+            m2 = re.sub(r"[\s\-\/]","", db_model)
+            if   m1 == m2:              score += 55
+            elif m1 in m2:              score += 50
+            elif m2 in m1:              score += 45
+            elif model[:6] in db_model: score += 25
+
+        if mfr and db_mfr and mfr[:5] in db_mfr:
+            score += 15
+
+        if Q and pd.notna(row["Flow_m3h"]):
+            pct = abs(Q - row["Flow_m3h"]) / max(row["Flow_m3h"], 1)
+            score += 30 if pct < 0.05 else 20 if pct < 0.15 else 10 if pct < 0.25 else 0
+
+        if H and pd.notna(row["Head_m"]):
+            pct = abs(H - row["Head_m"]) / max(row["Head_m"], 1)
+            score += 25 if pct < 0.05 else 15 if pct < 0.15 else 8 if pct < 0.20 else 0
+
+        if score > best_score:
+            best_score = score
+            best_row   = row
+            best_type  = ("exact" if score >= 65
+                          else "close" if score >= 35
+                          else "weak")
+
+    return best_row, best_score, best_type
+
+
+def get_bom_from_match(pump_row, db):
+    model   = str(pump_row["Model"])
+    matched = db["comps"][db["comps"]["Pump_Model_Compatibility"].str.contains(
+        re.escape(model), case=False, na=False, regex=True
+    )].copy()
+    return matched
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 6 — TIER 2  (physics engine)
+# ═══════════════════════════════════════════════════════════════════
+
+_IEC_KW = [
+    0.18,0.25,0.37,0.55,0.75,1.1,1.5,2.2,3.0,4.0,5.5,
+    7.5,11,15,18.5,22,30,37,45,55,75,90,110,132,160,
+    200,250,315,400,500,630,800,1000,
+]
+
+def round_iec(kw):
+    for s in _IEC_KW:
+        if s >= kw: return s
+    return round(kw, 1)
+
+def calc_specific_speed(Q, H, n=1450):
+    if not Q or not H or Q <= 0 or H <= 0:
+        return None
+    return n * math.sqrt(Q * 4.403) / ((H * 3.281) ** 0.75)
+
+def classify_pump_type(Ns, Q, H, fluid, stages=1, learned=None):
+    fl = (fluid or "").lower()
+
+    if any(k in fl for k in ["slurry","abrasive"]):
+        return "TPL-HSS-01", "Horizontal Slurry Pump"
+    if any(k in fl for k in ["sulphuric","sulfuric","hydrochloric","acid"]):
+        return "TPL-VSP-01", "Vertical Sump Pump"
+    if "live steam condensate" in fl:
+        return "TPL-VTP-02", "Vertical Turbine Pump VS6 (Condensate)"
+    if "condensate" in fl:
+        return "TPL-VTP-02", "Vertical Turbine Pump VS6 (Condensate)"
+    if "boiler feed" in fl:
+        return "TPL-MSC-01", "Multistage Centrifugal (BFW)"
+
+    if learned:
+        return "TPL-LEARNED", learned
+
+    if Ns is None:
+        return "TPL-HSC-01", "Horizontal Split Casing (default)"
+
+    if stages and stages > 1 and H and H > 150:
+        return "TPL-MSC-01", "Multistage Centrifugal"
+    if Q and Q < 20 and H and H > 50:
+        return "TPL-VRT-01", "Vertical Submersible"
+    if Ns < 1500:
+        return ("TPL-HSC-02","Horizontal Split Casing — High Head") \
+               if (H and H > 150) else ("TPL-HSC-01","Horizontal Split Casing")
+    elif Ns < 4000:
+        return "TPL-VTP-01", "Vertical Turbine Pump"
+    else:
+        return "TPL-VTP-01", "Vertical Turbine Pump (Axial)"
+
+def calc_motor_kw(Q, H, rho=1000, eta_pump=0.78, eta_motor=0.93, sf=1.10):
+    if not Q or not H or Q <= 0 or H <= 0:
+        return None
+    shaft = (Q * H * rho * 9.81) / (eta_pump * 3600 * 1000)
+    return round_iec(shaft / eta_motor * sf)
+
+def select_material(fluid, temp_c, pressure_kpa, db):
+    mc = db["mat_compat"].copy()
+    mc = mc.dropna(subset=["Rule_ID"])
+    mc = mc[mc["Rule_ID"].astype(str).str.startswith("MAT-", na=False)]
+
+    fl   = str(fluid or "").lower()
+    temp = float(temp_c or 30)
+    pres = float(pressure_kpa or 500)
+
+    mc["Temp_Min_C"]       = pd.to_numeric(mc["Temp_Min_C"],       errors="coerce").fillna(0)
+    mc["Temp_Max_C"]       = pd.to_numeric(mc["Temp_Max_C"],       errors="coerce").fillna(500)
+    mc["Pressure_Max_kPa"] = pd.to_numeric(mc["Pressure_Max_kPa"],errors="coerce").fillna(99999)
+
+    defaults = mc[ mc["Rule_ID"].str.startswith("MAT-DEFAULT", na=False)]
+    rules    = mc[~mc["Rule_ID"].str.startswith("MAT-DEFAULT", na=False)]
+
+    valid = rules[
+        (rules["Temp_Min_C"]       <= temp) &
+        (rules["Temp_Max_C"]       >= temp) &
+        (rules["Pressure_Max_kPa"] >= pres)
+    ]
+
+    exact = valid[valid["Fluid_Type"].str.lower().str.contains(
+        fl[:12], na=False, case=False
+    )]
+    if not exact.empty:
+        row = exact.iloc[0]
+    else:
+        cat_map = {
+            "water":      "Clean Water",
+            "caustic":    "Alkali/Caustic",
+            "acid":       "Dilute Acid",
+            "slurry":     "Abrasive Slurry",
+            "condensate": "Condensate",
+            "oil":        "Hydrocarbon",
+            "seawater":   "Seawater",
+            "brine":      "Seawater",
+            "boiler":     "High Temp",
+        }
+        cat = "Clean Water"
+        for k, v in cat_map.items():
+            if k in fl: cat = v; break
+        cm = valid[valid["Fluid_Category"] == cat]
+        row = cm.iloc[0] if not cm.empty \
+              else (defaults.iloc[0] if not defaults.empty else rules.iloc[0])
+
+    cols = ["Casing_MOC","Impeller_MOC","Shaft_MOC","Shaft_Sleeve_MOC",
+            "Wear_Ring_MOC","Seal_Type","Seal_Plan","Fastener_MOC"]
+    out = {c: (str(row[c]) if c in row.index and pd.notna(row[c]) else "VTA")
+           for c in cols}
+    out["Rule_ID"]     = str(row.get("Rule_ID",""))
+    out["Fluid_Match"] = str(row.get("Fluid_Type",""))
+    return out
+
+def estimate_weight(pump_type_str, motor_kw, store=None):
+    P  = float(motor_kw or 30)
+    pt = (pump_type_str or "").lower()
+
+    # Calibration coefficients from learning
+    pump_c = motor_c = 1.0
+    if store:
+        for key, cal in store.get("weight_calibs", {}).items():
+            if key in pt:
+                pump_c  = cal.get("pump_coeff",  1.0)
+                motor_c = cal.get("motor_coeff", 1.0)
+                break
+
+    w = {}
+    if "slurry" in pt:
+        w["pump_kg"]      = round(_base_pump_wt(pt, P)  * pump_c)
+        w["motor_kg"]     = round(_base_motor_wt(P)     * motor_c)
+        w["baseplate_kg"] = round(0.30 * w["pump_kg"])
+        w["guard_kg"]     = round(0.10 * w["pump_kg"])
+    elif "sump" in pt or "acid" in pt:
+        w["pump_kg"]      = round(_base_pump_wt(pt, P)  * pump_c)
+        w["motor_kg"]     = round(_base_motor_wt(P)     * motor_c)
+        w["baseplate_kg"] = 20
+    elif "turbine" in pt or "vs6" in pt:
+        w["pump_kg"]      = round(_base_pump_wt(pt, P)  * pump_c)
+        w["motor_kg"]     = round(_base_motor_wt(P)     * motor_c)
+        w["baseplate_kg"] = 60
+    else:
+        w["pump_kg"]      = round(_base_pump_wt(pt, P)  * pump_c)
+        w["motor_kg"]     = round(_base_motor_wt(P)     * motor_c)
+        w["baseplate_kg"] = round(max(80, 0.18 * P**1.02))
+        w["coupling_kg"]  = max(10, round(0.015 * P))
+
+    w["total_kg"] = sum(w.values())
+    return w
+
+def get_bom_template(template_id, db):
+    sec_b = pd.read_excel(DB_PATH, sheet_name="BOM_Templates", header=16)
+    sec_b.columns = [str(c).strip() for c in sec_b.columns]
+    if "Template_ID" in sec_b.columns:
+        tpl = sec_b[sec_b["Template_ID"].astype(str).str.strip() == template_id.strip()]
+        if not tpl.empty:
+            return tpl
+    return sec_b[sec_b["Template_ID"].astype(str).str.contains("HSC-01", na=False)]
+
+def tier2_generate(specs, db, store=None):
+    Q      = specs.get("flow_m3h")
+    H      = specs.get("head_m")
+    n      = specs.get("speed_rpm")     or 1450
+    fluid  = specs.get("fluid")         or "Clear Water"
+    temp   = specs.get("temp_c")        or 30
+    rho    = specs.get("density_kgm3")  or 1000
+    stages = specs.get("stages")        or 1
+    motor_input = specs.get("motor_kw")
+
+    Ns  = calc_specific_speed(Q, H, n)
+    lrn = get_learned_correction(Ns, fluid) if Ns else None
+
+    tpl_id, pump_type_desc = classify_pump_type(Ns, Q, H, fluid, stages, lrn)
+
+    eta   = 0.75 if (Ns and Ns < 1500) else 0.82
+    mkw   = motor_input or calc_motor_kw(Q, H, rho, eta)
+    moc   = select_material(fluid, temp, 500, db)
+    wts   = estimate_weight(pump_type_desc, mkw, store)
+
+    tpl   = get_bom_template(tpl_id, db)
+    moc_map = {
+        "Casing":"Casing_MOC","Impeller":"Impeller_MOC",
+        "Shaft":"Shaft_MOC","Sleeve":"Shaft_Sleeve_MOC",
+        "Wear Ring":"Wear_Ring_MOC","Seal":"Seal_Type",
+        "Fasteners":"Fastener_MOC",
+    }
+    wt_map = {"Pump":"pump_kg","Motor":"motor_kg",
+              "Baseplate":"baseplate_kg","Coupling":"coupling_kg"}
+
+    rows = []
+    for i, (_, tc) in enumerate(tpl.iterrows(), 1):
+        cat = str(tc.get("Component_Category",""))
+        sub = str(tc.get("Component_Subcategory",""))
+        req = str(tc.get("Req_Type","M"))
+        qty = str(tc.get("Qty_Logic","1"))
+        mat = moc.get(moc_map.get(cat,"Casing_MOC"),"Per Service")
+        if mat in ["nan","VTA","None",""]: mat = "Engineer to Specify"
+        wt  = wts.get(wt_map.get(cat,""), "")
+        rows.append({
+            "No":          i,
+            "Component_ID":f"CALC-{tpl_id}-{i:03d}",
+            "Category":    cat,
+            "Description": sub if sub and sub != cat else cat,
+            "MOC":         mat,
+            "Qty":         qty,
+            "Req_Type":    req,
+            "Weight_kg":   wt,
+            "Source":      "Tier 2 — Physics",
+            "Notes":       str(tc.get("Notes_for_BOM_Generator",""))[:80],
+        })
+
+    summary = {
+        "specific_speed_Ns":  round(Ns,1) if Ns else "N/A",
+        "pump_type":          pump_type_desc,
+        "template_used":      tpl_id,
+        "motor_kw_calc":      mkw,
+        "eta_pump_assumed":   round(eta*100,1),
+        "material_rule":      moc.get("Rule_ID",""),
+        "fluid_matched":      moc.get("Fluid_Match",""),
+        "seal_plan":          moc.get("Seal_Plan",""),
+        "weights":            wts,
+        "moc":                moc,
+        "learned_correction": lrn,
+    }
+    return pd.DataFrame(rows), summary
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 7 — ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════
+
+def _safe(v):
+    """Ensure spec values are clean — no None crashing .upper()/.lower()."""
+    if v is None: return None
+    if isinstance(v, str): return v.strip() or None
+    try:
+        f = float(v)
+        return f if (f == f) else None   # NaN check
+    except (TypeError, ValueError):
+        return v
+
+def generate_bom(specs, db, store=None):
+    specs = {k: _safe(v) for k, v in (specs or {}).items()}
+
+    pump_row, score, mtype = tier1_match(specs, db)
+    if pump_row is not None and score >= 30:
+        bom = get_bom_from_match(pump_row, db)
+        if not bom.empty:
+            out = bom[["Component_ID","Category","Subcategory",
+                        "Component_Name","Material_Spec","Qty_Per_Unit",
+                        "Unit","Weight_kg","Vendor_Name","Notes"]].copy()
+            out.insert(0,"No", range(1,len(out)+1))
+            out.insert(9,"Source","Tier 1 — Database")
+            return out, "tier1", {
+                "pump_id":    pump_row["Pump_ID"],
+                "model":      pump_row["Model"],
+                "score":      score,
+                "match_type": mtype,
+            }, None
+
+    bom_df, summary = tier2_generate(specs, db, store)
+    return bom_df, "tier2", None, summary
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 8 — EXCEL EXPORT
+# ═══════════════════════════════════════════════════════════════════
+
+def export_bom_excel(bom_df, specs, tier, match_info, calc_summary):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "BOM"
+    thin = Side(style="thin", color="CCCCCC")
+    bdr  = Border(left=thin,right=thin,top=thin,bottom=thin)
+
+    ws.merge_cells("A1:L1")
+    c = ws["A1"]
+    c.value = "AUTOMATED BILL OF MATERIALS"
+    c.font  = Font(bold=True,size=13,color="FFFFFF")
+    c.fill  = PatternFill("solid",start_color="1F4E79")
+    c.alignment = Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    info = [
+        ("Model",      (specs or {}).get("model","—") or "Physics Calculated"),
+        ("Flow (m³/h)",(specs or {}).get("flow_m3h","—")),
+        ("Head (m)",   (specs or {}).get("head_m","—")),
+        ("Fluid",      (specs or {}).get("fluid","—")),
+        ("Temp",       f"{(specs or {}).get('temp_c','—')} °C"),
+        ("Method",     f"Tier 1 — {(match_info or {}).get('model','')}"
+                       if tier=="tier1"
+                       else f"Tier 2 — {(calc_summary or {}).get('pump_type','')}"),
+        ("Generated",  pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
+    ]
+    r = 2
+    for lbl, val in info:
+        ws.cell(r,1,lbl).font  = Font(bold=True,size=9)
+        ws.cell(r,2,str(val)).font = Font(size=9)
+        r += 1
+    r += 1
+
+    hf = PatternFill("solid",start_color="2E75B6")
+    hfont = Font(bold=True,color="FFFFFF",size=9)
+    for j, col in enumerate(bom_df.columns):
+        c = ws.cell(r,j+1,col)
+        c.font=hfont; c.fill=hf
+        c.alignment=Alignment(horizontal="center",wrap_text=True)
+        c.border=bdr
+    ws.row_dimensions[r].height=28
+    r += 1
+
+    alt = PatternFill("solid",start_color="F2F2F2")
+    for i,(_, row) in enumerate(bom_df.iterrows()):
+        for j, val in enumerate(row):
+            c = ws.cell(r,j+1, val if pd.notna(val) else "")
+            c.font=Font(size=9)
+            c.alignment=Alignment(wrap_text=True,vertical="top")
+            c.border=bdr
+            if i%2==1: c.fill=alt
+        ws.row_dimensions[r].height=18
+        r += 1
+
+    for i,w in enumerate([5,18,14,14,35,25,6,6,8,20,14,45]):
+        if i < ws.max_column:
+            ws.column_dimensions[get_column_letter(i+1)].width = w
+    ws.freeze_panes = f"A{r-len(bom_df)}"
+
+    if tier=="tier2" and calc_summary:
+        ws2 = wb.create_sheet("Calculation")
+        ws2["A1"] = "TIER 2 CALCULATION SUMMARY"
+        ws2["A1"].font = Font(bold=True,size=12,color="FFFFFF")
+        ws2["A1"].fill = PatternFill("solid",start_color="70AD47")
+        r2 = 3
+        for k,v in calc_summary.items():
+            if k in ("moc","weights"): continue
+            ws2.cell(r2,1,str(k)).font = Font(bold=True,size=9)
+            ws2.cell(r2,2,str(v)).font = Font(size=9)
+            r2 += 1
+        r2 += 1
+        ws2.cell(r2,1,"WEIGHTS").font=Font(bold=True)
+        r2 += 1
+        for k,v in calc_summary.get("weights",{}).items():
+            ws2.cell(r2,1,k).font=Font(bold=True,size=9)
+            ws2.cell(r2,2,f"{v} kg").font=Font(size=9)
+            r2 += 1
+        ws2.column_dimensions["A"].width=30
+        ws2.column_dimensions["B"].width=45
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
