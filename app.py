@@ -525,31 +525,79 @@ elif st.session_state.page == "output":
     tab1, tab2, tab3 = st.tabs(["📋 BOM Table", "📊 Summary", "🔧 Calculations"])
 
     with tab1:
-        fc1, fc2 = st.columns([2, 2])
-        with fc1:
-            cats = ["All"] + sorted(bom["Category"].dropna().unique().tolist()) \
-                   if "Category" in bom.columns else ["All"]
-            cat_f = st.selectbox("Category", cats)
-        with fc2:
-            req_col = "Req_Type" if "Req_Type" in bom.columns else None
-            if req_col:
-                reqs  = ["All"] + sorted(bom[req_col].dropna().unique().tolist())
-                req_f = st.selectbox("Required Type", reqs)
-            else:
-                req_f = "All"
+        from engine import group_bom
 
-        disp = bom.copy()
-        if cat_f != "All" and "Category" in disp.columns:
-            disp = disp[disp["Category"] == cat_f]
-        if req_f != "All" and req_col:
-            disp = disp[disp[req_col] == req_f]
+        vt1, vt2 = st.columns([3, 1])
+        with vt2:
+            view_mode = st.radio("View", ["Grouped", "Flat"],
+                                 horizontal=True, label_visibility="collapsed")
 
-        key_cols = ["No","Component_ID","Category","Description",
-                    "MOC","Material_Spec","Qty","Qty_Per_Unit",
-                    "Weight_kg","Vendor_Name","Req_Type","Source"]
-        show = [c for c in key_cols if c in disp.columns]
-        st.dataframe(disp[show], use_container_width=True, height=430, hide_index=True)
-        st.caption(f"{len(disp)} of {len(bom)} components shown")
+        GRP_COLOR = {
+            "PUMP HYDRAULICS":           "#1a3a5c",
+            "ROTATING ASSEMBLY":         "#1a3a5c",
+            "BEARINGS & LUBRICATION":    "#2e5984",
+            "SHAFT SEALING":             "#2e5984",
+            "DRIVE & COUPLING":          "#366092",
+            "MOTOR / DRIVER":            "#17375e",
+            "STRUCTURAL & BASEPLATE":    "#4f6228",
+            "PIPING, NOZZLES & FLANGES": "#4f6228",
+            "FASTENERS & GASKETS":       "#595959",
+            "INSTRUMENTATION":           "#595959",
+            "ACOUSTIC & SAFETY":         "#595959",
+            "COMPLETE ASSEMBLY":         "#1f4e79",
+            "OTHER":                     "#444444",
+        }
+        KEY = ["No","Component_ID","Category","Component_Name",
+               "Description","Material_Spec","MOC","Qty_Per_Unit",
+               "Qty","Unit","Weight_kg","Vendor_Name","Source"]
+
+        if view_mode == "Grouped":
+            groups = group_bom(bom)
+            total  = 0
+            for gname, gdf in groups:
+                color = GRP_COLOR.get(gname, "#444444")
+                cnt   = len(gdf)
+                total += cnt
+                st.markdown(
+                    f'<div style="background:{color};padding:6px 14px;border-radius:5px;'
+                    f'margin-top:12px;margin-bottom:3px;display:flex;'
+                    f'justify-content:space-between;align-items:center;">'
+                    f'<span style="color:#fff;font-weight:700;font-size:11px;'
+                    f'letter-spacing:1px;">{gname}</span>'
+                    f'<span style="color:#ffffffaa;font-size:11px;">{cnt} items</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                show = [c for c in KEY if c in gdf.columns]
+                st.dataframe(
+                    gdf[show],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(36 * cnt + 40, 320),
+                )
+            st.caption(f"{total} components in {len(groups)} sections")
+
+        else:
+            fc1, fc2 = st.columns([2, 2])
+            with fc1:
+                cats  = ["All"] + sorted(bom["Category"].dropna().unique().tolist()) \
+                        if "Category" in bom.columns else ["All"]
+                cat_f = st.selectbox("Category", cats)
+            with fc2:
+                req_col = "Req_Type" if "Req_Type" in bom.columns else None
+                if req_col:
+                    reqs  = ["All"] + sorted(bom[req_col].dropna().unique().tolist())
+                    req_f = st.selectbox("Required Type", reqs)
+                else:
+                    req_f = "All"
+            disp = bom.copy()
+            if cat_f != "All" and "Category" in disp.columns:
+                disp = disp[disp["Category"] == cat_f]
+            if req_f != "All" and req_col:
+                disp = disp[disp[req_col] == req_f]
+            show = [c for c in KEY if c in disp.columns]
+            st.dataframe(disp[show], use_container_width=True, height=430, hide_index=True)
+            st.caption(f"{len(disp)} of {len(bom)} components")
 
     with tab2:
         sc1, sc2 = st.columns(2)
