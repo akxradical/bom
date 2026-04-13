@@ -699,6 +699,102 @@ def tier2_generate(specs, db, store=None):
     return pd.DataFrame(rows), summary
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# SECTION 7A — BOM GROUPING
+# ═══════════════════════════════════════════════════════════════════
+
+# Canonical group order — how a real BOM is structured in EPC
+_GROUP_ORDER = [
+    # Section 1 — Pump Hydraulics
+    ('PUMP HYDRAULICS',
+     ['Pump','Casing','Impeller','Rotor','Wear Ring','Liner']),
+    # Section 2 — Rotating & Shaft
+    ('ROTATING ASSEMBLY',
+     ['Shaft','Sleeve','Rotor']),
+    # Section 3 — Bearings
+    ('BEARINGS & LUBRICATION',
+     ['Bearing','Housing','Lubrication','Oiler']),
+    # Section 4 — Sealing
+    ('SHAFT SEALING',
+     ['Seal','Mechanical Seal','Gland','Stuffing Box']),
+    # Section 5 — Drive
+    ('DRIVE & COUPLING',
+     ['Coupling','Guard','V-Belt','Pulley','Belt']),
+    # Section 6 — Driver
+    ('MOTOR / DRIVER',
+     ['Motor']),
+    # Section 7 — Structural
+    ('STRUCTURAL & BASEPLATE',
+     ['Baseplate','Foundation','Stool','Saddle','Frame','Bracket']),
+    # Section 8 — Piping & Nozzles
+    ('PIPING, NOZZLES & FLANGES',
+     ['Flange','Piping','Pipe','Column','Strainer','Nozzle']),
+    # Section 9 — Fasteners & Gaskets
+    ('FASTENERS & GASKETS',
+     ['Fastener','Fasteners','Gasket','Bolt','Stud','Nut']),
+    # Section 10 — Instrumentation
+    ('INSTRUMENTATION',
+     ['Instrumentation','Thermometer','Gauge','Sensor']),
+    # Section 11 — Acoustic & Safety
+    ('ACOUSTIC & SAFETY',
+     ['Enclosure','Acoustic','Guard']),
+    # Section 12 — Complete Assembly
+    ('COMPLETE ASSEMBLY',
+     ['Assembly']),
+]
+
+def _get_group(category):
+    """Return group name for a given category string."""
+    cat = str(category).strip()
+    for group_name, members in _GROUP_ORDER:
+        for m in members:
+            if m.lower() == cat.lower() or m.lower() in cat.lower():
+                return group_name
+    return 'OTHER'
+
+def group_bom(bom_df):
+    """
+    Takes flat BOM DataFrame.
+    Returns list of (group_name, sub_df) tuples in correct order.
+    Re-numbers items within each group.
+
+    Used by both app display and Excel export.
+    """
+    if bom_df is None or bom_df.empty:
+        return []
+
+    # Assign group to every row
+    cat_col = 'Category' if 'Category' in bom_df.columns else bom_df.columns[1]
+    bom_df = bom_df.copy()
+    bom_df['_group'] = bom_df[cat_col].apply(_get_group)
+
+    # Build ordered groups — only include groups that have rows
+    seen_groups = []
+    result = []
+    for group_name, _ in _GROUP_ORDER:
+        rows = bom_df[bom_df['_group'] == group_name].copy()
+        if not rows.empty and group_name not in seen_groups:
+            seen_groups.append(group_name)
+            rows = rows.drop(columns=['_group'])
+            result.append((group_name, rows))
+
+    # Any ungrouped rows go to OTHER
+    other = bom_df[bom_df['_group'] == 'OTHER'].copy().drop(columns=['_group'])
+    if not other.empty:
+        result.append(('OTHER', other))
+
+    # Re-number: global sequential No across all groups
+    n = 1
+    renumbered = []
+    for gname, gdf in result:
+        gdf = gdf.copy()
+        gdf['No'] = range(n, n + len(gdf))
+        n += len(gdf)
+        renumbered.append((gname, gdf))
+
+    return renumbered
+
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 7 — ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════
@@ -751,7 +847,9 @@ def export_bom_excel(bom_df, specs, tier, match_info, calc_summary):
     thin = Side(style="thin", color="CCCCCC")
     bdr  = Border(left=thin,right=thin,top=thin,bottom=thin)
 
-    ws.merge_cells("A1:L1")
+    # ── Title ──────────────────────────────────────────────────
+    MAX_COL = 10
+    ws.merge_cells(f"A1:{get_column_letter(MAX_COL)}1")
     c = ws["A1"]
     c.value = "AUTOMATED BILL OF MATERIALS"
     c.font  = Font(bold=True,size=13,color="FFFFFF")
@@ -759,49 +857,119 @@ def export_bom_excel(bom_df, specs, tier, match_info, calc_summary):
     c.alignment = Alignment(horizontal="center",vertical="center")
     ws.row_dimensions[1].height = 22
 
+    # ── Project info block ─────────────────────────────────────
     info = [
-        ("Model",      (specs or {}).get("model","—") or "Physics Calculated"),
-        ("Flow (m³/h)",(specs or {}).get("flow_m3h","—")),
-        ("Head (m)",   (specs or {}).get("head_m","—")),
-        ("Fluid",      (specs or {}).get("fluid","—")),
-        ("Temp",       f"{(specs or {}).get('temp_c','—')} °C"),
-        ("Method",     f"Tier 1 — {(match_info or {}).get('model','')}"
-                       if tier=="tier1"
-                       else f"Tier 2 — {(calc_summary or {}).get('pump_type','')}"),
-        ("Generated",  pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
+        ("Pump Model",   (specs or {}).get("model","—") or "Physics Calculated"),
+        ("Flow (m³/h)",  (specs or {}).get("flow_m3h","—")),
+        ("Head (m)",     (specs or {}).get("head_m","—")),
+        ("Fluid",        (specs or {}).get("fluid","—")),
+        ("Temperature",  f"{(specs or {}).get('temp_c','—')} °C"),
+        ("Motor (kW)",   (specs or {}).get("motor_kw") or (calc_summary or {}).get("motor_kw_calc","—")),
+        ("BOM Method",   f"Tier 1 — {(match_info or {}).get('model','')}"
+                          if tier=="tier1"
+                          else f"Tier 2 — {(calc_summary or {}).get('pump_type','')}"),
+        ("Generated",    pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
     ]
     r = 2
     for lbl, val in info:
-        ws.cell(r,1,lbl).font  = Font(bold=True,size=9)
-        ws.cell(r,2,str(val)).font = Font(size=9)
+        c1 = ws.cell(r,1,lbl);         c1.font=Font(bold=True,size=9); c1.fill=PatternFill("solid",start_color="F0F5FB")
+        c2 = ws.cell(r,2,str(val));    c2.font=Font(size=9)
+        ws.merge_cells(f"B{r}:{get_column_letter(MAX_COL)}{r}")
         r += 1
-    r += 1
 
-    hf = PatternFill("solid",start_color="2E75B6")
+    # ── Column headers ─────────────────────────────────────────
+    r += 1
+    HDR_ROW = r
+    headers = ["No","Component ID","Category","Description / Name",
+               "Material (MOC)","Qty","Unit","Weight (kg)","Vendor","Notes"]
+    hf    = PatternFill("solid",start_color="1F4E79")
     hfont = Font(bold=True,color="FFFFFF",size=9)
-    for j, col in enumerate(bom_df.columns):
-        c = ws.cell(r,j+1,col)
+    for j,h in enumerate(headers):
+        c = ws.cell(r,j+1,h)
         c.font=hfont; c.fill=hf
         c.alignment=Alignment(horizontal="center",wrap_text=True)
         c.border=bdr
     ws.row_dimensions[r].height=28
     r += 1
 
-    alt = PatternFill("solid",start_color="F2F2F2")
-    for i,(_, row) in enumerate(bom_df.iterrows()):
-        for j, val in enumerate(row):
-            c = ws.cell(r,j+1, val if pd.notna(val) else "")
-            c.font=Font(size=9)
-            c.alignment=Alignment(wrap_text=True,vertical="top")
-            c.border=bdr
-            if i%2==1: c.fill=alt
-        ws.row_dimensions[r].height=18
+    # ── Group colours (section header fill) ───────────────────
+    GROUP_COLORS = {
+        "PUMP HYDRAULICS":           "1A3A5C",
+        "ROTATING ASSEMBLY":         "1A3A5C",
+        "BEARINGS & LUBRICATION":    "2E5984",
+        "SHAFT SEALING":             "2E5984",
+        "DRIVE & COUPLING":          "366092",
+        "MOTOR / DRIVER":            "17375E",
+        "STRUCTURAL & BASEPLATE":    "4F6228",
+        "PIPING, NOZZLES & FLANGES": "4F6228",
+        "FASTENERS & GASKETS":       "7F7F7F",
+        "INSTRUMENTATION":           "7F7F7F",
+        "ACOUSTIC & SAFETY":         "7F7F7F",
+        "COMPLETE ASSEMBLY":         "1F4E79",
+        "OTHER":                     "595959",
+    }
+    alt = PatternFill("solid",start_color="F2F7FC")
+    alt2= PatternFill("solid",start_color="FFFFFF")
+
+    # ── Write grouped BOM ─────────────────────────────────────
+    groups = group_bom(bom_df)
+
+    # Determine display columns
+    t1_cols = ["No","Component_ID","Category","Component_Name",
+               "Material_Spec","Qty_Per_Unit","Unit","Weight_kg",
+               "Vendor_Name","Notes"]
+    t2_cols = ["No","Component_ID","Category","Description",
+               "MOC","Qty","","Weight_kg","","Notes"]
+
+    def _cell_val(row_series, col_name, fallback=""):
+        if col_name and col_name in row_series.index:
+            v = row_series[col_name]
+            return "" if pd.isna(v) else v
+        return fallback
+
+    for gname, gdf in groups:
+        # Section header row
+        grp_color = GROUP_COLORS.get(gname, "595959")
+        ws.merge_cells(f"A{r}:{get_column_letter(MAX_COL)}{r}")
+        gc = ws.cell(r,1, f"  {gname}")
+        gc.font  = Font(bold=True,size=9,color="FFFFFF")
+        gc.fill  = PatternFill("solid",start_color=grp_color)
+        gc.alignment = Alignment(vertical="center")
+        ws.row_dimensions[r].height = 16
         r += 1
 
-    for i,w in enumerate([5,18,14,14,35,25,6,6,8,20,14,45]):
-        if i < ws.max_column:
-            ws.column_dimensions[get_column_letter(i+1)].width = w
-    ws.freeze_panes = f"A{r-len(bom_df)}"
+        # Component rows
+        is_t1 = "Component_Name" in gdf.columns
+        cols  = t1_cols if is_t1 else t2_cols
+
+        for i,(_, row_s) in enumerate(gdf.iterrows()):
+            row_fill = alt if i%2==0 else alt2
+            vals = [
+                _cell_val(row_s,"No"),
+                _cell_val(row_s,"Component_ID"),
+                _cell_val(row_s,"Category"),
+                _cell_val(row_s,"Component_Name") or _cell_val(row_s,"Description"),
+                _cell_val(row_s,"Material_Spec")  or _cell_val(row_s,"MOC"),
+                _cell_val(row_s,"Qty_Per_Unit")   or _cell_val(row_s,"Qty"),
+                _cell_val(row_s,"Unit"),
+                _cell_val(row_s,"Weight_kg"),
+                _cell_val(row_s,"Vendor_Name"),
+                _cell_val(row_s,"Notes"),
+            ]
+            for j,val in enumerate(vals):
+                c = ws.cell(r,j+1, val)
+                c.font      = Font(size=9)
+                c.alignment = Alignment(wrap_text=True,vertical="top")
+                c.border    = bdr
+                c.fill      = row_fill
+            ws.row_dimensions[r].height = 18
+            r += 1
+
+    # ── Column widths ──────────────────────────────────────────
+    col_widths = [5,22,16,38,28,6,6,10,22,42]
+    for i,w in enumerate(col_widths):
+        ws.column_dimensions[get_column_letter(i+1)].width = w
+    ws.freeze_panes = f"A{HDR_ROW+1}"
 
     if tier=="tier2" and calc_summary:
         ws2 = wb.create_sheet("Calculation")
