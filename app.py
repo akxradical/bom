@@ -12,6 +12,7 @@ from engine import (
     load_db, extract_pdf_text, parse_specs,
     generate_bom, export_bom_excel, calc_specific_speed,
     get_store, log_feedback, log_correction, log_pattern,
+    group_bom,
 )
 
 # ─────────────────────────────────────────────────────────────────
@@ -525,8 +526,6 @@ elif st.session_state.page == "output":
     tab1, tab2, tab3 = st.tabs(["📋 BOM Table", "📊 Summary", "🔧 Calculations"])
 
     with tab1:
-        from engine import group_bom
-
         vt1, vt2 = st.columns([3, 1])
         with vt2:
             view_mode = st.radio("View", ["Grouped", "Flat"],
