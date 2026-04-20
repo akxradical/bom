@@ -371,42 +371,70 @@ def extract_pdf_text(file_bytes):
 _PATTERNS = {
     "flow_m3h": [
         r"(?:[Rr]ated\s+)?(?:[Vv]olumetric\s+)?[Ff]low\s*(?:[Rr]ate|[Cc]apacity)?\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
+        r"[Ff]low\s*[:\-=]?\s*(\d+\.?\d*)\s*m\xb3/h",
         r"[Cc]apacity\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
+        r"[Dd]ischarge\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
         r"\bQ\s*[=:\-]\s*(\d+\.?\d*)\s*m3",
         r"(\d+\.?\d*)\s*m3/hr",
+        r"[Cc]apacity\s+of\s+each\s+pump\s+(?:m3/h[r]?)?\s*(\d+\.?\d*)",
+        r"(?:Flow|Discharge|Capacity)\s+(?:m3/h[r]?|m\xb3/h[r]?)\s+(\d+\.?\d*)",
         r"\b(\d{3,5}\.?\d*)\s*LPM\b",
+        r"\b(\d{3,5}\.?\d*)\s*L/[Mm]in\b",
+        r"\b(\d+\.?\d*)\s*[Ll][Pp][Ss]\b",
+        r"\b(\d+\.?\d*)\s*[Ll]/[Ss]\b",
     ],
     "head_m": [
-        r"[Pp]ump\s+[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
-        r"[Tt]otal\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
-        r"[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
+        r"[Pp]ump\s+[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
+        r"[Tt]otal\s+(?:[Dd]ynamic\s+)?[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
+        r"[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
+        r"\bTDH\s*[:\-=]?\s*(\d+\.?\d*)\s*m",
         r"\bH\s*[=:\-]\s*(\d+\.?\d*)\s*m\b",
+        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*[Mm][Ww][Cc]",
+        r"(\d+\.?\d*)\s*[Mm][Ww][Cc]",
+        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*[Mm][Ll][Cc]",
+        r"(\d+\.?\d*)\s*[Mm][Ll][Cc]",
+        r"[Pp]ump\s+[Dd]ifferential\s+[Hh]ead[^\d]+(\d+\.?\d*)",
+        r"[Dd]ifferential\s+[Hh]ead[^\d]+(\d+\.?\d*)",
+        r"(\d{1,3}\.?\d*)\s*[Mm]tr\b",
         r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
     ],
     "speed_rpm": [
         r"[Ff]ull\s+[Ll]oad\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"[Rr]ated\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
+        r"[Ss]peed\s+of\s+[Pp]ump[^\d]+(\d{3,4})",
         r"[Ss]peed\s*[:\-=]?\s*(\d{3,4})\s*[Rr][Pp][Mm]",
         r"(\d{3,4})\s*[Rr][Pp][Mm]",
     ],
     "motor_kw": [
         r"[Mm]otor\s+[Rr]ating\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Mm]otor\s+[Pp]ower\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
         r"[Nn]ominal\s+[Pp]ower\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
         r"[Rr]ated\s+[Oo]utput.*?(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Ss]elected\s+[Dd]rive\s+[Rr]ating.*?(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Ss]elected\s+[Mm]otor.*?(\d+\.?\d*)\s*[Kk][Ww]",
+        r"[Mm]otor\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
+        r"(\d+\.?\d*)\s*[Kk][Ww]\s*(?:motor|Motor|MOTOR|nameplate)",
         r"(\d+\.?\d*)\s*[Hh][Pp]\b",
     ],
     "temp_c": [
         r"[Oo]p(?:erating)?\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
         r"[Pp]rocess\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
+        r"[Tt]emp(?:erature)?\s+[Oo]f\s+[Ff]luid[^\d]*(\d+\.?\d*)",
+        r"[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0][Cc]",
         r"(\d{2,3})\s*[Dd]eg\.?\s*[Cc]\b",
         r"(\d{2,3})\s*[°\xb0][Cc]\b",
+        r"[Ff]luid\s+[Tt]emp[^\d]+(\d+\.?\d*)",
     ],
     "density_kgm3": [
         r"[Dd]ensity\s*[:\-=]?\s*(\d{3,4}\.?\d*)\s*kg",
         r"[Ss]pecific\s+[Gg]ravity\s*[:\-=]?\s*(\d\.?\d+)",
         r"\bSG\s*[=:\-]\s*(\d\.?\d+)\b",
+        r"\bS\.?G\.?\s*[=:\-]\s*(\d\.?\d+)\b",
+        r"[Ss]p\.?\s*[Gg]r\.?\s*[=:\-]\s*(\d\.?\d+)",
     ],
     "stages": [
         r"[Nn]o\.?\s+[Oo]f\s+[Ss]tages?\s*[:\-=]?\s*(\d+)",
+        r"[Nn]umber\s+[Oo]f\s+[Ss]tages?\s*[:\-=]?\s*(\d+)",
         r"(\d+)\s*[Ss]tage\s+[Pp]ump",
         r"(\d+)[- ][Ss]tage\b",
     ],
@@ -542,12 +570,16 @@ def parse_specs(text, learned_patterns=None):
                 m = re.search(p, t)
                 if not m: continue
                 val = float(m.group(1))
-                if field=="flow_m3h" and ("LPM" in p or "L/[Mm]in" in p):
-                    val = round(val/1000*60, 2)
-                if field=="motor_kw" and "[Hh][Pp]" in p:
-                    val = round(val*0.7457, 2)
-                if field=="density_kgm3" and val < 5:
-                    val = round(val*1000, 1)
+                # Unit conversions
+                if field == "flow_m3h":
+                    if any(x in p for x in ["LPM", "L/[Mm]in"]):
+                        val = round(val / 1000 * 60, 2)   # LPM → m³/h
+                    elif any(x in p for x in ["[Ll][Pp][Ss]", "[Ll]/[Ss]", "l/s"]):
+                        val = round(val * 3.6, 2)           # LPS → m³/h
+                if field == "motor_kw" and "[Hh][Pp]" in p:
+                    val = round(val * 0.7457, 2)            # HP → kW
+                if field == "density_kgm3" and val < 5:
+                    val = round(val * 1000, 1)              # SG → kg/m³
                 lo, hi = _SANITY.get(field,(None,None))
                 if lo is not None and not (lo < val < hi): continue
                 specs[field] = val; break
