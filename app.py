@@ -24,6 +24,176 @@ try:
 except Exception:
     PRICING_AVAILABLE = False
 
+
+def _show_pricing_results(priced_df, cost_sum, specs, tier, mi, cs):
+    """Render the full cost estimation results."""
+
+    # ── Top cost metrics ─────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    ex_gst  = cost_sum["total_ex_gst"]
+    gst_amt = cost_sum["total_gst"]
+    incl    = cost_sum["total_incl_gst"]
+    comps   = cost_sum["component_count"]
+
+    for col, (lbl, val, clr) in zip([c1,c2,c3,c4], [
+        ("Ex-GST Total",     f"₹{ex_gst:,.0f}",  "#58a6ff"),
+        ("GST (18%)",        f"₹{gst_amt:,.0f}", "#ffa657"),
+        ("Total incl. GST",  f"₹{incl:,.0f}",    "#3fb950"),
+        ("Components Priced",str(comps),          "#79c0ff"),
+    ]):
+        col.markdown(
+            f'<div class="metric-tile">'
+            f'<div class="metric-value" style="color:{clr};font-size:20px;">{val}</div>'
+            f'<div class="metric-label">{lbl}</div></div>',
+            unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    tab1, tab2, tab3 = st.tabs(["📊 Cost Breakdown", "📋 Detailed Line Items", "⬇ Export"])
+
+    # ── TAB 1: Cost Breakdown ────────────────────────────────────
+    with tab1:
+        col_a, col_b = st.columns([3, 2])
+
+        with col_a:
+            st.markdown('<div class="sec-hdr">Cost by Sub-Assembly</div>',
+                        unsafe_allow_html=True)
+            sub_totals = cost_sum.get("sub_totals", {})
+            max_v = max(sub_totals.values()) if sub_totals else 1
+            for sub, val in sub_totals.items():
+                pct = int(val / max_v * 100)
+                pct_of_total = val / max(cost_sum["total_ex_gst"], 1) * 100
+                st.markdown(
+                    f'<div style="margin:5px 0;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="color:#8b949e;font-size:12px;">{sub[:35]}</span>'
+                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
+                    f'₹{val:,.0f} ({pct_of_total:.1f}%)</span></div>'
+                    f'<div style="background:#21262d;border-radius:3px;height:8px;">'
+                    f'<div style="background:#1f6feb;width:{pct}%;'
+                    f'border-radius:3px;height:8px;"></div></div></div>',
+                    unsafe_allow_html=True)
+
+        with col_b:
+            st.markdown('<div class="sec-hdr">Top 5 Cost Drivers</div>',
+                        unsafe_allow_html=True)
+            for item in cost_sum.get("top5_drivers", []):
+                name = str(item.get("Component_Name", item.get("Description","—")))[:35]
+                val2 = item.get("Total_Price_INR", 0)
+                conf = item.get("Price_Confidence","—")
+                conf_color = "#3fb950" if conf=="high" else "#ffa657" if conf=="medium" else "#8b949e"
+                st.markdown(
+                    f'<div style="padding:6px 0;border-bottom:1px solid #21262d;">'
+                    f'<div style="color:#e6edf3;font-size:12px;">{name}</div>'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
+                    f'₹{val2:,.0f}</span>'
+                    f'<span style="color:{conf_color};font-size:10px;">{conf}</span>'
+                    f'</div></div>',
+                    unsafe_allow_html=True)
+
+            st.markdown("---")
+            # Confidence breakdown
+            st.markdown('<div class="sec-hdr">Price Confidence</div>',
+                        unsafe_allow_html=True)
+            conf_d = cost_sum.get("confidence", {})
+            for level, cnt in conf_d.items():
+                clr = "#3fb950" if level=="high" else "#ffa657" if level=="medium" else "#8b949e"
+                st.markdown(
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding:3px 0;">'
+                    f'<span style="color:{clr};font-size:12px;">●  {level.title()}</span>'
+                    f'<span style="color:#8b949e;font-size:12px;">{cnt} items</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+        # Disclaimer
+        st.markdown(
+            f'<div class="card-amber" style="margin-top:16px;">'
+            f'⚠️  <b style="color:#d29922;">Indicative Estimate Only</b><br>'
+            f'<span style="color:#8b949e;font-size:12px;">'
+            f'{cost_sum.get("note","")}</span></div>',
+            unsafe_allow_html=True)
+
+    # ── TAB 2: Detailed Line Items ───────────────────────────────
+    with tab2:
+        show_cols = []
+        for c in ["No", "Category", "Sub_Assembly",
+                  "Component_Name", "Description",
+                  "Material_Spec", "MOC",
+                  "Qty_Per_Unit", "Qty",
+                  "Weight_kg",
+                  "Unit_Price_INR", "Price_Basis",
+                  "Qty_Num", "Total_Price_INR",
+                  "GST_Rate_%", "GST_Amount_INR", "Price_With_GST",
+                  "Price_Confidence", "Price_Source", "Price_Notes"]:
+            if c in priced_df.columns:
+                show_cols.append(c)
+
+        # Format for display
+        disp = priced_df[show_cols].copy()
+        for col in ["Unit_Price_INR","Total_Price_INR","GST_Amount_INR","Price_With_GST"]:
+            if col in disp.columns:
+                disp[col] = disp[col].apply(
+                    lambda x: f"₹{int(x):,}" if pd.notna(x) and x else "—")
+
+        st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
+        st.caption(
+            f"Total (ex-GST): ₹{cost_sum['total_ex_gst']:,} | "
+            f"GST: ₹{cost_sum['total_gst']:,} | "
+            f"Total (incl. GST): ₹{cost_sum['total_incl_gst']:,}")
+
+    # ── TAB 3: Export ────────────────────────────────────────────
+    with tab3:
+        st.markdown('<div class="sec-hdr">Download Priced BOM</div>',
+                    unsafe_allow_html=True)
+
+        # CSV download
+        csv_df = priced_df.copy()
+        st.download_button(
+            "⬇ Download Priced BOM (CSV)",
+            csv_df.to_csv(index=False),
+            f"Priced_BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.csv",
+            "text/csv", use_container_width=False)
+
+        st.markdown("---")
+        st.markdown(
+            '<div class="card">'
+            '<div class="sec-hdr">Cost Summary</div>', unsafe_allow_html=True)
+
+        summary_lines = [
+            ("Total BOM Value (Ex-GST)",    f"₹{cost_sum['total_ex_gst']:,}"),
+            ("GST @ 18%",                   f"₹{cost_sum['total_gst']:,}"),
+            ("Total BOM Value (Incl. GST)", f"₹{cost_sum['total_incl_gst']:,}"),
+            ("Number of Line Items",        str(cost_sum['component_count'])),
+            ("Live Market Lookups",         str(cost_sum['api_calls_used'])),
+            ("Generated",                   pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
+            ("Fluid Service",               (specs or {}).get("fluid","—")),
+            ("Motor",                       f"{(specs or {}).get('motor_kw') or (cs or {}).get('motor_kw_calc','—')} kW"),
+            ("BOM Method",                  "Tier 1 — Database" if tier=="tier1" else "Tier 2 — Physics"),
+        ]
+        for lbl, val in summary_lines:
+            st.markdown(
+                f'<div class="kv-row"><span class="kv-lbl">{lbl}</span>'
+                f'<span class="kv-val">{val}</span></div>',
+                unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown(
+            '<div class="card-amber">'
+            '⚠️  Prices are indicative market estimates for budget planning purposes.<br>'
+            '<span style="color:#8b949e;font-size:12px;">'
+            'Actual procurement prices will vary based on vendor, quantity, '
+            'delivery terms, and market conditions at time of order.</span>'
+            '</div>', unsafe_allow_html=True)
+
+        # Re-run pricing
+        st.markdown("---")
+        if st.button("🔄 Re-run Pricing (refresh market data)", use_container_width=False):
+            st.session_state.priced_df   = None
+            st.session_state.cost_summary = None
+            st.rerun()
+
+
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────
@@ -1012,6 +1182,7 @@ elif st.session_state.page == "database":
         st.dataframe(db["vendors"],use_container_width=True,hide_index=True)
 
 
+
 # ═══════════════════════════════════════════════════════════════════
 # PAGE — COST ESTIMATION  (Claude API + web search)
 # ═══════════════════════════════════════════════════════════════════
@@ -1118,172 +1289,3 @@ if st.session_state.page == "pricing":
     st.markdown("---")
     if st.button("← Back to BOM Output"):
         st.session_state.page = "output"; st.rerun()
-
-
-def _show_pricing_results(priced_df, cost_sum, specs, tier, mi, cs):
-    """Render the full cost estimation results."""
-
-    # ── Top cost metrics ─────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    ex_gst  = cost_sum["total_ex_gst"]
-    gst_amt = cost_sum["total_gst"]
-    incl    = cost_sum["total_incl_gst"]
-    comps   = cost_sum["component_count"]
-
-    for col, (lbl, val, clr) in zip([c1,c2,c3,c4], [
-        ("Ex-GST Total",     f"₹{ex_gst:,.0f}",  "#58a6ff"),
-        ("GST (18%)",        f"₹{gst_amt:,.0f}", "#ffa657"),
-        ("Total incl. GST",  f"₹{incl:,.0f}",    "#3fb950"),
-        ("Components Priced",str(comps),          "#79c0ff"),
-    ]):
-        col.markdown(
-            f'<div class="metric-tile">'
-            f'<div class="metric-value" style="color:{clr};font-size:20px;">{val}</div>'
-            f'<div class="metric-label">{lbl}</div></div>',
-            unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    tab1, tab2, tab3 = st.tabs(["📊 Cost Breakdown", "📋 Detailed Line Items", "⬇ Export"])
-
-    # ── TAB 1: Cost Breakdown ────────────────────────────────────
-    with tab1:
-        col_a, col_b = st.columns([3, 2])
-
-        with col_a:
-            st.markdown('<div class="sec-hdr">Cost by Sub-Assembly</div>',
-                        unsafe_allow_html=True)
-            sub_totals = cost_sum.get("sub_totals", {})
-            max_v = max(sub_totals.values()) if sub_totals else 1
-            for sub, val in sub_totals.items():
-                pct = int(val / max_v * 100)
-                pct_of_total = val / max(cost_sum["total_ex_gst"], 1) * 100
-                st.markdown(
-                    f'<div style="margin:5px 0;">'
-                    f'<div style="display:flex;justify-content:space-between;">'
-                    f'<span style="color:#8b949e;font-size:12px;">{sub[:35]}</span>'
-                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
-                    f'₹{val:,.0f} ({pct_of_total:.1f}%)</span></div>'
-                    f'<div style="background:#21262d;border-radius:3px;height:8px;">'
-                    f'<div style="background:#1f6feb;width:{pct}%;'
-                    f'border-radius:3px;height:8px;"></div></div></div>',
-                    unsafe_allow_html=True)
-
-        with col_b:
-            st.markdown('<div class="sec-hdr">Top 5 Cost Drivers</div>',
-                        unsafe_allow_html=True)
-            for item in cost_sum.get("top5_drivers", []):
-                name = str(item.get("Component_Name", item.get("Description","—")))[:35]
-                val2 = item.get("Total_Price_INR", 0)
-                conf = item.get("Price_Confidence","—")
-                conf_color = "#3fb950" if conf=="high" else "#ffa657" if conf=="medium" else "#8b949e"
-                st.markdown(
-                    f'<div style="padding:6px 0;border-bottom:1px solid #21262d;">'
-                    f'<div style="color:#e6edf3;font-size:12px;">{name}</div>'
-                    f'<div style="display:flex;justify-content:space-between;">'
-                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
-                    f'₹{val2:,.0f}</span>'
-                    f'<span style="color:{conf_color};font-size:10px;">{conf}</span>'
-                    f'</div></div>',
-                    unsafe_allow_html=True)
-
-            st.markdown("---")
-            # Confidence breakdown
-            st.markdown('<div class="sec-hdr">Price Confidence</div>',
-                        unsafe_allow_html=True)
-            conf_d = cost_sum.get("confidence", {})
-            for level, cnt in conf_d.items():
-                clr = "#3fb950" if level=="high" else "#ffa657" if level=="medium" else "#8b949e"
-                st.markdown(
-                    f'<div style="display:flex;justify-content:space-between;'
-                    f'padding:3px 0;">'
-                    f'<span style="color:{clr};font-size:12px;">●  {level.title()}</span>'
-                    f'<span style="color:#8b949e;font-size:12px;">{cnt} items</span>'
-                    f'</div>', unsafe_allow_html=True)
-
-        # Disclaimer
-        st.markdown(
-            f'<div class="card-amber" style="margin-top:16px;">'
-            f'⚠️  <b style="color:#d29922;">Indicative Estimate Only</b><br>'
-            f'<span style="color:#8b949e;font-size:12px;">'
-            f'{cost_sum.get("note","")}</span></div>',
-            unsafe_allow_html=True)
-
-    # ── TAB 2: Detailed Line Items ───────────────────────────────
-    with tab2:
-        show_cols = []
-        for c in ["No", "Category", "Sub_Assembly",
-                  "Component_Name", "Description",
-                  "Material_Spec", "MOC",
-                  "Qty_Per_Unit", "Qty",
-                  "Weight_kg",
-                  "Unit_Price_INR", "Price_Basis",
-                  "Qty_Num", "Total_Price_INR",
-                  "GST_Rate_%", "GST_Amount_INR", "Price_With_GST",
-                  "Price_Confidence", "Price_Source", "Price_Notes"]:
-            if c in priced_df.columns:
-                show_cols.append(c)
-
-        # Format for display
-        disp = priced_df[show_cols].copy()
-        for col in ["Unit_Price_INR","Total_Price_INR","GST_Amount_INR","Price_With_GST"]:
-            if col in disp.columns:
-                disp[col] = disp[col].apply(
-                    lambda x: f"₹{int(x):,}" if pd.notna(x) and x else "—")
-
-        st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
-        st.caption(
-            f"Total (ex-GST): ₹{cost_sum['total_ex_gst']:,} | "
-            f"GST: ₹{cost_sum['total_gst']:,} | "
-            f"Total (incl. GST): ₹{cost_sum['total_incl_gst']:,}")
-
-    # ── TAB 3: Export ────────────────────────────────────────────
-    with tab3:
-        st.markdown('<div class="sec-hdr">Download Priced BOM</div>',
-                    unsafe_allow_html=True)
-
-        # CSV download
-        csv_df = priced_df.copy()
-        st.download_button(
-            "⬇ Download Priced BOM (CSV)",
-            csv_df.to_csv(index=False),
-            f"Priced_BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.csv",
-            "text/csv", use_container_width=False)
-
-        st.markdown("---")
-        st.markdown(
-            '<div class="card">'
-            '<div class="sec-hdr">Cost Summary</div>', unsafe_allow_html=True)
-
-        summary_lines = [
-            ("Total BOM Value (Ex-GST)",    f"₹{cost_sum['total_ex_gst']:,}"),
-            ("GST @ 18%",                   f"₹{cost_sum['total_gst']:,}"),
-            ("Total BOM Value (Incl. GST)", f"₹{cost_sum['total_incl_gst']:,}"),
-            ("Number of Line Items",        str(cost_sum['component_count'])),
-            ("Live Market Lookups",         str(cost_sum['api_calls_used'])),
-            ("Generated",                   pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
-            ("Fluid Service",               (specs or {}).get("fluid","—")),
-            ("Motor",                       f"{(specs or {}).get('motor_kw') or (cs or {}).get('motor_kw_calc','—')} kW"),
-            ("BOM Method",                  "Tier 1 — Database" if tier=="tier1" else "Tier 2 — Physics"),
-        ]
-        for lbl, val in summary_lines:
-            st.markdown(
-                f'<div class="kv-row"><span class="kv-lbl">{lbl}</span>'
-                f'<span class="kv-val">{val}</span></div>',
-                unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown(
-            '<div class="card-amber">'
-            '⚠️  Prices are indicative market estimates for budget planning purposes.<br>'
-            '<span style="color:#8b949e;font-size:12px;">'
-            'Actual procurement prices will vary based on vendor, quantity, '
-            'delivery terms, and market conditions at time of order.</span>'
-            '</div>', unsafe_allow_html=True)
-
-        # Re-run pricing
-        st.markdown("---")
-        if st.button("🔄 Re-run Pricing (refresh market data)", use_container_width=False):
-            st.session_state.priced_df   = None
-            st.session_state.cost_summary = None
-            st.rerun()
