@@ -58,61 +58,73 @@ def _call_claude(prompt, system="", use_search=False, max_tokens=4000):
 
 
 def _parse_json(text):
-    """Extract JSON from Claude response — handles messy output robustly."""
-    clean = re.sub(r"```(?:json)?|```", "", text).strip()
+    """Extract JSON from Claude response. Handles extra text, fences, trailing commas."""
+    if not text:
+        return None
 
-    # Try direct parse first
-    for attempt in [clean]:
-        try:
-            return json.loads(attempt)
-        except Exception:
-            pass
+    # Strip markdown fences
+    clean = text.strip()
+    clean = clean.replace("```json", "").replace("```", "").strip()
 
-    # Find JSON object or array — try whichever appears FIRST
-    obj_pos = clean.find('{')
-    arr_pos = clean.find('[')
-    # Order by which appears first (array first if it wraps objects)
-    pairs = []
-    if arr_pos >= 0 and (obj_pos < 0 or arr_pos < obj_pos):
-        pairs = [('[', ']'), ('{', '}')]
-    else:
-        pairs = [('{', '}'), ('[', ']')]
-    for opener, closer in pairs:
-        start = clean.find(opener)
-        if start == -1:
+    # Strategy 1: direct parse
+    try:
+        return json.loads(clean)
+    except Exception:
+        pass
+
+    # Strategy 2: find the outermost [ ] or { } using bracket counting
+    result = _bracket_extract(clean, '[', ']')
+    if result is not None:
+        return result
+
+    result = _bracket_extract(clean, '{', '}')
+    if result is not None:
+        return result
+
+    return None
+
+
+def _bracket_extract(text, opener, closer):
+    """Find and parse the first complete JSON structure bounded by opener/closer."""
+    start = text.find(opener)
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+
+        # Handle string literals — skip everything inside quotes
+        if ch == '"' and (i == 0 or text[i-1] != '\\'):
+            in_string = not in_string
+            i += 1
             continue
-        depth = 0
-        in_str = False
-        escape = False
-        for i in range(start, len(clean)):
-            c = clean[i]
-            if escape:
-                escape = False
-                continue
-            if c == '\\':
-                escape = True
-                continue
-            if c == '"' and not escape:
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if c == opener:
-                depth += 1
-            elif c == closer:
-                depth -= 1
-                if depth == 0:
-                    chunk = clean[start:i+1]
+
+        if in_string:
+            i += 1
+            continue
+
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i+1]
+                # Try parsing
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # Fix trailing commas: ,} or ,]
+                    import re as _re
+                    fixed = _re.sub(r',\s*([}\]])', r'\1', candidate)
                     try:
-                        return json.loads(chunk)
-                    except json.JSONDecodeError:
-                        # Try fixing common issues
-                        chunk2 = re.sub(r",\s*([}\]])", r"\1", chunk)  # trailing commas
-                        try:
-                            return json.loads(chunk2)
-                        except Exception:
-                            pass
-                    break
+                        return json.loads(fixed)
+                    except Exception:
+                        return None
+        i += 1
+
     return None
 
 
