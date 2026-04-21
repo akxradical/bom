@@ -291,13 +291,49 @@ Respond with ONLY the JSON array."""
     raw = _call_claude(prompt, system=BOM_SYSTEM, max_tokens=6000)
     data = _parse_json(raw)
 
+    # Normalize: always return a list of dicts
+    items = _normalize_bom_data(data, raw)
+    return items
+
+
+def _normalize_bom_data(data, raw_text=""):
+    """
+    Claude can return BOM as:
+      - list of dicts (ideal)
+      - dict with "components", "bom", or "items" key
+      - dict that IS a single component
+      - string (if _parse_json failed)
+      - None
+    Normalize to list of dicts always.
+    """
     if isinstance(data, list):
-        return data
-    elif isinstance(data, dict) and "components" in data:
-        return data["components"]
-    elif isinstance(data, dict) and "bom" in data:
-        return data["bom"]
-    return data
+        # Filter: only keep dicts, skip strings/ints
+        return [item for item in data if isinstance(item, dict)]
+
+    if isinstance(data, dict):
+        # Check for nested list keys
+        for key in ["components", "bom", "items", "bill_of_materials",
+                     "BOM", "Components", "data"]:
+            if key in data and isinstance(data[key], list):
+                return [item for item in data[key] if isinstance(item, dict)]
+        # Maybe the dict itself has component fields
+        if "component" in data or "section" in data or "moc" in data:
+            return [data]
+        # Try all list values in the dict
+        for v in data.values():
+            if isinstance(v, list) and len(v) > 3:
+                items = [item for item in v if isinstance(item, dict)]
+                if items:
+                    return items
+
+    # Last resort: try to extract from raw text if _parse_json gave bad result
+    if raw_text and isinstance(raw_text, str):
+        # Try finding array in raw text directly
+        arr = _bracket_extract(raw_text.replace("```json","").replace("```",""), "[", "]")
+        if isinstance(arr, list):
+            return [item for item in arr if isinstance(item, dict)]
+
+    return []
 
 
 def bom_to_dataframe(bom_list):
@@ -307,18 +343,22 @@ def bom_to_dataframe(bom_list):
 
     rows = []
     for i, comp in enumerate(bom_list, 1):
+        if not isinstance(comp, dict):
+            continue
         rows.append({
             "No":           i,
             "Section":      str(comp.get("section", "")),
             "Sub_Assembly": str(comp.get("sub_assembly", "")),
-            "Component":    str(comp.get("component", "")),
-            "Description":  str(comp.get("description", "")),
-            "MOC":          str(comp.get("moc", "")),
-            "Qty":          str(comp.get("qty", "1")),
-            "Weight_kg":    comp.get("weight_kg"),
-            "Req_Type":     str(comp.get("req_type", "M")),
-            "Notes":        str(comp.get("notes", "")),
+            "Component":    str(comp.get("component", comp.get("name", comp.get("item", "")))),
+            "Description":  str(comp.get("description", comp.get("desc", ""))),
+            "MOC":          str(comp.get("moc", comp.get("material", comp.get("MOC", "")))),
+            "Qty":          str(comp.get("qty", comp.get("quantity", "1"))),
+            "Weight_kg":    comp.get("weight_kg", comp.get("weight", None)),
+            "Req_Type":     str(comp.get("req_type", comp.get("type", "M"))),
+            "Notes":        str(comp.get("notes", comp.get("note", comp.get("remarks", "")))),
         })
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows)
 
 
