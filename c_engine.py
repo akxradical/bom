@@ -58,14 +58,61 @@ def _call_claude(prompt, system="", use_search=False, max_tokens=4000):
 
 
 def _parse_json(text):
-    """Extract JSON from Claude response (strips markdown fences)."""
+    """Extract JSON from Claude response — handles messy output robustly."""
     clean = re.sub(r"```(?:json)?|```", "", text).strip()
-    m = re.search(r"\{.*\}", clean, re.DOTALL)
-    if m:
-        return json.loads(m.group())
-    m2 = re.search(r"\[.*\]", clean, re.DOTALL)
-    if m2:
-        return json.loads(m2.group())
+
+    # Try direct parse first
+    for attempt in [clean]:
+        try:
+            return json.loads(attempt)
+        except Exception:
+            pass
+
+    # Find JSON object or array — try whichever appears FIRST
+    obj_pos = clean.find('{')
+    arr_pos = clean.find('[')
+    # Order by which appears first (array first if it wraps objects)
+    pairs = []
+    if arr_pos >= 0 and (obj_pos < 0 or arr_pos < obj_pos):
+        pairs = [('[', ']'), ('{', '}')]
+    else:
+        pairs = [('{', '}'), ('[', ']')]
+    for opener, closer in pairs:
+        start = clean.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(clean)):
+            c = clean[i]
+            if escape:
+                escape = False
+                continue
+            if c == '\\':
+                escape = True
+                continue
+            if c == '"' and not escape:
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    chunk = clean[start:i+1]
+                    try:
+                        return json.loads(chunk)
+                    except json.JSONDecodeError:
+                        # Try fixing common issues
+                        chunk2 = re.sub(r",\s*([}\]])", r"\1", chunk)  # trailing commas
+                        try:
+                            return json.loads(chunk2)
+                        except Exception:
+                            pass
+                    break
     return None
 
 
