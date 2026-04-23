@@ -112,13 +112,10 @@ def _bracket_extract(text, opener, closer):
             depth -= 1
             if depth == 0:
                 candidate = text[start:i+1]
-                # Try parsing
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError:
-                    # Fix trailing commas: ,} or ,]
-                    import re as _re
-                    fixed = _re.sub(r',\s*([}\]])', r'\1', candidate)
+                    fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
                     try:
                         return json.loads(fixed)
                     except Exception:
@@ -148,7 +145,18 @@ Critical rules:
 - Extract Material of Construction (MOC) for every component mentioned.
 - Identify the pump type: HSC, VTP, Slurry, Sump, Multistage, etc.
 - Note manufacturer, model, tag numbers, project details.
-- If a field says "VTA" or "Bidder to furnish" → mark as null, don't guess."""
+- If a field says "VTA" or "Bidder to furnish" → mark as null, don't guess.
+- Read EVERY row carefully: vendor response columns often contain the actual 
+  values (materials, dimensions, weights) even when the spec column says VTA.
+- Pay special attention to:
+  * Nozzle sizes and ratings from the nozzle schedule
+  * All MOC entries including casing bolts, bearing housing, base plate
+  * Weights section (total, heaviest part, transport)
+  * Seal type, seal plan, and seal accessories
+  * Drive type (direct/belt/gear) and coupling details
+  * Motor electrical data (voltage, frequency, poles)
+  * NPSHA/NPSHR values
+  * Vibration and noise limits"""
 
 
 def claude_extract_specs(pdf_text):
@@ -157,9 +165,11 @@ def claude_extract_specs(pdf_text):
     Handles multi-pump documents automatically.
     """
     prompt = f"""Read this pump technical document and extract ALL pump specifications.
+Pay careful attention to the VENDOR RESPONSE column — it often contains the actual
+values when the specification column says "VTA" (Vendor to Advise).
 
 DOCUMENT TEXT:
-{pdf_text[:12000]}
+{pdf_text[:15000]}
 
 Respond with ONLY a JSON object (no other text):
 {{
@@ -170,60 +180,107 @@ Respond with ONLY a JSON object (no other text):
   
   "pumps": [
     {{
-      "pump_label": "descriptive name e.g. Hydrant Water Pump",
+      "pump_label": "descriptive name e.g. Feed Liquor Booster Pump",
       "model": "pump model or null",
       "manufacturer": "name or null",
-      "type": "Horizontal Split Casing | Vertical Turbine | Slurry | Sump | Multistage | Other",
+      "type": "Horizontal Centrifugal | Horizontal Split Casing | Vertical Turbine | Slurry | Sump | Multistage | Other",
       "tag_numbers": "tag nos or null",
-      "standard": "API 610 | IS 5120 | etc or null",
+      "standard": "API 610 | IS 5120 | ISO 9906 | etc or null",
+      "quantity": "total number of pump units or null",
+      "configuration": "1W+1S per stream etc or null",
       
       "flow_m3h": number or null,
       "head_m": number or null,
       "speed_rpm": number or null,
       "motor_kw": number or null,
+      "shaft_power_kw": number or null,
       "stages": number or null,
       "temp_c": number or null,
       "density_kgm3": number or null,
       "fluid": "fluid name",
-      "viscosity": "value or null",
+      "viscosity": "value with unit or null",
       "npsha_m": number or null,
+      "npshr_m": number or null,
+      "min_flow_m3h": number or null,
+      "shutoff_head_m": number or null,
+      "efficiency_pct": number or null,
+      "impeller_dia_mm": number or null,
       
       "moc": {{
-        "casing": "material spec or null",
-        "impeller": "material spec or null",
-        "shaft": "material spec or null",
-        "shaft_sleeve": "material spec or null",
-        "wear_ring": "material spec or null",
-        "bearing": "material spec or null",
-        "seal_type": "mechanical seal / gland packing / null",
-        "seal_plan": "Plan 11, Plan 53B, etc or null",
-        "baseplate": "material spec or null",
-        "fasteners": "material spec or null"
+        "casing": "exact material spec from vendor response, e.g. ASTM A532 Gr.IIIA",
+        "impeller": "exact material spec, e.g. 12% Chrome Steel ASTM A487",
+        "shaft": "exact material spec, e.g. EN-19 / SS410",
+        "shaft_sleeve": "exact material spec, e.g. SS316",
+        "wear_ring": "exact material spec or null",
+        "bearing": "type and make, e.g. Taper roller / TIMKEN",
+        "bearing_housing": "material spec, e.g. Grey Cast Iron",
+        "seal_type": "Single mechanical seal with SLD / gland packing / etc",
+        "seal_plan": "API Plan 62 / Plan 11 / Plan 53B / etc or null",
+        "baseplate": "material spec, e.g. MS (Mild Steel)",
+        "fasteners": "material spec, e.g. A197 2H & A193 B7",
+        "gland_plate": "material spec or null",
+        "coupling_halves": "material spec or null"
       }},
       
       "nozzles": {{
-        "suction_size": "size or null",
-        "discharge_size": "size or null",
-        "rating": "PN16, 150#, etc or null"
+        "suction_size": "DN or inch size, e.g. DN200 or 8 inch",
+        "suction_rating": "Class 300 / PN16 / etc",
+        "discharge_size": "DN or inch size, e.g. DN150 or 6 inch",
+        "discharge_rating": "Class 300 / PN16 / etc",
+        "flange_standard": "ANSI B16.5 / IS 6392 / etc"
       }},
 
       "weights": {{
         "pump_bare_kg": number or null,
         "motor_kg": number or null,
         "baseplate_kg": number or null,
-        "total_package_kg": number or null
+        "total_package_kg": number or null,
+        "heaviest_part_kg": number or null,
+        "transport_kg": number or null
       }},
       
-      "coupling": "type or null",
-      "drive": "motor | diesel engine | both",
-      "notes": "any critical notes"
+      "motor": {{
+        "type": "Squirrel cage / Slip ring / etc",
+        "rating_kw": number or null,
+        "voltage_v": "690V / 415V / etc",
+        "frequency_hz": 50,
+        "poles": 4,
+        "speed_rpm": number or null,
+        "enclosure": "TEFC / etc or null",
+        "mounting": "by pump vendor / by contractor / etc"
+      }},
+      
+      "drive": {{
+        "type": "direct coupled | belt driven | gear driven",
+        "coupling_type": "disc / tyre / gear / V-belt / etc",
+        "belt_guard": true/false
+      }},
+      
+      "vibration_limit": "value with unit or null",
+      "noise_limit_dba": number or null,
+      "performance_test_std": "ISO 9906:2012 / etc or null",
+      "surface_prep_spec": "spec reference or null",
+      
+      "scope": {{
+        "pump": true/false,
+        "motor": true/false,
+        "mechanical_seal": true/false,
+        "baseframe": true/false,
+        "coupling_guard": true/false,
+        "companion_flanges": true/false,
+        "foundation_bolts": true/false,
+        "first_fill_lubricants": true/false,
+        "suction_strainer": true/false
+      }},
+      
+      "notes": "any critical notes including vendor remarks"
     }}
   ]
 }}
 
 Be accurate. If data is missing, use null — never guess."""
 
-    raw = _call_claude(prompt, system=SPEC_SYSTEM)
+    raw = _call_claude(prompt, system=SPEC_SYSTEM, max_tokens=6000)
     data = _parse_json(raw)
     return data
 
@@ -239,13 +296,17 @@ Every BOM you generate must:
 1. Cover ALL sub-assemblies: pump hydraulics, rotating assembly, bearings, 
    sealing, drive/coupling, motor, structural, piping/nozzles, fasteners, 
    instrumentation, acoustic (if needed), complete assembly.
-2. Specify MOC (Material of Construction) for EVERY component.
+2. Specify MOC (Material of Construction) for EVERY component — use exact 
+   ASTM/EN/IS specifications, not generic terms.
 3. Include realistic weights where known.
 4. Specify quantity per pump unit.
 5. Mark each component as M (Mandatory), C (Conditional), or O (Optional).
-6. Be specific — not generic. E.g. "SKF 6217 C3" not just "Bearing".
+6. Be specific — not generic. E.g. "Taper Roller Bearing - TIMKEN" not just "Bearing".
 7. Include seal plan piping, coupling guard, foundation bolts, counter flanges.
 8. For Indian EPC: include RTDs for pump bearings, dial thermometers.
+9. Reference the datasheet wherever possible in notes (e.g. "per DS row 86").
+10. For belt-driven pumps: include V-belt set, pulleys, belt guard.
+11. For motors mounted by pump vendor: include full motor specs.
 """
 
 
@@ -279,14 +340,19 @@ IMPORTANT:
 - Include ALL wetted parts with correct MOC for the fluid service
 - Motor: specify frame size, kW, voltage, poles
 - Seal: specify type, plan, materials
-- Coupling: specify type (disc/tyre/spacer), DBSE
+- For belt drive: include V-belt set, motor pulley, pump pulley, belt guard
+- For direct coupling: specify type (disc/tyre/spacer), DBSE
 - Baseplate: IS 2062 fabricated with drain pan
 - Foundation bolts: specify quantity and size
-- Counter flanges: both suction and discharge
+- Counter flanges: both suction and discharge with gaskets and fasteners
 - Gaskets: specify type and material
 - Instrumentation: RTDs for pump bearings if applicable
+- Casing wear rings AND impeller wear rings as separate items
+- Shaft sleeve if applicable
+- All bearing housing components
+- Casing joint bolts/fasteners
 
-Respond with ONLY the JSON array."""
+Respond with ONLY the JSON array — no preamble, no explanation."""
 
     raw = _call_claude(prompt, system=BOM_SYSTEM, max_tokens=6000)
     data = _parse_json(raw)
@@ -307,28 +373,22 @@ def _normalize_bom_data(data, raw_text=""):
     Normalize to list of dicts always.
     """
     if isinstance(data, list):
-        # Filter: only keep dicts, skip strings/ints
         return [item for item in data if isinstance(item, dict)]
 
     if isinstance(data, dict):
-        # Check for nested list keys
         for key in ["components", "bom", "items", "bill_of_materials",
                      "BOM", "Components", "data"]:
             if key in data and isinstance(data[key], list):
                 return [item for item in data[key] if isinstance(item, dict)]
-        # Maybe the dict itself has component fields
         if "component" in data or "section" in data or "moc" in data:
             return [data]
-        # Try all list values in the dict
         for v in data.values():
             if isinstance(v, list) and len(v) > 3:
                 items = [item for item in v if isinstance(item, dict)]
                 if items:
                     return items
 
-    # Last resort: try to extract from raw text if _parse_json gave bad result
     if raw_text and isinstance(raw_text, str):
-        # Try finding array in raw text directly
         arr = _bracket_extract(raw_text.replace("```json","").replace("```",""), "[", "]")
         if isinstance(arr, list):
             return [item for item in arr if isinstance(item, dict)]
@@ -392,7 +452,6 @@ def claude_price_bom(bom_df, pump_specs, progress_callback=None):
 
     specs_str = json.dumps(pump_specs, indent=2, default=str) if isinstance(pump_specs, dict) else str(pump_specs)
 
-    # Build component list for batch pricing
     components = []
     for _, row in bom_df.iterrows():
         components.append({
@@ -405,7 +464,6 @@ def claude_price_bom(bom_df, pump_specs, progress_callback=None):
             "section":     str(row.get("Section", "")),
         })
 
-    # Split into batches of ~10 for manageable API calls
     batch_size = 10
     batches    = [components[i:i+batch_size]
                   for i in range(0, len(components), batch_size)]
@@ -474,7 +532,6 @@ Respond with ONLY the JSON array."""
         elif isinstance(data, dict):
             all_prices.append(data)
 
-    # Merge prices into BOM
     if progress_callback:
         progress_callback(92, "Compiling final cost report...")
 
@@ -587,7 +644,6 @@ def group_bom(bom_df):
             sec_rows2 = sec_rows.drop(columns=["_ord"], errors="ignore")
             result.append((sec, sec, sec_rows2))
 
-    # Ungrouped
     other = df[~df[sec_col].str.strip().isin(SECTION_ORDER)]
     if not other.empty:
         other = other.drop(columns=["_ord"], errors="ignore")
@@ -616,7 +672,8 @@ def extract_pdf_text(file_bytes):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# EXCEL EXPORT
+# EXCEL EXPORT  *** BUG FIX: removed hfont() helper that conflicted
+#               *** with openpyxl internals. Now uses Font() directly.
 # ═══════════════════════════════════════════════════════════════════
 
 def export_excel(bom_df, pump_specs, priced=False):
@@ -629,18 +686,19 @@ def export_excel(bom_df, pump_specs, priced=False):
     thin = Side(style="thin", color="CCCCCC")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    def hfill(c): return PatternFill("solid", start_color=c)
-    def hfont(b=False, s=9, c="000000"): return Font(bold=b, size=s, color=c)
-
     # ── Cover ─────────────────────────────────────────────────────
-    ws0 = wb.active; ws0.title = "Cover"
+    ws0 = wb.active
+    ws0.title = "Cover"
     ws0.sheet_view.showGridLines = False
-    ws0.column_dimensions["A"].width = 30; ws0.column_dimensions["B"].width = 55
+    ws0.column_dimensions["A"].width = 30
+    ws0.column_dimensions["B"].width = 55
 
     ws0.merge_cells("A1:B1")
-    c = ws0["A1"]; c.value = "BILL OF MATERIALS"
-    c.font = Font(bold=True, size=18, color="FFFFFF"); c.fill = hfill("1F4E79")
-    c.alignment = Alignment(horizontal="center", vertical="center")
+    title_cell = ws0["A1"]
+    title_cell.value = "BILL OF MATERIALS"
+    title_cell.font = Font(name="Arial", bold=True, size=18, color="FFFFFF")
+    title_cell.fill = PatternFill("solid", fgColor="1F4E79")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws0.row_dimensions[1].height = 36
 
     specs = pump_specs if isinstance(pump_specs, dict) else {}
@@ -651,12 +709,17 @@ def export_excel(bom_df, pump_specs, priced=False):
             ("Pump Model",       p.get("model", "—")),
             ("Manufacturer",     p.get("manufacturer", "—")),
             ("Type",             p.get("type", "—")),
+            ("Tag Numbers",      p.get("tag_numbers", "—")),
             ("Flow (m³/h)",      p.get("flow_m3h", "—")),
             ("Head (m)",         p.get("head_m", "—")),
             ("Motor (kW)",       p.get("motor_kw", "—")),
+            ("Shaft Power (kW)", p.get("shaft_power_kw", "—")),
+            ("Speed (RPM)",      p.get("speed_rpm", "—")),
             ("Fluid",            p.get("fluid", "—")),
             ("Temperature (°C)", p.get("temp_c", "—")),
+            ("Density (kg/m³)",  p.get("density_kgm3", "—")),
             ("Standard",         p.get("standard", "—")),
+            ("Quantity",         p.get("quantity", "—")),
             ("Project",          specs.get("project", "—")),
         ]
     else:
@@ -670,61 +733,89 @@ def export_excel(bom_df, pump_specs, priced=False):
 
     r = 3
     for lbl, val in info_items:
-        ws0.cell(r, 1, lbl).font = hfont(True); ws0.cell(r, 1).fill = hfill("EEF2F7")
-        ws0.cell(r, 1).border = bdr
-        ws0.cell(r, 2, str(val) if val else "—").font = hfont()
-        ws0.cell(r, 2).border = bdr
+        lbl_cell = ws0.cell(r, 1, lbl)
+        lbl_cell.font = Font(name="Arial", bold=True, size=10)
+        lbl_cell.fill = PatternFill("solid", fgColor="EEF2F7")
+        lbl_cell.border = bdr
+
+        val_cell = ws0.cell(r, 2, str(val) if val else "—")
+        val_cell.font = Font(name="Arial", size=10)
+        val_cell.border = bdr
         r += 1
 
-    ws0.cell(r+1, 1, "Generated").font = hfont(True)
-    ws0.cell(r+1, 2, pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")).font = hfont()
+    gen_cell_lbl = ws0.cell(r + 1, 1, "Generated")
+    gen_cell_lbl.font = Font(name="Arial", bold=True, size=10)
+    gen_cell_val = ws0.cell(r + 1, 2, pd.Timestamp.now().strftime("%d-%b-%Y %H:%M"))
+    gen_cell_val.font = Font(name="Arial", size=10)
 
     # ── BOM Sheet ─────────────────────────────────────────────────
     ws1 = wb.create_sheet("BOM")
     ws1.sheet_view.showGridLines = False
 
-    # Determine columns
     if priced and "Total_Price_INR" in bom_df.columns:
-        cols = ["No","Section","Sub_Assembly","Component","Description","MOC",
-                "Qty","Weight_kg","Req_Type","Unit_Price_INR","Total_Price_INR",
-                "GST_18pct","Price_With_GST","Price_Confidence","Notes"]
+        cols = ["No", "Section", "Sub_Assembly", "Component", "Description", "MOC",
+                "Qty", "Weight_kg", "Req_Type", "Unit_Price_INR", "Total_Price_INR",
+                "GST_18pct", "Price_With_GST", "Price_Confidence", "Notes"]
     else:
-        cols = ["No","Section","Sub_Assembly","Component","Description","MOC",
-                "Qty","Weight_kg","Req_Type","Notes"]
+        cols = ["No", "Section", "Sub_Assembly", "Component", "Description", "MOC",
+                "Qty", "Weight_kg", "Req_Type", "Notes"]
     cols = [c for c in cols if c in bom_df.columns]
 
-    widths = {"No":5,"Section":22,"Sub_Assembly":20,"Component":30,
-              "Description":40,"MOC":25,"Qty":8,"Weight_kg":10,
-              "Req_Type":6,"Unit_Price_INR":14,"Total_Price_INR":14,
-              "GST_18pct":12,"Price_With_GST":14,"Price_Confidence":10,"Notes":35}
+    widths = {
+        "No": 5, "Section": 22, "Sub_Assembly": 20, "Component": 30,
+        "Description": 40, "MOC": 25, "Qty": 8, "Weight_kg": 10,
+        "Req_Type": 6, "Unit_Price_INR": 14, "Total_Price_INR": 14,
+        "GST_18pct": 12, "Price_With_GST": 14, "Price_Confidence": 10, "Notes": 35,
+    }
 
+    # Title row
     ws1.merge_cells(f"A1:{get_column_letter(len(cols))}1")
-    c1 = ws1["A1"]; c1.value = "BILL OF MATERIALS"
-    c1.font = Font(bold=True, size=12, color="FFFFFF"); c1.fill = hfill("1F4E79")
-    c1.alignment = Alignment(horizontal="center"); ws1.row_dimensions[1].height = 24
+    bom_title = ws1["A1"]
+    bom_title.value = "BILL OF MATERIALS"
+    bom_title.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    bom_title.fill = PatternFill("solid", fgColor="1F4E79")
+    bom_title.alignment = Alignment(horizontal="center")
+    ws1.row_dimensions[1].height = 24
 
+    # Header row
     r = 2
     for j, col in enumerate(cols):
-        c = ws1.cell(r, j+1, col.replace("_"," "))
-        c.font = hfont(True, 9, "FFFFFF"); c.fill = hfill("2E75B6")
-        c.alignment = Alignment(horizontal="center", wrap_text=True); c.border = bdr
-        ws1.column_dimensions[get_column_letter(j+1)].width = widths.get(col, 14)
-    ws1.row_dimensions[r].height = 26; r += 1
+        hdr = ws1.cell(r, j + 1, col.replace("_", " "))
+        hdr.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
+        hdr.fill = PatternFill("solid", fgColor="2E75B6")
+        hdr.alignment = Alignment(horizontal="center", wrap_text=True)
+        hdr.border = bdr
+        ws1.column_dimensions[get_column_letter(j + 1)].width = widths.get(col, 14)
+    ws1.row_dimensions[r].height = 26
+    r += 1
 
-    alt1 = hfill("EEF4FB"); alt2 = hfill("FFFFFF")
+    # Data rows
+    alt_fill_1 = PatternFill("solid", fgColor="EEF4FB")
+    alt_fill_2 = PatternFill("solid", fgColor="FFFFFF")
+
     for i, (_, row) in enumerate(bom_df.iterrows()):
-        rf = alt1 if i % 2 == 0 else alt2
+        row_fill = alt_fill_1 if i % 2 == 0 else alt_fill_2
         for j, col in enumerate(cols):
             val = row.get(col, "")
-            if pd.isna(val): val = ""
-            if col in ("Unit_Price_INR","Total_Price_INR","GST_18pct","Price_With_GST"):
-                if val and val != "": val = f"₹{int(val):,}"
-            c = ws1.cell(r, j+1, val)
-            c.font = hfont(size=8); c.fill = rf; c.border = bdr
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-        ws1.row_dimensions[r].height = 16; r += 1
+            if pd.isna(val):
+                val = ""
+            if col in ("Unit_Price_INR", "Total_Price_INR", "GST_18pct", "Price_With_GST"):
+                try:
+                    if val and val != "":
+                        val = f"₹{int(float(val)):,}"
+                except (ValueError, TypeError):
+                    pass
+            cell = ws1.cell(r, j + 1, val)
+            cell.font = Font(name="Arial", size=8)
+            cell.fill = row_fill
+            cell.border = bdr
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws1.row_dimensions[r].height = 16
+        r += 1
 
     ws1.freeze_panes = "A3"
 
-    buf = BytesIO(); wb.save(buf); buf.seek(0)
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
     return buf
