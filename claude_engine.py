@@ -58,7 +58,8 @@ def _call_claude(prompt, system="", use_search=False, max_tokens=4000):
 
 
 def _parse_json(text):
-    """Extract JSON from Claude response. Handles extra text, fences, trailing commas."""
+    """Extract JSON from Claude response. Handles extra text, fences, trailing commas,
+    AND truncated arrays (when max_tokens cuts off mid-JSON)."""
     if not text:
         return None
 
@@ -77,11 +78,73 @@ def _parse_json(text):
     if result is not None:
         return result
 
+    # Strategy 3: TRUNCATED ARRAY RECOVERY
+    # If the text starts with [ but has no matching ] (max_tokens cut off),
+    # extract every complete {...} object inside it
+    arr_start = clean.find('[')
+    if arr_start != -1:
+        recovered = _recover_truncated_array(clean[arr_start:])
+        if recovered and len(recovered) > 1:
+            return recovered
+
+    # Strategy 4: single object fallback
     result = _bracket_extract(clean, '{', '}')
     if result is not None:
         return result
 
     return None
+
+
+def _recover_truncated_array(text):
+    """Extract all complete JSON objects from a truncated array like [{ }, { }, { ..."""
+    objects = []
+    i = 0
+    while i < len(text):
+        # Find start of next object
+        start = text.find('{', i)
+        if start == -1:
+            break
+
+        # Use bracket counting to find its end
+        depth = 0
+        in_string = False
+        j = start
+        found_end = False
+        while j < len(text):
+            ch = text[j]
+            if ch == '"' and (j == 0 or text[j-1] != '\\'):
+                in_string = not in_string
+                j += 1
+                continue
+            if in_string:
+                j += 1
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:j+1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except json.JSONDecodeError:
+                        fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+                        try:
+                            obj = json.loads(fixed)
+                            if isinstance(obj, dict):
+                                objects.append(obj)
+                        except Exception:
+                            pass
+                    found_end = True
+                    i = j + 1
+                    break
+            j += 1
+        if not found_end:
+            # This object was truncated — skip it
+            break
+    return objects
 
 
 def _bracket_extract(text, opener, closer):
@@ -352,9 +415,10 @@ IMPORTANT:
 - All bearing housing components
 - Casing joint bolts/fasteners
 
-Respond with ONLY the JSON array — no preamble, no explanation."""
+Respond with ONLY the JSON array — no preamble, no explanation.
+Keep descriptions under 80 characters to avoid truncation."""
 
-    raw = _call_claude(prompt, system=BOM_SYSTEM, max_tokens=6000)
+    raw = _call_claude(prompt, system=BOM_SYSTEM, max_tokens=8000)
     data = _parse_json(raw)
 
     # Normalize: always return a list of dicts
@@ -389,9 +453,14 @@ def _normalize_bom_data(data, raw_text=""):
                     return items
 
     if raw_text and isinstance(raw_text, str):
-        arr = _bracket_extract(raw_text.replace("```json","").replace("```",""), "[", "]")
+        cleaned = raw_text.replace("```json","").replace("```","")
+        arr = _bracket_extract(cleaned, "[", "]")
         if isinstance(arr, list):
             return [item for item in arr if isinstance(item, dict)]
+        # Last resort: recover individual objects from truncated array
+        recovered = _recover_truncated_array(cleaned)
+        if recovered and len(recovered) > 0:
+            return recovered
 
     return []
 
