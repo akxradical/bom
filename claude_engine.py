@@ -36,7 +36,7 @@ def _get_client():
 
 
 def _call_claude(prompt, system="", use_search=False, max_tokens=4000):
-    """Single Claude API call. Returns text response."""
+    """Single Claude API call with automatic retry on rate limits."""
     client = _get_client()
     kwargs = {
         "model":      "claude-sonnet-4-5",
@@ -48,13 +48,25 @@ def _call_claude(prompt, system="", use_search=False, max_tokens=4000):
     if use_search:
         kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
 
-    resp = client.messages.create(**kwargs)
-
-    parts = []
-    for block in resp.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    return "\n".join(parts).strip()
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            resp = client.messages.create(**kwargs)
+            parts = []
+            for block in resp.content:
+                if hasattr(block, "text"):
+                    parts.append(block.text)
+            return "\n".join(parts).strip()
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate_limit" in err_str.lower():
+                wait = 30 * (2 ** attempt)  # 30s, 60s, 120s, 240s
+                import streamlit as st
+                st.toast(f"⏳ Rate limit hit — waiting {wait}s before retry ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+    raise Exception("Rate limit exceeded after 4 retries. Try again in a few minutes.")
 
 
 def _parse_json(text):
@@ -519,21 +531,34 @@ def claude_price_bom(bom_df, pump_specs, progress_callback=None):
     if bom_df is None or bom_df.empty:
         return bom_df
 
-    specs_str = json.dumps(pump_specs, indent=2, default=str) if isinstance(pump_specs, dict) else str(pump_specs)
+    specs_str = ""
+    if isinstance(pump_specs, dict):
+        # Only send essential specs, not the full extraction
+        compact = {
+            "pump": pump_specs.get("pump_label", ""),
+            "type": pump_specs.get("type", ""),
+            "flow_m3h": pump_specs.get("flow_m3h"),
+            "head_m": pump_specs.get("head_m"),
+            "motor_kw": pump_specs.get("motor_kw"),
+            "fluid": pump_specs.get("fluid", ""),
+            "temp_c": pump_specs.get("temp_c"),
+        }
+        specs_str = json.dumps(compact, default=str)
+    else:
+        specs_str = str(pump_specs)[:500]
 
     components = []
     for _, row in bom_df.iterrows():
         components.append({
-            "no":          row.get("No", ""),
-            "component":   str(row.get("Component", "")),
-            "description": str(row.get("Description", "")),
-            "moc":         str(row.get("MOC", "")),
-            "qty":         str(row.get("Qty", "1")),
-            "weight_kg":   row.get("Weight_kg"),
-            "section":     str(row.get("Section", "")),
+            "no":        row.get("No", ""),
+            "component": str(row.get("Component", "")),
+            "moc":       str(row.get("MOC", "")),
+            "qty":       str(row.get("Qty", "1")),
+            "weight_kg": row.get("Weight_kg"),
         })
 
-    batch_size = 10
+    # Larger batches = fewer API calls = less rate limit pressure
+    batch_size = 15
     batches    = [components[i:i+batch_size]
                   for i in range(0, len(components), batch_size)]
 
@@ -554,46 +579,26 @@ def claude_price_bom(bom_df, pump_specs, progress_callback=None):
             label = progress_labels[min(batch_idx, len(progress_labels)-1)]
             progress_callback(pct, label)
 
-        batch_str = json.dumps(batch, indent=1, default=str)
-        prompt = f"""Price these pump components at current Indian market rates (2025-2026).
+        # Rate limit protection: wait between batches (30k tokens/min limit)
+        if batch_idx > 0:
+            time.sleep(25)
 
-PUMP CONTEXT:
-{specs_str[:2000]}
+        batch_str = json.dumps(batch, default=str)
+        prompt = f"""Price these pump components at Indian market rates (2025-26).
 
-COMPONENTS TO PRICE:
+Pump: {specs_str}
+
+Components:
 {batch_str}
 
-For EACH component, respond with a JSON array:
-[
-  {{
-    "no": <component number>,
-    "unit_price_inr": <integer price in INR>,
-    "total_price_inr": <unit_price × quantity>,
-    "price_basis": "per unit | per kg | per set",
-    "confidence": "high | medium | low",
-    "source": "vendor/market source",
-    "notes": "price basis, assumptions"
-  }}
-]
+Return JSON array, one per component:
+[{{"no":<num>,"unit_price_inr":<int>,"total_price_inr":<int>,"confidence":"high|medium|low","source":"brief source","notes":"brief"}}]
 
-Pricing guidelines:
-- Motor: ₹4,000-8,000 per kW for LT, ₹3,500-5,500 per kW for HT
-- CS castings (A216 WCB): ₹200-280/kg finished
-- SS316 castings: ₹700-900/kg finished
-- High chrome (A532): ₹900-1200/kg finished
-- Mechanical seal (cartridge): ₹40,000-4,00,000 depending on size/plan
-- Bearings: ₹2,000-50,000 depending on type/size
-- Coupling (disc/tyre): ₹15,000-80,000 depending on torque rating
-- Baseplate IS2062: ₹100-140/kg fabricated
-- Counter flanges: ₹1,500-8,000 depending on size/rating
-- Foundation bolts: ₹150-400 per bolt depending on size
-- Gaskets: ₹300-1,500 each depending on size/material
-
-Use web search for motors, seals, and any component > ₹50,000.
-Respond with ONLY the JSON array."""
+Rate guide: Motor ₹4-8k/kW, CS casting ₹200-280/kg, SS316 ₹700-900/kg, High chrome ₹900-1200/kg, Mech seal ₹40k-4L, Bearings ₹2-50k, Baseplate ₹100-140/kg.
+JSON only."""
 
         raw = _call_claude(prompt, system=PRICE_SYSTEM,
-                          use_search=True, max_tokens=3000)
+                          use_search=True, max_tokens=2000)
         data = _parse_json(raw)
 
         if isinstance(data, list):
