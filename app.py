@@ -207,9 +207,11 @@ elif st.session_state.page == "specs":
     # Document type badge
     doc_type = data.get("document_type", "unknown")
     project  = data.get("project", "—")
+    mfr      = data.get("manufacturer", "—")
     st.markdown(
         f'<div class="card-blue">'
         f'<b style="color:#79c0ff;">Document:</b> {doc_type} | '
+        f'<b style="color:#79c0ff;">Manufacturer:</b> {mfr} | '
         f'<b style="color:#79c0ff;">Project:</b> {project}'
         f'</div>', unsafe_allow_html=True)
 
@@ -234,31 +236,41 @@ elif st.session_state.page == "specs":
     pump_idx = st.session_state.selected_pump_idx
     pump     = pumps[min(pump_idx, len(pumps)-1)]
 
-    # Display specs
-    c1, c2 = st.columns(2)
+    # Display specs — 3 column layout
+    c1, c2, c3 = st.columns(3)
 
     with c1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="sec-hdr">Performance</div>', unsafe_allow_html=True)
         for k, lbl in [
-            ("pump_label",  "Pump"),
-            ("model",       "Model"),
-            ("manufacturer","Manufacturer"),
-            ("type",        "Type"),
-            ("standard",    "Standard"),
-            ("flow_m3h",    "Flow (m³/h)"),
-            ("head_m",      "Head (m)"),
-            ("speed_rpm",   "Speed (RPM)"),
-            ("motor_kw",    "Motor (kW)"),
-            ("stages",      "Stages"),
-            ("fluid",       "Fluid"),
-            ("temp_c",      "Temperature (°C)"),
-            ("density_kgm3","Density (kg/m³)"),
-            ("npsha_m",     "NPSHA (m)"),
+            ("pump_label",     "Pump"),
+            ("model",          "Model"),
+            ("manufacturer",   "Manufacturer"),
+            ("type",           "Type"),
+            ("tag_numbers",    "Tag Numbers"),
+            ("standard",       "Standard"),
+            ("quantity",       "Quantity"),
+            ("configuration",  "Configuration"),
+            ("flow_m3h",       "Flow (m³/h)"),
+            ("head_m",         "Head (m)"),
+            ("speed_rpm",      "Speed (RPM)"),
+            ("motor_kw",       "Motor (kW)"),
+            ("shaft_power_kw", "Shaft Power (kW)"),
+            ("stages",         "Stages"),
+            ("fluid",          "Fluid"),
+            ("temp_c",         "Temperature (°C)"),
+            ("density_kgm3",   "Density (kg/m³)"),
+            ("viscosity",      "Viscosity"),
+            ("npsha_m",        "NPSHA (m)"),
+            ("npshr_m",        "NPSHR (m)"),
+            ("min_flow_m3h",   "Min Flow (m³/h)"),
+            ("shutoff_head_m", "Shutoff Head (m)"),
+            ("efficiency_pct", "Efficiency (%)"),
+            ("impeller_dia_mm","Impeller Dia (mm)"),
         ]:
             val = pump.get(k)
-            if val is not None:
-                _kv(lbl, str(val), blue=k in ("flow_m3h","head_m","motor_kw"))
+            if val is not None and str(val).strip() and str(val).lower() != "none":
+                _kv(lbl, str(val), blue=k in ("flow_m3h","head_m","motor_kw","shaft_power_kw"))
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
@@ -267,31 +279,123 @@ elif st.session_state.page == "specs":
                     unsafe_allow_html=True)
         moc = pump.get("moc", {}) or {}
         for k, lbl in [
-            ("casing",       "Casing"),
-            ("impeller",     "Impeller"),
-            ("shaft",        "Shaft"),
-            ("shaft_sleeve", "Shaft Sleeve"),
-            ("wear_ring",    "Wear Ring"),
-            ("bearing",      "Bearing"),
-            ("seal_type",    "Seal Type"),
-            ("seal_plan",    "Seal Plan"),
-            ("baseplate",    "Baseplate"),
-            ("fasteners",    "Fasteners"),
+            ("casing",          "Casing"),
+            ("impeller",        "Impeller"),
+            ("shaft",           "Shaft"),
+            ("shaft_sleeve",    "Shaft Sleeve"),
+            ("wear_ring",       "Wear Ring"),
+            ("bearing",         "Bearing"),
+            ("bearing_housing", "Bearing Housing"),
+            ("seal_type",       "Seal Type"),
+            ("seal_plan",       "Seal Plan"),
+            ("baseplate",       "Baseplate"),
+            ("fasteners",       "Fasteners"),
+            ("gland_plate",     "Gland/Seal Plate"),
+            ("coupling_halves", "Coupling Halves"),
         ]:
             val = moc.get(k)
-            if val:
+            if val and str(val).lower() != "none" and str(val).lower() != "null":
                 _kv(lbl, str(val))
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Weights if available
+        # Nozzles
+        noz = pump.get("nozzles", {}) or {}
+        if any(v for v in noz.values() if v and str(v).lower() != "none"):
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="sec-hdr">Nozzles</div>', unsafe_allow_html=True)
+            for k, lbl in [
+                ("suction_size",    "Suction Size"),
+                ("suction_rating",  "Suction Rating"),
+                ("discharge_size",  "Discharge Size"),
+                ("discharge_rating","Discharge Rating"),
+                ("flange_standard", "Flange Standard"),
+            ]:
+                val = noz.get(k)
+                if val and str(val).lower() != "none":
+                    _kv(lbl, str(val))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with c3:
+        # Weights
         wts = pump.get("weights", {}) or {}
-        if any(wts.values()):
+        if any(v for v in wts.values() if v and str(v) != "0"):
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown('<div class="sec-hdr">Weights</div>', unsafe_allow_html=True)
-            for k, lbl in [("pump_bare_kg","Pump"), ("motor_kg","Motor"),
-                           ("baseplate_kg","Baseplate"), ("total_package_kg","Total")]:
+            for k, lbl in [
+                ("pump_bare_kg",     "Pump (bare)"),
+                ("motor_kg",         "Motor"),
+                ("baseplate_kg",     "Baseplate"),
+                ("total_package_kg", "Total Package"),
+                ("heaviest_part_kg", "Heaviest Part"),
+                ("transport_kg",     "Transport"),
+            ]:
                 if wts.get(k):
                     _kv(lbl, f"{wts[k]} kg", blue=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Motor
+        mot = pump.get("motor", {}) or {}
+        if any(v for v in mot.values() if v and str(v).lower() != "none"):
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="sec-hdr">Motor / Electrical</div>', unsafe_allow_html=True)
+            for k, lbl in [
+                ("type",         "Motor Type"),
+                ("rating_kw",    "Rating (kW)"),
+                ("voltage_v",    "Voltage"),
+                ("frequency_hz", "Frequency (Hz)"),
+                ("poles",        "Poles"),
+                ("speed_rpm",    "Speed (RPM)"),
+                ("enclosure",    "Enclosure"),
+                ("mounting",     "Mounting"),
+            ]:
+                val = mot.get(k)
+                if val and str(val).lower() != "none":
+                    _kv(lbl, str(val))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Drive
+        drv = pump.get("drive", {}) or {}
+        if any(v for v in drv.values() if v and str(v).lower() != "none"):
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="sec-hdr">Drive</div>', unsafe_allow_html=True)
+            for k, lbl in [
+                ("type",          "Drive Type"),
+                ("coupling_type", "Coupling/Belt"),
+                ("belt_guard",    "Belt Guard"),
+            ]:
+                val = drv.get(k)
+                if val is not None and str(val).lower() != "none":
+                    _kv(lbl, str(val))
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Misc specs
+        misc_items = []
+        for k, lbl in [
+            ("vibration_limit",      "Vibration Limit"),
+            ("noise_limit_dba",      "Noise Limit (dBA)"),
+            ("performance_test_std", "Performance Test Std"),
+            ("surface_prep_spec",    "Surface Prep Spec"),
+        ]:
+            val = pump.get(k)
+            if val and str(val).lower() != "none":
+                misc_items.append((lbl, str(val)))
+        if misc_items:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="sec-hdr">Standards & Limits</div>', unsafe_allow_html=True)
+            for lbl, val in misc_items:
+                _kv(lbl, val)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Scope
+        scope = pump.get("scope", {}) or {}
+        scope_items = [(k.replace("_"," ").title(), v) for k, v in scope.items()
+                       if v is True or v is False]
+        if scope_items:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="sec-hdr">Scope of Supply</div>', unsafe_allow_html=True)
+            for lbl, val in scope_items:
+                icon = "✅" if val else "❌"
+                _kv(lbl, icon)
             st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
