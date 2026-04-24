@@ -117,7 +117,11 @@ def _call_claude(prompt, system="", max_tokens=4000):
     if not key:
         raise ValueError("ANTHROPIC_API_KEY not set — skipping Claude")
 
-    import anthropic
+    try:
+        import anthropic
+    except ImportError:
+        raise ValueError("anthropic package not installed. Run: pip install anthropic")
+
     client = anthropic.Anthropic(api_key=key)
     kwargs = {
         "model":      "claude-sonnet-4-5",
