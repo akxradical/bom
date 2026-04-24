@@ -6,4 +6,3 @@ Pillow>=10.0.0
 numpy>=1.24.0
 # anthropic is now OPTIONAL — only needed if you set ANTHROPIC_API_KEY
 # The system runs fully on free LLMs (Gemini/Groq/Cerebras) without it
-anthropic>=0.40.0
