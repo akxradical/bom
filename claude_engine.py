@@ -236,14 +236,34 @@ def _call_llm(prompt, system="", max_tokens=4000):
 
 
 def _parse_json(text):
-    """Extract JSON from Claude response. Handles extra text, fences, trailing commas,
-    AND truncated arrays (when max_tokens cuts off mid-JSON)."""
+    """Extract JSON from LLM response. Handles:
+    - Markdown fences (```json ... ```)
+    - Preamble text ("Here is the JSON: ...")
+    - Trailing commas  
+    - Truncated arrays (max_tokens cut off mid-JSON)
+    - Gemini wrapping response in extra explanation
+    """
     if not text:
         return None
 
-    # Strip markdown fences
+    # Strip markdown fences — all variants
     clean = text.strip()
-    clean = clean.replace("```json", "").replace("```", "").strip()
+    for fence in ["```json", "```JSON", "```", "`"]:
+        clean = clean.replace(fence, "")
+    clean = clean.strip()
+
+    # Strip common LLM preamble lines before JSON
+    # Gemini often says "Here is the extracted JSON:" or "```json\n{..."
+    lines = clean.split('\n')
+    # Find the first line that starts with { or [
+    json_start_line = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('{') or stripped.startswith('['):
+            json_start_line = i
+            break
+    if json_start_line > 0:
+        clean = '\n'.join(lines[json_start_line:]).strip()
 
     # Strategy 1: direct parse
     try:
@@ -251,24 +271,22 @@ def _parse_json(text):
     except Exception:
         pass
 
-    # Strategy 2: find the outermost [ ] or { } using bracket counting
+    # Strategy 2: find the outermost { } (spec extraction returns a dict)
+    result = _bracket_extract(clean, '{', '}')
+    if result is not None:
+        return result
+
+    # Strategy 3: find the outermost [ ] (BOM generation returns an array)
     result = _bracket_extract(clean, '[', ']')
     if result is not None:
         return result
 
-    # Strategy 3: TRUNCATED ARRAY RECOVERY
-    # If the text starts with [ but has no matching ] (max_tokens cut off),
-    # extract every complete {...} object inside it
+    # Strategy 4: TRUNCATED ARRAY RECOVERY
     arr_start = clean.find('[')
     if arr_start != -1:
         recovered = _recover_truncated_array(clean[arr_start:])
         if recovered and len(recovered) > 1:
             return recovered
-
-    # Strategy 4: single object fallback
-    result = _bracket_extract(clean, '{', '}')
-    if result is not None:
-        return result
 
     return None
 
@@ -522,9 +540,31 @@ Respond with ONLY a JSON object (no other text):
 Be accurate. If data is missing, use null — never guess."""
 
     raw, provider = _call_llm(prompt, system=SPEC_SYSTEM, max_tokens=6000)
+
+    # Save raw response so app.py can show it for debugging if parse fails
+    try:
+        import streamlit as st
+        st.session_state["_last_raw_response"] = raw[:4000] if raw else ""
+    except Exception:
+        pass
+
     data = _parse_json(raw)
-    if data and isinstance(data, dict):
-        data["_llm_provider"] = provider
+
+    # If parse completely failed, build a minimal shell so the app doesn't
+    # silently freeze — user will see the debug output in app.py
+    if not data or not isinstance(data, dict):
+        return None
+
+    # Ensure pumps key always exists as a list
+    if "pumps" not in data or not isinstance(data.get("pumps"), list):
+        # Sometimes Gemini returns the pump object directly at root level
+        if any(k in data for k in ["flow_m3h", "head_m", "motor_kw", "fluid", "type"]):
+            data = {"pumps": [data], "document_type": "vendor_datasheet",
+                    "multi_pump": False, "manufacturer": data.get("manufacturer")}
+        else:
+            data["pumps"] = []
+
+    data["_llm_provider"] = provider
     return data
 
 
