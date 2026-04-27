@@ -1,90 +1,1423 @@
 """
-BOM Generation Engine v3.0
-──────────────────────────
-4 core capabilities:
-  1. Structured BOM with component-level material specifications
-  2. Sub-assembly grouping from real dissection data
-  3. Material traceability — MOC linked to fluid-temperature rules
-  4. Weight schedule per sub-assembly for foundation & crane selection
+BOM Engine — Free Multi-LLM Edition
+════════════════════════════════════
+Zero dependency on Claude. Uses FREE LLM APIs for everything:
+  - Gemini 2.5 Flash (primary) — best for datasheet reading (huge context)
+  - Groq Llama 3.3 70B — fastest, good for JSON generation
+  - Cerebras Llama 3.3 70B — highest quota (14,400 req/day)
+  - Claude — OPTIONAL paid fallback (only if you have key + all free fail)
 
-Author : Ayush Kamle
-Stack  : Pure Python — pandas, openpyxl, re, math, json
+Cost per BOM: ₹0 (free tier) vs ₹11 with Claude.
+
+Author: Ayush Kamle
 """
 
-import os, re, math, json, datetime
+import json, re, time, os
 import pandas as pd
 from io import BytesIO
 
 # ─────────────────────────────────────────────────────────────────
-# PATHS
+# MULTI-PROVIDER LLM CLIENT (FREE-FIRST)
 # ─────────────────────────────────────────────────────────────────
-_DIR     = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(_DIR, "Component_Library_COMPLETE.xlsx")
-LRN_PATH = os.path.join(_DIR, "learning_data.json")
+# For SPEC EXTRACTION (needs big context window):
+#   1. Gemini 2.5 Flash — 1M token context, perfect for datasheets
+#   2. Groq / Cerebras — 128k context, good enough for most docs
+#   3. Claude — only if ANTHROPIC_API_KEY is set and all above fail
+#
+# For BOM GENERATION (needs good JSON output):
+#   1. Gemini 2.5 Flash — great structured output
+#   2. Groq Llama 3.3 70B — fast JSON generation
+#   3. Cerebras Llama 3.3 70B — reliable fallback
+#   4. Claude — paid fallback
+#
+# For PRICING: should-cost model runs locally (no LLM needed for 90%+)
+# ─────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────
-# SUB-ASSEMBLY HIERARCHY MAP
-# Every category maps to: (section, level, assembly_group)
-# Level 1 = package, 2 = sub-assembly, 3 = component
-# ─────────────────────────────────────────────────────────────────
-HIERARCHY = {
-    # Section A — Pump Hydraulics
-    "Pump":          ("A. PUMP HYDRAULICS",        1, "Pump Assembly"),
-    "Casing":        ("A. PUMP HYDRAULICS",        2, "Casing Assembly"),
-    "Impeller":      ("A. PUMP HYDRAULICS",        3, "Casing Assembly"),
-    "Liner":         ("A. PUMP HYDRAULICS",        3, "Casing Assembly"),
-    "Wear Ring":     ("A. PUMP HYDRAULICS",        3, "Casing Assembly"),
-    "Rotor":         ("A. PUMP HYDRAULICS",        2, "Rotor Assembly"),
-    # Section B — Rotating Assembly
-    "Shaft":         ("B. ROTATING ASSEMBLY",      3, "Rotor Assembly"),
-    "Sleeve":        ("B. ROTATING ASSEMBLY",      3, "Rotor Assembly"),
-    # Section C — Bearings
-    "Bearing":       ("C. BEARINGS & LUBRICATION", 3, "Bearing Assembly"),
-    "Housing":       ("C. BEARINGS & LUBRICATION", 2, "Bearing Assembly"),
-    "Lubrication":   ("C. BEARINGS & LUBRICATION", 3, "Bearing Assembly"),
-    "Oiler":         ("C. BEARINGS & LUBRICATION", 3, "Bearing Assembly"),
-    # Section D — Sealing
-    "Seal":          ("D. SHAFT SEALING",          2, "Sealing Assembly"),
-    "Mechanical Seal":("D. SHAFT SEALING",         2, "Sealing Assembly"),
-    "Gland":         ("D. SHAFT SEALING",          3, "Sealing Assembly"),
-    "Stuffing Box":  ("D. SHAFT SEALING",          3, "Sealing Assembly"),
-    "Shim":          ("D. SHAFT SEALING",          3, "Sealing Assembly"),
-    # Section E — Drive
-    "Coupling":      ("E. DRIVE & COUPLING",       2, "Drive Assembly"),
-    "Guard":         ("E. DRIVE & COUPLING",       3, "Drive Assembly"),
-    "V-Belt":        ("E. DRIVE & COUPLING",       3, "Drive Assembly"),
-    "Pulley":        ("E. DRIVE & COUPLING",       3, "Drive Assembly"),
-    "Belt":          ("E. DRIVE & COUPLING",       3, "Drive Assembly"),
-    # Section F — Motor
-    "Motor":         ("F. MOTOR / DRIVER",         1, "Motor"),
-    # Section G — Structural
-    "Baseplate":     ("G. STRUCTURAL",             1, "Structural"),
-    "Foundation":    ("G. STRUCTURAL",             2, "Structural"),
-    "Stool":         ("G. STRUCTURAL",             2, "Structural"),
-    "Saddle":        ("G. STRUCTURAL",             2, "Structural"),
-    "Frame":         ("G. STRUCTURAL",             2, "Structural"),
-    "Bracket":       ("G. STRUCTURAL",             2, "Structural"),
-    # Section H — Piping & Nozzles
-    "Flange":        ("H. PIPING & NOZZLES",       2, "Piping Assembly"),
-    "Piping":        ("H. PIPING & NOZZLES",       3, "Piping Assembly"),
-    "Column":        ("H. PIPING & NOZZLES",       2, "Piping Assembly"),
-    "Strainer":      ("H. PIPING & NOZZLES",       3, "Piping Assembly"),
-    "Nozzle":        ("H. PIPING & NOZZLES",       2, "Piping Assembly"),
-    # Section I — Fasteners & Gaskets
-    "Fastener":      ("I. FASTENERS & GASKETS",    3, "Fasteners"),
-    "Fasteners":     ("I. FASTENERS & GASKETS",    3, "Fasteners"),
-    "Gasket":        ("I. FASTENERS & GASKETS",    3, "Fasteners"),
-    "Bolt":          ("I. FASTENERS & GASKETS",    3, "Fasteners"),
-    # Section J — Instrumentation
-    "Instrumentation":("J. INSTRUMENTATION",       2, "Instrumentation"),
-    "Thermometer":   ("J. INSTRUMENTATION",        3, "Instrumentation"),
-    "Gauge":         ("J. INSTRUMENTATION",        3, "Instrumentation"),
-    # Section K — Acoustic & Safety
-    "Enclosure":     ("K. ACOUSTIC & SAFETY",      1, "Acoustic Enclosure"),
-    "Acoustic":      ("K. ACOUSTIC & SAFETY",      1, "Acoustic Enclosure"),
-    # Section L — Complete Assembly
-    "Assembly":      ("L. COMPLETE ASSEMBLY",      1, "Complete Package"),
+def _get_api_key(key_name):
+    """Get API key from Streamlit secrets, return empty string if not set."""
+    import streamlit as st
+    return st.secrets.get(key_name, "")
+
+
+
+def _http_post(url, headers, body_dict, timeout=120, retries=3):
+    """POST with retry on 503/429. Returns parsed JSON dict."""
+    import urllib.request, urllib.error
+    data_bytes = json.dumps(body_dict).encode("utf-8")
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data_bytes, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            status = e.code
+            body = ""
+            try:
+                body = e.read().decode("utf-8")[:200]
+            except Exception:
+                pass
+            if status in (429, 503) and attempt < retries - 1:
+                wait = 10 * (attempt + 1)  # 10s, 20s
+                time.sleep(wait)
+                last_err = e
+                continue
+            # 403 = bad key, 400 = bad request — no point retrying
+            raise Exception(f"HTTP {status}: {body or e.reason}")
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            raise
+    raise last_err
+
+
+def _call_gemini(prompt, system="", max_tokens=8000):
+    """Google Gemini 2.5 Flash. Free, 1M context window. Best for datasheets."""
+    key = _get_api_key("GEMINI_API_KEY")
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set")
+
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+    data = _http_post(url, {"Content-Type": "application/json"}, body)
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def _call_groq(prompt, system="", max_tokens=4000):
+    """Groq — Llama 3.3 70B. Free, very fast. Model verified April 2026."""
+    key = _get_api_key("GROQ_API_KEY")
+    if not key:
+        raise ValueError("GROQ_API_KEY not set")
+
+    body = {
+        "model": "llama-3.3-70b-versatile",  # current production model
+        "messages": [],
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+    }
+    if system:
+        body["messages"].append({"role": "system", "content": system})
+    body["messages"].append({"role": "user", "content": prompt})
+
+    data = _http_post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        body,
+    )
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _call_cerebras(prompt, system="", max_tokens=4000):
+    """Cerebras — llama3.1-8b. Free. Note: Cerebras dropped llama-3.3-70b,
+    current free models are llama3.1-8b and openai-gpt-oss."""
+    key = _get_api_key("CEREBRAS_API_KEY")
+    if not key:
+        raise ValueError("CEREBRAS_API_KEY not set")
+
+    # Try llama3.1-8b first (confirmed available), fallback to openai-gpt-oss-20b
+    for model in ["llama3.1-8b", "openai-gpt-oss-20b"]:
+        body = {
+            "model": model,
+            "messages": [],
+            "max_tokens": min(max_tokens, 4000),
+            "temperature": 0.1,
+        }
+        if system:
+            body["messages"].append({"role": "system", "content": system})
+        body["messages"].append({"role": "user", "content": prompt})
+
+        try:
+            data = _http_post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                body,
+            )
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if "404" in str(e) or "model" in str(e).lower():
+                continue  # try next model
+            raise
+    raise Exception("No working Cerebras model found. Check https://inference-docs.cerebras.ai/models/overview")
+
+
+def _call_claude(prompt, system="", max_tokens=4000):
+    """Claude — OPTIONAL paid fallback. Only used if key exists + all free fail."""
+    key = _get_api_key("ANTHROPIC_API_KEY")
+    if not key:
+        raise ValueError("ANTHROPIC_API_KEY not set — skipping Claude")
+
+    try:
+        import anthropic
+    except ImportError:
+        raise ValueError("anthropic package not installed. Run: pip install anthropic")
+
+    client = anthropic.Anthropic(api_key=key)
+    kwargs = {
+        "model":      "claude-sonnet-4-5",
+        "max_tokens":  max_tokens,
+        "messages":   [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = client.messages.create(**kwargs)
+            parts = []
+            for block in resp.content:
+                if hasattr(block, "text"):
+                    parts.append(block.text)
+            return "\n".join(parts).strip()
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                time.sleep(30 * (2 ** attempt))
+            else:
+                raise
+    raise Exception("Claude rate limit exceeded.")
+
+
+def _call_llm(prompt, system="", max_tokens=4000):
+    """Universal LLM caller. Tries ALL providers, free-first.
+    Returns (response_text, provider_name).
+    
+    Priority: Gemini → Groq → Cerebras → Claude (paid, optional)
+    """
+    providers = [
+        ("Gemini",   _call_gemini),
+        ("Groq",     _call_groq),
+        ("Cerebras", _call_cerebras),
+        ("Claude",   _call_claude),
+    ]
+
+    errors = []
+    for name, fn in providers:
+        try:
+            result = fn(prompt, system=system, max_tokens=max_tokens)
+            if result and len(result.strip()) > 10:
+                return result, name
+        except Exception as e:
+            err_msg = str(e)[:120]
+            # Don't log "not set" as an error — it's expected
+            if "not set" not in err_msg.lower():
+                errors.append(f"{name}: {err_msg}")
+            continue
+
+    # Build helpful error message
+    configured = []
+    for key_name, label in [("GEMINI_API_KEY","Gemini"), ("GROQ_API_KEY","Groq"),
+                             ("CEREBRAS_API_KEY","Cerebras"), ("ANTHROPIC_API_KEY","Claude")]:
+        if _get_api_key(key_name):
+            configured.append(label)
+
+    if not configured:
+        raise Exception(
+            "No LLM API keys configured!\n"
+            "Add at least ONE to .streamlit/secrets.toml:\n"
+            "  GEMINI_API_KEY = \"AIza...\"    (FREE — https://aistudio.google.com)\n"
+            "  GROQ_API_KEY = \"gsk_...\"      (FREE — https://console.groq.com)\n"
+            "  CEREBRAS_API_KEY = \"csk-...\"  (FREE — https://cloud.cerebras.ai)\n"
+            "  ANTHROPIC_API_KEY = \"sk-...\"  (PAID — https://console.anthropic.com)"
+        )
+    else:
+        raise Exception(
+            f"All configured providers failed ({', '.join(configured)}):\n" +
+            "\n".join(errors) +
+            "\nTry again in a minute, or add more API keys."
+        )
+
+
+def _parse_json(text):
+    """Extract JSON from LLM response. Handles:
+    - Markdown fences (```json ... ```)
+    - Preamble text ("Here is the JSON: ...")
+    - Trailing commas  
+    - Truncated arrays (max_tokens cut off mid-JSON)
+    - Gemini wrapping response in extra explanation
+    """
+    if not text:
+        return None
+
+    # Strip markdown fences — all variants
+    clean = text.strip()
+    for fence in ["```json", "```JSON", "```", "`"]:
+        clean = clean.replace(fence, "")
+    clean = clean.strip()
+
+    # Strip common LLM preamble lines before JSON
+    # Gemini often says "Here is the extracted JSON:" or "```json\n{..."
+    lines = clean.split('\n')
+    # Find the first line that starts with { or [
+    json_start_line = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('{') or stripped.startswith('['):
+            json_start_line = i
+            break
+    if json_start_line > 0:
+        clean = '\n'.join(lines[json_start_line:]).strip()
+
+    # Strategy 1: direct parse
+    try:
+        return json.loads(clean)
+    except Exception:
+        pass
+
+    # Strategy 2: find the outermost { } (spec extraction returns a dict)
+    result = _bracket_extract(clean, '{', '}')
+    if result is not None:
+        return result
+
+    # Strategy 3: find the outermost [ ] (BOM generation returns an array)
+    result = _bracket_extract(clean, '[', ']')
+    if result is not None:
+        return result
+
+    # Strategy 4: TRUNCATED ARRAY RECOVERY
+    arr_start = clean.find('[')
+    if arr_start != -1:
+        recovered = _recover_truncated_array(clean[arr_start:])
+        if recovered and len(recovered) > 1:
+            return recovered
+
+    return None
+
+
+def _recover_truncated_array(text):
+    """Extract all complete JSON objects from a truncated array like [{ }, { }, { ..."""
+    objects = []
+    i = 0
+    while i < len(text):
+        # Find start of next object
+        start = text.find('{', i)
+        if start == -1:
+            break
+
+        # Use bracket counting to find its end
+        depth = 0
+        in_string = False
+        j = start
+        found_end = False
+        while j < len(text):
+            ch = text[j]
+            if ch == '"' and (j == 0 or text[j-1] != '\\'):
+                in_string = not in_string
+                j += 1
+                continue
+            if in_string:
+                j += 1
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:j+1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except json.JSONDecodeError:
+                        fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+                        try:
+                            obj = json.loads(fixed)
+                            if isinstance(obj, dict):
+                                objects.append(obj)
+                        except Exception:
+                            pass
+                    found_end = True
+                    i = j + 1
+                    break
+            j += 1
+        if not found_end:
+            # This object was truncated — skip it
+            break
+    return objects
+
+
+def _bracket_extract(text, opener, closer):
+    """Find and parse the first complete JSON structure bounded by opener/closer."""
+    start = text.find(opener)
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        ch = text[i]
+
+        # Handle string literals — skip everything inside quotes
+        if ch == '"' and (i == 0 or text[i-1] != '\\'):
+            in_string = not in_string
+            i += 1
+            continue
+
+        if in_string:
+            i += 1
+            continue
+
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+                    try:
+                        return json.loads(fixed)
+                    except Exception:
+                        return None
+        i += 1
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1 — CLAUDE READS THE PDF
+# ═══════════════════════════════════════════════════════════════════
+
+SPEC_SYSTEM = """You are a senior mechanical/procurement engineer specialising in 
+rotating equipment (pumps, compressors, turbines) for EPC projects in India.
+
+Your job: Read pump datasheets, GA drawings, vendor technical documents, and 
+procurement specifications. Extract every technical parameter accurately.
+
+Critical rules:
+- If the document contains multiple pump types (e.g. Hydrant, Spray, Jockey), 
+  identify ALL of them and list each separately.
+- Convert all units to SI: flow in m³/h, head in metres, power in kW, temp in °C.
+- If head is in mWC, mlc, or kPa — convert to metres.
+- If flow is in LPM, LPS, USGPM, l/s — convert to m³/h.
+- If power is in HP/BHP — convert to kW (×0.7457).
+- Extract Material of Construction (MOC) for every component mentioned.
+- Identify the pump type: HSC, VTP, Slurry, Sump, Multistage, etc.
+- Note manufacturer, model, tag numbers, project details.
+- If a field says "VTA" or "Bidder to furnish" → mark as null, don't guess.
+- Read EVERY row carefully: vendor response columns often contain the actual 
+  values (materials, dimensions, weights) even when the spec column says VTA.
+- Pay special attention to:
+  * Nozzle sizes and ratings from the nozzle schedule
+  * All MOC entries including casing bolts, bearing housing, base plate
+  * Weights section (total, heaviest part, transport)
+  * Seal type, seal plan, and seal accessories
+  * Drive type (direct/belt/gear) and coupling details
+  * Motor electrical data (voltage, frequency, poles)
+  * NPSHA/NPSHR values
+  * Vibration and noise limits"""
+
+
+def claude_extract_specs(pdf_text):
+    """
+    Send PDF text to Claude. Returns structured specs dict.
+    Handles multi-pump documents automatically.
+    """
+    prompt = f"""Read this pump technical document and extract ALL pump specifications.
+Pay careful attention to the VENDOR RESPONSE column — it often contains the actual
+values when the specification column says "VTA" (Vendor to Advise).
+
+DOCUMENT TEXT:
+{pdf_text[:15000]}
+
+Respond with ONLY a JSON object (no other text):
+{{
+  "document_type": "vendor_datasheet | procurement_spec | ga_drawing | manual",
+  "project": "project name if mentioned",
+  "manufacturer": "manufacturer name or null",
+  "multi_pump": true/false,
+  
+  "pumps": [
+    {{
+      "pump_label": "descriptive name e.g. Feed Liquor Booster Pump",
+      "model": "pump model or null",
+      "manufacturer": "name or null",
+      "type": "Horizontal Centrifugal | Horizontal Split Casing | Vertical Turbine | Slurry | Sump | Multistage | Other",
+      "tag_numbers": "tag nos or null",
+      "standard": "API 610 | IS 5120 | ISO 9906 | etc or null",
+      "quantity": "total number of pump units or null",
+      "configuration": "1W+1S per stream etc or null",
+      
+      "flow_m3h": number or null,
+      "head_m": number or null,
+      "speed_rpm": number or null,
+      "motor_kw": number or null,
+      "shaft_power_kw": number or null,
+      "stages": number or null,
+      "temp_c": number or null,
+      "density_kgm3": number or null,
+      "fluid": "fluid name",
+      "viscosity": "value with unit or null",
+      "npsha_m": number or null,
+      "npshr_m": number or null,
+      "min_flow_m3h": number or null,
+      "shutoff_head_m": number or null,
+      "efficiency_pct": number or null,
+      "impeller_dia_mm": number or null,
+      
+      "moc": {{
+        "casing": "exact material spec from vendor response, e.g. ASTM A532 Gr.IIIA",
+        "impeller": "exact material spec, e.g. 12% Chrome Steel ASTM A487",
+        "shaft": "exact material spec, e.g. EN-19 / SS410",
+        "shaft_sleeve": "exact material spec, e.g. SS316",
+        "wear_ring": "exact material spec or null",
+        "bearing": "type and make, e.g. Taper roller / TIMKEN",
+        "bearing_housing": "material spec, e.g. Grey Cast Iron",
+        "seal_type": "Single mechanical seal with SLD / gland packing / etc",
+        "seal_plan": "API Plan 62 / Plan 11 / Plan 53B / etc or null",
+        "baseplate": "material spec, e.g. MS (Mild Steel)",
+        "fasteners": "material spec, e.g. A197 2H & A193 B7",
+        "gland_plate": "material spec or null",
+        "coupling_halves": "material spec or null"
+      }},
+      
+      "nozzles": {{
+        "suction_size": "DN or inch size, e.g. DN200 or 8 inch",
+        "suction_rating": "Class 300 / PN16 / etc",
+        "discharge_size": "DN or inch size, e.g. DN150 or 6 inch",
+        "discharge_rating": "Class 300 / PN16 / etc",
+        "flange_standard": "ANSI B16.5 / IS 6392 / etc"
+      }},
+
+      "weights": {{
+        "pump_bare_kg": number or null,
+        "motor_kg": number or null,
+        "baseplate_kg": number or null,
+        "total_package_kg": number or null,
+        "heaviest_part_kg": number or null,
+        "transport_kg": number or null
+      }},
+      
+      "motor": {{
+        "type": "Squirrel cage / Slip ring / etc",
+        "rating_kw": number or null,
+        "voltage_v": "690V / 415V / etc",
+        "frequency_hz": 50,
+        "poles": 4,
+        "speed_rpm": number or null,
+        "enclosure": "TEFC / etc or null",
+        "mounting": "by pump vendor / by contractor / etc"
+      }},
+      
+      "drive": {{
+        "type": "direct coupled | belt driven | gear driven",
+        "coupling_type": "disc / tyre / gear / V-belt / etc",
+        "belt_guard": true/false
+      }},
+      
+      "vibration_limit": "value with unit or null",
+      "noise_limit_dba": number or null,
+      "performance_test_std": "ISO 9906:2012 / etc or null",
+      "surface_prep_spec": "spec reference or null",
+      
+      "scope": {{
+        "pump": true/false,
+        "motor": true/false,
+        "mechanical_seal": true/false,
+        "baseframe": true/false,
+        "coupling_guard": true/false,
+        "companion_flanges": true/false,
+        "foundation_bolts": true/false,
+        "first_fill_lubricants": true/false,
+        "suction_strainer": true/false
+      }},
+      
+      "notes": "any critical notes including vendor remarks"
+    }}
+  ]
+}}
+
+Be accurate. If data is missing, use null — never guess."""
+
+    raw, provider = _call_llm(prompt, system=SPEC_SYSTEM, max_tokens=6000)
+
+    # Save raw response so app.py can show it for debugging if parse fails
+    try:
+        import streamlit as st
+        st.session_state["_last_raw_response"] = raw[:4000] if raw else ""
+    except Exception:
+        pass
+
+    data = _parse_json(raw)
+
+    # If parse completely failed, build a minimal shell so the app doesn't
+    # silently freeze — user will see the debug output in app.py
+    if not data or not isinstance(data, dict):
+        return None
+
+    # Ensure pumps key always exists as a list
+    if "pumps" not in data or not isinstance(data.get("pumps"), list):
+        # Sometimes Gemini returns the pump object directly at root level
+        if any(k in data for k in ["flow_m3h", "head_m", "motor_kw", "fluid", "type"]):
+            data = {"pumps": [data], "document_type": "vendor_datasheet",
+                    "multi_pump": False, "manufacturer": data.get("manufacturer")}
+        else:
+            data["pumps"] = []
+
+    data["_llm_provider"] = provider
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2 — CLAUDE GENERATES THE BOM
+# ═══════════════════════════════════════════════════════════════════
+
+BOM_SYSTEM = """You are an expert pump procurement engineer in India. 
+You generate Bills of Materials for centrifugal pump packages.
+
+Every BOM you generate must:
+1. Cover ALL sub-assemblies: pump hydraulics, rotating assembly, bearings, 
+   sealing, drive/coupling, motor, structural, piping/nozzles, fasteners, 
+   instrumentation, acoustic (if needed), complete assembly.
+2. Specify MOC (Material of Construction) for EVERY component — use exact 
+   ASTM/EN/IS specifications, not generic terms.
+3. Include realistic weights where known.
+4. Specify quantity per pump unit.
+5. Mark each component as M (Mandatory), C (Conditional), or O (Optional).
+6. Be specific — not generic. E.g. "Taper Roller Bearing - TIMKEN" not just "Bearing".
+7. Include seal plan piping, coupling guard, foundation bolts, counter flanges.
+8. For Indian EPC: include RTDs for pump bearings, dial thermometers.
+9. Reference the datasheet wherever possible in notes (e.g. "per DS row 86").
+10. For belt-driven pumps: include V-belt set, pulleys, belt guard.
+11. For motors mounted by pump vendor: include full motor specs.
+"""
+
+
+def claude_generate_bom(pump_specs):
+    """
+    Given extracted pump specs, generate a complete BOM.
+    Returns a list of component dicts.
+    """
+    specs_str = json.dumps(pump_specs, indent=2, default=str)
+
+    prompt = f"""Generate a COMPLETE Bill of Materials for this pump:
+
+PUMP SPECIFICATIONS:
+{specs_str}
+
+Generate the BOM as a JSON array. Each component:
+{{
+  "section": "A. PUMP HYDRAULICS | B. ROTATING ASSEMBLY | C. BEARINGS & LUBRICATION | D. SHAFT SEALING | E. DRIVE & COUPLING | F. MOTOR / DRIVER | G. STRUCTURAL | H. PIPING & NOZZLES | I. FASTENERS & GASKETS | J. INSTRUMENTATION | K. ACOUSTIC & SAFETY | L. COMPLETE ASSEMBLY",
+  "sub_assembly": "Casing Assembly | Rotor Assembly | Bearing Assembly | Sealing Assembly | Drive Assembly | Motor | Structural | Piping Assembly | Fasteners | Instrumentation | Acoustic Enclosure | Complete Package",
+  "component": "specific component name",
+  "description": "detailed description with specs where applicable",
+  "moc": "exact material specification — ASTM/IS/EN standard",
+  "qty": "1 | 2 | 1 set | etc",
+  "weight_kg": number or null,
+  "req_type": "M | C | O",
+  "notes": "any relevant notes"
+}}
+
+IMPORTANT:
+- Include AT LEAST 25 components for a standard pump
+- Include ALL wetted parts with correct MOC for the fluid service
+- Motor: specify frame size, kW, voltage, poles
+- Seal: specify type, plan, materials
+- For belt drive: include V-belt set, motor pulley, pump pulley, belt guard
+- For direct coupling: specify type (disc/tyre/spacer), DBSE
+- Baseplate: IS 2062 fabricated with drain pan
+- Foundation bolts: specify quantity and size
+- Counter flanges: both suction and discharge with gaskets and fasteners
+- Gaskets: specify type and material
+- Instrumentation: RTDs for pump bearings if applicable
+- Casing wear rings AND impeller wear rings as separate items
+- Shaft sleeve if applicable
+- All bearing housing components
+- Casing joint bolts/fasteners
+
+Respond with ONLY the JSON array — no preamble, no explanation.
+Keep descriptions under 80 characters to avoid truncation."""
+
+    raw, provider = _call_llm(prompt, system=BOM_SYSTEM, max_tokens=8000)
+    data = _parse_json(raw)
+
+    # Normalize: always return a list of dicts
+    items = _normalize_bom_data(data, raw)
+    return items
+
+
+def _normalize_bom_data(data, raw_text=""):
+    """
+    Claude can return BOM as:
+      - list of dicts (ideal)
+      - dict with "components", "bom", or "items" key
+      - dict that IS a single component
+      - string (if _parse_json failed)
+      - None
+    Normalize to list of dicts always.
+    """
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+
+    if isinstance(data, dict):
+        for key in ["components", "bom", "items", "bill_of_materials",
+                     "BOM", "Components", "data"]:
+            if key in data and isinstance(data[key], list):
+                return [item for item in data[key] if isinstance(item, dict)]
+        if "component" in data or "section" in data or "moc" in data:
+            return [data]
+        for v in data.values():
+            if isinstance(v, list) and len(v) > 3:
+                items = [item for item in v if isinstance(item, dict)]
+                if items:
+                    return items
+
+    if raw_text and isinstance(raw_text, str):
+        cleaned = raw_text.replace("```json","").replace("```","")
+        arr = _bracket_extract(cleaned, "[", "]")
+        if isinstance(arr, list):
+            return [item for item in arr if isinstance(item, dict)]
+        # Last resort: recover individual objects from truncated array
+        recovered = _recover_truncated_array(cleaned)
+        if recovered and len(recovered) > 0:
+            return recovered
+
+    return []
+
+
+def bom_to_dataframe(bom_list):
+    """Convert Claude BOM output to a clean DataFrame."""
+    if not bom_list:
+        return pd.DataFrame()
+
+    rows = []
+    for i, comp in enumerate(bom_list, 1):
+        if not isinstance(comp, dict):
+            continue
+        rows.append({
+            "No":           i,
+            "Section":      str(comp.get("section", "")),
+            "Sub_Assembly": str(comp.get("sub_assembly", "")),
+            "Component":    str(comp.get("component", comp.get("name", comp.get("item", "")))),
+            "Description":  str(comp.get("description", comp.get("desc", ""))),
+            "MOC":          str(comp.get("moc", comp.get("material", comp.get("MOC", "")))),
+            "Qty":          str(comp.get("qty", comp.get("quantity", "1"))),
+            "Weight_kg":    comp.get("weight_kg", comp.get("weight", None)),
+            "Req_Type":     str(comp.get("req_type", comp.get("type", "M"))),
+            "Notes":        str(comp.get("notes", comp.get("note", comp.get("remarks", "")))),
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3 — SHOULD-COST MODEL
+# ═══════════════════════════════════════════════════════════════════
+# Purpose: Reverse-engineer the SUPPLIER'S manufacturing cost.
+# This is NOT "what we pay" — it's "what it costs HIM to make it."
+#
+# Cost structure for every component:
+#   Raw Material Cost  = net weight × material ₹/kg (grade-specific)
+#   Machining Cost     = complexity factor × raw material cost
+#   Surface Treatment  = painting / plating / heat treatment
+#   ───────────────────────────────────────────
+#   Manufactured Cost  = raw + machining + surface
+#
+#   Bought-out items   = market price (web lookup) + supplier markup 5-6%
+#   (motors, bearings, seals, instruments — supplier doesn't make these)
+#
+# This model works for ANY engineered product: pumps, valves, 
+# heat exchangers, gearboxes, vessels, skids, etc.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── RAW MATERIAL RATES (₹/kg) ────────────────────────────────────
+# These are RAW MATERIAL costs — what the foundry/forge pays for metal.
+# NOT finished price. Machining is added separately.
+# Sources: Metal Bulletin India, LME India, SAIL price lists, IndiaMart
+RAW_MATERIAL_RATES = {
+    # Carbon Steel
+    "A216 WCB":       130,   # CS casting raw
+    "WCB":            130,
+    "SA 216":         130,
+    "IS 2062":        72,    # Structural plate/section
+    "MS":             72,    # Mild steel plate
+    "MILD STEEL":     72,
+    "CARBON STEEL":   85,
+    "A105":           95,    # CS forging
+    # Alloy Steel
+    "EN-19":          180,   # Alloy steel bar (Cr-Mo)
+    "EN19":           180,
+    "EN-24":          200,   # Ni-Cr-Mo steel bar
+    "EN24":           200,
+    "SS410":          210,   # Martensitic SS bar
+    "4140":           175,
+    "4340":           210,
+    # Stainless Steel
+    "SS304":          280,   # Austenitic SS
+    "CF8":            320,   # SS304 casting
+    "SS316":          340,   # SS316 bar/plate
+    "CF8M":           380,   # SS316 casting
+    "SS316L":         350,
+    "DUPLEX":         520,   # Duplex SS (2205)
+    "CD4MCU":         550,   # Duplex casting
+    "SUPER DUPLEX":   680,
+    # High Alloy
+    "MONEL":          2200,
+    "INCONEL":        3200,
+    "HASTELLOY":      3800,
+    "TITANIUM":       3500,
+    # Chrome Iron
+    "A532":           280,   # High chrome white iron casting (raw)
+    "HIGH CHROME":    280,
+    "ASTM A487":      220,   # 12% chrome steel casting
+    "12% CHROME":     220,
+    # Cast Iron
+    "GREY CAST IRON": 65,    # GCI raw
+    "CAST IRON":      65,
+    "CI":             65,
+    "SG IRON":        85,    # Spheroidal graphite (ductile)
+    "DUCTILE IRON":   85,
+    # Special
+    "A193 B7":        250,   # High-strength alloy bolting bar
+    "A197":           150,   # Nut material
+    "RUBBER":         180,   # Lined/moulded rubber
+    "PTFE":           800,
+    "EPDM":           350,
 }
+
+# ── MACHINING COMPLEXITY MULTIPLIERS ─────────────────────────────
+# Applied on top of raw material cost.
+# Factor = additional cost as % of raw material cost.
+# E.g. 0.8 means machining costs 80% of raw material cost.
+MACHINING_FACTORS = {
+    # Heavy castings — pattern + moulding + rough machining + finish
+    "pump_casing":       0.90,   # Complex casting, internal passages, flange faces
+    "impeller":          1.20,   # Complex curved vanes, balancing, close tolerances
+    "wear_ring":         0.60,   # Simple turned ring, interference fit
+    "volute_liner":      0.70,
+    "diffuser":          1.00,
+    # Rotating parts — forging/bar + turning + grinding
+    "shaft":             0.85,   # Multi-diameter turning, keyways, threading
+    "shaft_sleeve":      0.50,   # Simple OD/ID turning
+    "coupling_half":     0.55,
+    "impeller_nut":      0.30,
+    # Housings — casting + boring + face machining
+    "bearing_housing":   0.65,   # Bore machining, face finishing, oil channels
+    "seal_housing":      0.70,
+    "gland_plate":       0.45,   # Flat plate, bolt holes, bore
+    "stuffing_box":      0.60,
+    # Fabrication — cutting + welding + machining
+    "baseplate":         0.40,   # Cut, weld, drill, machine pads
+    "base_frame":        0.40,
+    "skid":              0.35,
+    # Simple machined parts
+    "key":               0.25,
+    "spacer":            0.20,
+    "bolt":              0.30,
+    "nut":               0.20,
+    "flange":            0.45,   # Forging + drilling + face machining
+    "gasket":            0.15,   # Die cut or spiral wound
+    # Default
+    "default_casting":   0.70,
+    "default_forging":   0.55,
+    "default_machined":  0.50,
+    "default_fabricated":0.35,
+    "default":           0.50,
+}
+
+# ── SURFACE TREATMENT COSTS (₹/kg) ──────────────────────────────
+SURFACE_TREATMENT = {
+    "painting":          8,     # Standard industrial primer + topcoat
+    "hot_dip_galv":      18,    # Hot-dip galvanizing
+    "electroplating":    35,    # Chrome/nickel plating
+    "heat_treatment":    25,    # Normalizing/stress relieving
+    "shot_blasting":     5,     # Surface prep
+    "none":              0,
+}
+
+# ── BOUGHT-OUT ITEM REFERENCE PRICES (₹) ────────────────────────
+# These are MARKET prices for items the supplier doesn't manufacture.
+# The supplier just buys these and adds 5-6% margin.
+# Sources: IndiaMart, TradeIndia, IEEMA motor price index
+BOUGHT_OUT_PRICES = {
+    # Motors — ₹/kW (OEM price to pump vendor)
+    "motor_per_kw_ht_690v":    3800,    # HT/MV motor ≥200kW
+    "motor_per_kw_lt_415v":    4800,    # LT motor <200kW
+    "motor_per_kw_lt_small":   6500,    # Small LT motor <30kW (higher ₹/kW)
+    # Bearings (OEM price)
+    "skf_6200_series":         800,     # Small deep groove
+    "skf_6300_series":         1800,    # Medium deep groove
+    "skf_7300_series":         3500,    # Angular contact medium
+    "timken_taper_medium":     5500,    # Taper roller 80-120mm bore
+    "timken_taper_large":      9000,    # Taper roller >120mm bore
+    "skf_spherical_large":     15000,   # Spherical roller >150mm
+    # Mechanical Seals (OEM price, supplier buys from EagleBurgmann/John Crane)
+    "mech_seal_single_small":  22000,   # Single, <50mm shaft
+    "mech_seal_single_medium": 55000,   # Single, 50-80mm shaft
+    "mech_seal_single_large":  110000,  # Single, >80mm shaft
+    "mech_seal_double":        180000,  # Double with barrier fluid
+    "mech_seal_cartridge":     140000,  # Cartridge type
+    "seal_sld_device":         25000,   # Synthetic Lubricating Device add-on
+    # Coupling (OEM price)
+    "coupling_disc_small":     8000,
+    "coupling_disc_large":     28000,
+    "coupling_gear":           45000,
+    # V-belts
+    "vbelt_set_small":         4000,    # <50kW
+    "vbelt_set_medium":        8000,    # 50-200kW
+    "vbelt_set_large":         14000,   # >200kW
+    "vbelt_guard":             3500,
+    # Pulleys
+    "pulley_small":            3000,
+    "pulley_large":            8000,
+    # Instrumentation
+    "rtd_pt100":               1200,
+    "dial_thermometer":        800,
+    "pressure_gauge":          1500,
+    "vibration_switch":        4500,
+    # Flanges & Gaskets (bought-out)
+    "companion_flange_4inch":  1200,
+    "companion_flange_6inch":  2200,
+    "companion_flange_8inch":  3500,
+    "companion_flange_10inch": 5500,
+    "companion_flange_12inch": 7500,
+    "gasket_spiral_wound_4":   400,
+    "gasket_spiral_wound_6":   550,
+    "gasket_spiral_wound_8":   700,
+    "gasket_spiral_wound_10":  900,
+    "gasket_compressed":       200,
+    # Foundation hardware
+    "foundation_bolt_m24":     180,
+    "foundation_bolt_m30":     280,
+    "foundation_bolt_m36":     400,
+    # First fill
+    "grease_first_fill_kg":    350,     # per kg
+    "oil_first_fill_litre":    250,     # per litre
+}
+
+# Supplier markup on bought-out items
+SUPPLIER_MARKUP = 0.06  # 6%
+
+# ── REFERENCE URLS for price verification ────────────────────────
+PRICE_REFERENCE_URLS = {
+    "motors":    "https://www.indiamart.com/search.mp?ss=industrial+electric+motor",
+    "bearings":  "https://www.indiamart.com/search.mp?ss=skf+timken+bearing",
+    "seals":     "https://www.indiamart.com/search.mp?ss=mechanical+seal+pump",
+    "castings":  "https://www.indiamart.com/search.mp?ss=steel+casting+price+per+kg",
+    "flanges":   "https://www.indiamart.com/search.mp?ss=ansi+flanges",
+    "metals":    "https://www.metalmarket.in",
+    "steel":     "https://www.steelmint.com",
+    "lme":       "https://www.westmetall.com/en/markdaten.php",
+}
+
+
+def _classify_component(component_name, moc="", description=""):
+    """Classify a component as MANUFACTURED or BOUGHT-OUT.
+    Returns (category, machining_key, surface_treatment)."""
+    comp = (component_name or "").upper()
+    desc = (description or "").upper()
+    moc_u = (moc or "").upper()
+
+    # ── BOUGHT-OUT (supplier doesn't make, just procures) ─────────
+    if any(x in comp for x in ["MOTOR", "ELECTRIC MOTOR", "SCIM", "SQUIRREL CAGE"]):
+        if not any(x in comp for x in ["BOLT", "MOUNT", "BASE", "PULLEY", "SIDE", "BRACKET"]):
+            return "bought_out", "motor", "none"
+
+    if any(x in comp for x in ["BEARING"]) and "HOUSING" not in comp:
+        return "bought_out", "bearing", "none"
+
+    if any(x in comp for x in ["MECHANICAL SEAL", "MECH SEAL", "CARTRIDGE SEAL"]):
+        return "bought_out", "seal", "none"
+
+    if "SLD" in comp and ("DEVICE" in comp or "SYNTHETIC" in comp):
+        return "bought_out", "seal_accessory", "none"
+
+    if any(x in comp for x in ["RTD", "THERMOCOUPLE", "THERMOMETER", "PRESSURE GAUGE",
+                                "VIBRATION SWITCH", "TRANSMITTER"]):
+        return "bought_out", "instrument", "none"
+
+    if "V-BELT" in comp or "V BELT" in comp or "VBELT" in comp:
+        return "bought_out", "vbelt", "none"
+
+    if "COMPANION FLANGE" in comp or "COUNTER FLANGE" in comp:
+        return "bought_out", "flange_set", "none"
+
+    if "GASKET" in comp:
+        return "bought_out", "gasket", "none"
+
+    if "FOUNDATION" in comp and "BOLT" in comp:
+        return "bought_out", "foundation_bolt", "none"
+
+    if "GREASE" in comp or "LUBRICANT" in comp or "FIRST FILL" in comp:
+        return "bought_out", "lubricant", "none"
+
+    if "GUARD" in comp and ("BELT" in comp or "COUPLING" in comp):
+        return "bought_out", "guard", "none"
+
+    # ── MANUFACTURED (supplier makes in his shop) ─────────────────
+    if "CASING" in comp and "BOLT" not in comp:
+        return "manufactured", "pump_casing", "painting"
+
+    if "IMPELLER" in comp and "WEAR" not in comp and "NUT" not in comp:
+        return "manufactured", "impeller", "none"
+
+    if "WEAR RING" in comp:
+        return "manufactured", "wear_ring", "none"
+
+    if "SHAFT" in comp and "SLEEVE" not in comp and "KEY" not in comp:
+        return "manufactured", "shaft", "none"
+
+    if "SLEEVE" in comp:
+        return "manufactured", "shaft_sleeve", "none"
+
+    if "GLAND" in comp or "SEAL PLATE" in comp:
+        return "manufactured", "gland_plate", "none"
+
+    if "BEARING HOUSING" in comp or "PEDESTAL" in comp:
+        return "manufactured", "bearing_housing", "painting"
+
+    if "BASE" in comp or "BASEPLATE" in comp or "FRAME" in comp or "SKID" in comp:
+        return "manufactured", "baseplate", "painting"
+
+    if "PULLEY" in comp or "SHEAVE" in comp:
+        return "manufactured", "coupling_half", "painting"
+
+    if "KEY" in comp:
+        return "manufactured", "key", "none"
+
+    if "BOLT" in comp or "NUT" in comp or "STUD" in comp or "FASTENER" in comp:
+        return "manufactured", "bolt", "none"
+
+    if "NOZZLE" in comp:
+        return "manufactured", "flange", "painting"  # integral, priced as casting
+
+    if "ANCHOR" in comp:
+        return "bought_out", "foundation_bolt", "hot_dip_galv"
+
+    # ── COMPLIANCE / ASSEMBLY (no separate cost) ──────────────────
+    if any(x in comp for x in ["COMPLETE ASSEMBLY", "NOISE LEVEL", "VIBRATION",
+                                "COMPLIANCE", "PROVISION", "SURFACE PREP",
+                                "PERFORMANCE TEST"]):
+        return "compliance", "none", "none"
+
+    # Default: manufactured
+    return "manufactured", "default", "painting"
+
+
+def _get_raw_material_rate(moc):
+    """Find the ₹/kg rate for a given MOC string."""
+    moc_upper = (moc or "").upper()
+    for mat_key, rate in RAW_MATERIAL_RATES.items():
+        if mat_key in moc_upper:
+            return rate, mat_key
+    return None, None
+
+
+def _price_manufactured(comp_name, moc, weight_kg, qty_str, machining_key, surface_key):
+    """Should-cost for a manufactured component.
+    Returns dict with cost breakdown."""
+    result = {
+        "raw_material_cost": 0,
+        "machining_cost": 0,
+        "surface_cost": 0,
+        "total_cost": 0,
+        "confidence": "low",
+        "breakdown": "",
+    }
+
+    if not weight_kg or weight_kg <= 0:
+        return result
+
+    # Parse qty
+    try:
+        q = int(re.search(r'\d+', str(qty_str)).group()) if re.search(r'\d+', str(qty_str)) else 1
+    except Exception:
+        q = 1
+
+    # Gross weight = net weight × 1.08 (8% machining allowance on castings)
+    is_casting = machining_key in ("pump_casing", "impeller", "wear_ring", "bearing_housing",
+                                     "gland_plate", "default_casting")
+    gross_weight = weight_kg * 1.08 if is_casting else weight_kg
+
+    # Raw material cost
+    rate, matched_mat = _get_raw_material_rate(moc)
+    if rate is None:
+        rate = 100  # conservative fallback
+        matched_mat = "unknown (₹100/kg default)"
+        result["confidence"] = "low"
+    else:
+        result["confidence"] = "high"
+
+    raw_cost = rate * gross_weight * q
+    result["raw_material_cost"] = int(raw_cost)
+
+    # Machining cost
+    mach_factor = MACHINING_FACTORS.get(machining_key, MACHINING_FACTORS["default"])
+    mach_cost = raw_cost * mach_factor
+    result["machining_cost"] = int(mach_cost)
+
+    # Surface treatment
+    surf_rate = SURFACE_TREATMENT.get(surface_key, 0)
+    surf_cost = surf_rate * weight_kg * q
+    result["surface_cost"] = int(surf_cost)
+
+    # Total
+    total = raw_cost + mach_cost + surf_cost
+    result["total_cost"] = int(total)
+    result["breakdown"] = (
+        f"Raw: ₹{rate}/kg × {gross_weight:.0f}kg = ₹{int(raw_cost):,} ({matched_mat}) | "
+        f"Machining: ×{mach_factor} = ₹{int(mach_cost):,} | "
+        f"Surface: ₹{int(surf_cost):,}"
+    )
+    return result
+
+
+def _price_bought_out(comp_name, moc, weight_kg, qty_str, sub_type, pump_specs):
+    """Should-cost for bought-out items.
+    Returns dict with cost breakdown."""
+    comp = (comp_name or "").upper()
+    pump = pump_specs if isinstance(pump_specs, dict) else {}
+    result = {
+        "raw_material_cost": 0,    # = market price for bought-out
+        "machining_cost": 0,       # = 0 for bought-out
+        "surface_cost": 0,         # = supplier markup
+        "total_cost": 0,
+        "confidence": "medium",
+        "breakdown": "",
+    }
+
+    try:
+        q = int(re.search(r'\d+', str(qty_str)).group()) if re.search(r'\d+', str(qty_str)) else 1
+    except Exception:
+        q = 1
+
+    market_price = 0
+    source = ""
+
+    # ── MOTOR ──
+    if sub_type == "motor":
+        kw = pump.get("motor_kw") or 0
+        try:
+            kw = float(kw)
+        except (ValueError, TypeError):
+            kw = 0
+        voltage = str((pump.get("motor", {}) or {}).get("voltage_v", "415V"))
+
+        if kw >= 200 or "690" in voltage:
+            rate = BOUGHT_OUT_PRICES["motor_per_kw_ht_690v"]
+        elif kw >= 30:
+            rate = BOUGHT_OUT_PRICES["motor_per_kw_lt_415v"]
+        else:
+            rate = BOUGHT_OUT_PRICES["motor_per_kw_lt_small"]
+
+        market_price = int(kw * rate)
+        source = f"₹{rate}/kW × {kw}kW ({voltage})"
+        result["confidence"] = "high"
+
+    # ── BEARING ──
+    elif sub_type == "bearing":
+        if "TAPER" in comp or "TAPERED" in comp:
+            if weight_kg and weight_kg > 5:
+                market_price = BOUGHT_OUT_PRICES["timken_taper_large"]
+            else:
+                market_price = BOUGHT_OUT_PRICES["timken_taper_medium"]
+        elif "SPHERICAL" in comp:
+            market_price = BOUGHT_OUT_PRICES["skf_spherical_large"]
+        elif "ANGULAR" in comp:
+            market_price = BOUGHT_OUT_PRICES["skf_7300_series"]
+        else:
+            market_price = BOUGHT_OUT_PRICES["skf_6300_series"]
+        source = "OEM bearing price"
+
+    # ── MECHANICAL SEAL ──
+    elif sub_type == "seal":
+        if "DOUBLE" in comp:
+            market_price = BOUGHT_OUT_PRICES["mech_seal_double"]
+        elif "CARTRIDGE" in comp:
+            market_price = BOUGHT_OUT_PRICES["mech_seal_cartridge"]
+        elif any(x in comp for x in ["SLD", "PLAN 62", "LARGE"]):
+            market_price = BOUGHT_OUT_PRICES["mech_seal_single_large"]
+        elif "MEDIUM" in comp or (weight_kg and weight_kg > 10):
+            market_price = BOUGHT_OUT_PRICES["mech_seal_single_medium"]
+        else:
+            market_price = BOUGHT_OUT_PRICES["mech_seal_single_small"]
+        source = "OEM seal price (EagleBurgmann/John Crane class)"
+
+    elif sub_type == "seal_accessory":
+        market_price = BOUGHT_OUT_PRICES["seal_sld_device"]
+        source = "SLD device"
+
+    # ── V-BELT ──
+    elif sub_type == "vbelt":
+        kw = pump.get("motor_kw") or 0
+        try:
+            kw = float(kw)
+        except Exception:
+            kw = 100
+        if kw > 200:
+            market_price = BOUGHT_OUT_PRICES["vbelt_set_large"]
+        elif kw > 50:
+            market_price = BOUGHT_OUT_PRICES["vbelt_set_medium"]
+        else:
+            market_price = BOUGHT_OUT_PRICES["vbelt_set_small"]
+        source = f"V-belt set for {kw}kW"
+
+    # ── COMPANION FLANGE SET ──
+    elif sub_type == "flange_set":
+        if "200" in comp or "8" in comp or "SUCTION" in comp:
+            market_price = BOUGHT_OUT_PRICES["companion_flange_8inch"]
+        elif "150" in comp or "6" in comp or "DISCHARGE" in comp:
+            market_price = BOUGHT_OUT_PRICES["companion_flange_6inch"]
+        elif "250" in comp or "10" in comp:
+            market_price = BOUGHT_OUT_PRICES["companion_flange_10inch"]
+        else:
+            market_price = BOUGHT_OUT_PRICES["companion_flange_6inch"]
+        source = "Flange + gasket + bolt set"
+
+    # ── GASKET ──
+    elif sub_type == "gasket":
+        if "SPIRAL" in comp:
+            market_price = BOUGHT_OUT_PRICES["gasket_spiral_wound_8"]
+        else:
+            market_price = BOUGHT_OUT_PRICES["gasket_compressed"]
+        source = "Standard gasket"
+
+    # ── FOUNDATION BOLT ──
+    elif sub_type == "foundation_bolt":
+        count = 8  # typical
+        if q > 1:
+            count = q
+        market_price = BOUGHT_OUT_PRICES["foundation_bolt_m30"] * count
+        source = f"{count}× M30 foundation bolts"
+
+    # ── INSTRUMENT ──
+    elif sub_type == "instrument":
+        if "RTD" in comp:
+            market_price = BOUGHT_OUT_PRICES["rtd_pt100"]
+        elif "THERMO" in comp:
+            market_price = BOUGHT_OUT_PRICES["dial_thermometer"]
+        elif "PRESSURE" in comp:
+            market_price = BOUGHT_OUT_PRICES["pressure_gauge"]
+        elif "VIBRATION" in comp:
+            market_price = BOUGHT_OUT_PRICES["vibration_switch"]
+        else:
+            market_price = 2000
+        source = "Standard instrument"
+
+    # ── LUBRICANT ──
+    elif sub_type == "lubricant":
+        market_price = BOUGHT_OUT_PRICES["grease_first_fill_kg"] * max(weight_kg or 2, 2)
+        source = "First fill grease/oil"
+
+    # ── GUARD ──
+    elif sub_type == "guard":
+        market_price = BOUGHT_OUT_PRICES["vbelt_guard"]
+        source = "Belt/coupling guard"
+
+    else:
+        market_price = 5000
+        result["confidence"] = "low"
+        source = "Generic bought-out estimate"
+
+    market_price = market_price * q
+    supplier_markup_amt = int(market_price * SUPPLIER_MARKUP)
+
+    result["raw_material_cost"] = int(market_price)  # "raw" = OEM market price
+    result["surface_cost"] = supplier_markup_amt      # "surface" = supplier's margin
+    result["total_cost"] = int(market_price + supplier_markup_amt)
+    result["breakdown"] = f"Market: ₹{int(market_price):,} + Supplier markup {SUPPLIER_MARKUP*100:.0f}%: ₹{supplier_markup_amt:,} | {source}"
+
+    return result
+
+
+def claude_price_bom(bom_df, pump_specs, progress_callback=None):
+    """
+    SHOULD-COST MODEL: Reverse-engineer the supplier's manufacturing cost.
+    
+    For manufactured items:  Raw Material + Machining + Surface Treatment
+    For bought-out items:    Market Price + Supplier Markup (5-6%)
+    
+    Uses free LLMs only for items that can't be classified locally.
+    Claude is the absolute last fallback.
+    """
+    if bom_df is None or bom_df.empty:
+        return bom_df
+
+    pump = pump_specs if isinstance(pump_specs, dict) else {}
+
+    if progress_callback:
+        progress_callback(10, "Classifying components: manufactured vs bought-out...")
+
+    result_rows = []
+    unpriced = []
+
+    for _, row in bom_df.iterrows():
+        rd = row.to_dict()
+        comp_name = str(row.get("Component", ""))
+        moc = str(row.get("MOC", ""))
+        desc = str(row.get("Description", ""))
+        weight = row.get("Weight_kg")
+        qty_str = str(row.get("Qty", "1"))
+        no = row.get("No", 0)
+
+        category, sub_type, surface = _classify_component(comp_name, moc, desc)
+
+        if category == "manufactured":
+            cost = _price_manufactured(comp_name, moc, weight, qty_str, sub_type, surface)
+        elif category == "bought_out":
+            cost = _price_bought_out(comp_name, moc, weight, qty_str, sub_type, pump)
+        elif category == "compliance":
+            cost = {
+                "raw_material_cost": 0, "machining_cost": 0, "surface_cost": 0,
+                "total_cost": 0, "confidence": "high",
+                "breakdown": "Compliance/assembly item — no separate cost",
+            }
+        else:
+            cost = None
+
+        if cost and (cost["total_cost"] > 0 or cost["confidence"] == "high"):
+            total = cost["total_cost"]
+            gst = int(total * 0.18)
+            rd["Raw_Material_INR"]   = cost["raw_material_cost"]
+            rd["Machining_INR"]      = cost["machining_cost"]
+            rd["Surface_INR"]        = cost["surface_cost"]
+            rd["Unit_Price_INR"]     = total
+            rd["Total_Price_INR"]    = total
+            rd["GST_18pct"]          = gst
+            rd["Price_With_GST"]     = total + gst
+            rd["Price_Confidence"]   = cost["confidence"]
+            rd["Price_Source"]       = cost["breakdown"]
+            rd["Price_Notes"]        = f"Category: {category}"
+            rd["Component_Type"]     = category
+            result_rows.append(rd)
+        elif cost and cost["total_cost"] == 0 and category == "compliance":
+            rd["Raw_Material_INR"]   = 0
+            rd["Machining_INR"]      = 0
+            rd["Surface_INR"]        = 0
+            rd["Unit_Price_INR"]     = 0
+            rd["Total_Price_INR"]    = 0
+            rd["GST_18pct"]          = 0
+            rd["Price_With_GST"]     = 0
+            rd["Price_Confidence"]   = "high"
+            rd["Price_Source"]       = cost["breakdown"]
+            rd["Price_Notes"]        = "No separate cost"
+            rd["Component_Type"]     = "compliance"
+            result_rows.append(rd)
+        else:
+            unpriced.append((rd, no))
+
+    if progress_callback:
+        n_priced = len(result_rows)
+        progress_callback(60, f"Should-costed {n_priced}/{len(bom_df)} locally. LLM for {len(unpriced)} remaining...")
+
+    # Use free LLM for remaining unpriced
+    if unpriced:
+        unpriced_list = [{"no": no, "component": rd.get("Component",""),
+                          "moc": rd.get("MOC",""), "qty": rd.get("Qty","1"),
+                          "weight_kg": rd.get("Weight_kg")}
+                         for rd, no in unpriced]
+
+        prompt = f"""Estimate the MANUFACTURING COST (not selling price) for these components.
+Break down each into: raw_material_cost (₹/kg × weight), machining_cost, total.
+Indian rates 2025-26. Conservative estimates.
+
+Components: {json.dumps(unpriced_list, default=str)}
+
+Return JSON array:
+[{{"no":<n>,"raw_material_cost":<int>,"machining_cost":<int>,"total_cost":<int>,"confidence":"medium","breakdown":"brief"}}]
+JSON only."""
+
+        try:
+            raw, provider = _call_llm(prompt, max_tokens=2000)
+            if progress_callback:
+                progress_callback(80, f"Got costs from {provider}...")
+            llm_prices = _parse_json(raw)
+            price_map = {}
+            if isinstance(llm_prices, list):
+                for p in llm_prices:
+                    if isinstance(p, dict) and "no" in p:
+                        price_map[p["no"]] = p
+
+            for rd, no in unpriced:
+                pr = price_map.get(no, {})
+                raw_mat = int(pr.get("raw_material_cost", 0))
+                mach    = int(pr.get("machining_cost", 0))
+                total   = int(pr.get("total_cost", raw_mat + mach))
+                gst     = int(total * 0.18)
+                rd["Raw_Material_INR"]  = raw_mat
+                rd["Machining_INR"]     = mach
+                rd["Surface_INR"]       = 0
+                rd["Unit_Price_INR"]    = total
+                rd["Total_Price_INR"]   = total
+                rd["GST_18pct"]         = gst
+                rd["Price_With_GST"]    = total + gst
+                rd["Price_Confidence"]  = str(pr.get("confidence", "low"))
+                rd["Price_Source"]      = f"{provider}: {str(pr.get('breakdown', ''))}"
+                rd["Price_Notes"]       = "LLM estimate"
+                rd["Component_Type"]    = "unknown"
+                result_rows.append(rd)
+        except Exception as e:
+            for rd, no in unpriced:
+                rd.update({"Raw_Material_INR":0,"Machining_INR":0,"Surface_INR":0,
+                           "Unit_Price_INR":0,"Total_Price_INR":0,"GST_18pct":0,
+                           "Price_With_GST":0,"Price_Confidence":"none",
+                           "Price_Source":f"Failed: {str(e)[:50]}",
+                           "Price_Notes":"Manual costing required","Component_Type":"unknown"})
+                result_rows.append(rd)
+
+    if progress_callback:
+        progress_callback(92, "Compiling should-cost report...")
+
+    return pd.DataFrame(result_rows)
+
+
+def build_cost_summary(priced_df):
+    """Build a should-cost summary from priced BOM."""
+    if priced_df is None or priced_df.empty:
+        return {}
+
+    total_raw  = int(priced_df.get("Raw_Material_INR", pd.Series([0])).sum())
+    total_mach = int(priced_df.get("Machining_INR", pd.Series([0])).sum())
+    total_surf = int(priced_df.get("Surface_INR", pd.Series([0])).sum())
+    total_ex   = int(priced_df["Total_Price_INR"].sum())
+    total_gst  = int(priced_df["GST_18pct"].sum())
+    total_inc  = int(priced_df["Price_With_GST"].sum())
+
+    sub_col = "Sub_Assembly" if "Sub_Assembly" in priced_df.columns else "Section"
+    sub_totals = (priced_df.groupby(sub_col)["Total_Price_INR"]
+                  .sum().sort_values(ascending=False).to_dict())
+
+    top5 = (priced_df.nlargest(5, "Total_Price_INR")
+            [["Component","Description","Total_Price_INR","Price_Confidence"]]
+            .to_dict("records"))
+
+    conf = priced_df["Price_Confidence"].value_counts().to_dict()
+
+    # Count manufactured vs bought-out
+    type_col = "Component_Type" if "Component_Type" in priced_df.columns else None
+    type_split = priced_df[type_col].value_counts().to_dict() if type_col else {}
+
+    return {
+        "total_raw_material": total_raw,
+        "total_machining":    total_mach,
+        "total_surface":      total_surf,
+        "total_ex_gst":       total_ex,
+        "total_gst":          total_gst,
+        "total_incl_gst":     total_inc,
+        "sub_totals":         {k: int(v) for k, v in sub_totals.items()},
+        "top5_drivers":       top5,
+        "confidence":         conf,
+        "component_count":    len(priced_df),
+        "type_split":         type_split,
+        "note": ("SHOULD-COST estimate: supplier's manufacturing cost, not selling price. "
+                 "Use for procurement negotiation. Verify with vendor quotation."),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GROUPING (for display — uses section from Claude output)
+# ═══════════════════════════════════════════════════════════════════
 
 SECTION_ORDER = [
     "A. PUMP HYDRAULICS",
@@ -101,1216 +1434,209 @@ SECTION_ORDER = [
     "L. COMPLETE ASSEMBLY",
 ]
 
-# ─────────────────────────────────────────────────────────────────
-# WEIGHT SCHEDULE DATA — from real dissection sheets
-# ─────────────────────────────────────────────────────────────────
-REAL_WEIGHTS = {
-    "FLW-001": {
-        "Pump (bare)":              1160,
-        "Rotor Assembly":            173,
-        "Top Casing Half":           272,
-        "Motor (CGL 550kW)":        5300,
-        "Baseplate (IS2062)":       3250,
-        "Coupling (Rathi)":           50,
-        "Accessories":                50,
-        "Acoustic Enclosure (ARK)": 2350,
-        "TOTAL PACKAGE":           12160,
-        "Heaviest Single Lift":      272,
-        "Heaviest Lift Item":    "Top Casing Half",
-    },
-    "METSO-001": {
-        "Pump (bare)":              1010,
-        "Motor (Innomotics 500kW)": 3400,
-        "V-Belt Guard":              107,
-        "Bed Frame with Motor":      792,
-        "TOTAL PACKAGE":            5390,
-        "Heaviest Single Lift":     1010,
-        "Heaviest Lift Item":   "Pump bare",
-    },
-    "WILO-001": {
-        "Pump Assembly":            2175,
-        "Motor (KECL 200kW)":       1350,
-        "TOTAL PACKAGE":            2175,
-        "Heaviest Single Lift":     2175,
-        "Heaviest Lift Item":   "Complete pump assembly",
-    },
-    "WILO-002": {
-        "Pump Assembly":            1823,
-        "Motor (190kW)":            1250,
-        "TOTAL PACKAGE":            1823,
-        "Heaviest Single Lift":     1823,
-        "Heaviest Lift Item":   "Complete pump assembly",
-    },
-    "JYOTI-001": {
-        "Pump (VTP complete)":      5280,
-        "Motor (315kW)":            2800,
-        "TOTAL PACKAGE":            8080,
-        "Heaviest Single Lift":     5280,
-        "Heaviest Lift Item":   "VTP pump assembly",
-    },
-    "JYOTI-002": {
-        "Pump (VTP complete)":      3350,
-        "Motor (160kW)":            1350,
-        "TOTAL PACKAGE":            4700,
-        "Heaviest Single Lift":     3350,
-        "Heaviest Lift Item":   "VTP pump assembly",
-    },
-    "KSB-001": {
-        "Pump + Column Assembly":    410,
-        "Motor (45kW)":              750,
-        "TOTAL PACKAGE":             410,
-        "Heaviest Single Lift":      410,
-        "Heaviest Lift Item":   "Pump assembly",
-    },
-    "KSB-003": {
-        "Pump barrel + column":     1390,
-        "Motor (ABB 30kW)":          171,
-        "Motor lantern + base":      170,
-        "TOTAL PACKAGE":            1561,
-        "Heaviest Single Lift":     1390,
-        "Heaviest Lift Item":   "Pump barrel + column pipe",
-    },
-    "KSB-004": {
-        "Pump (empty)":              193,
-        "Motor (ABB 15kW)":          126,
-        "TOTAL PACKAGE":             319,
-        "Heaviest Single Lift":      193,
-        "Heaviest Lift Item":   "Pump assembly (empty)",
-    },
-    # From Pump_Master_List (database record weights)
-    "KSB-002": {
-        "Pump assembly":             350,
-        "Motor (5.5kW)":              48,
-        "TOTAL PACKAGE":             398,
-        "Heaviest Single Lift":      350,
-        "Heaviest Lift Item":   "Pump assembly",
-    },
-    "KSB-005": {
-        "Pump (VS6 double-casing)":  420,
-        "Motor (VTA)":               150,
-        "TOTAL PACKAGE":             570,
-        "Heaviest Single Lift":      420,
-        "Heaviest Lift Item":   "VS6 pump assembly (estimated)",
-        "_note":                     "Weight VTA — estimate based on similar VS6",
-    },
-    "WILO-003": {
-        "Pump (MPS-3 VTP 1-stage)":  680,
-        "Motor (CGL VPC710 260kW)":  820,
-        "Base frame + motor stool":  240,
-        "TOTAL PACKAGE":            1740,
-        "Heaviest Single Lift":      820,
-        "Heaviest Lift Item":   "Motor (CGL VPC710)",
-        "_note":                     "Estimate — GA weight not in dissection sheet",
-    },
-}
-
-# Crane selection rules
-def crane_category(total_kg):
-    if total_kg <= 500:   return "Chain block / fork lift"
-    if total_kg <= 3000:  return "Mobile crane 5–10T required"
-    if total_kg <= 10000: return "Mobile crane 25T required"
-    if total_kg <= 30000: return "Mobile crane 50T required"
-    return "Heavy lift crane — route survey required"
-
-def foundation_loads(total_kg):
-    static  = total_kg
-    dynamic = round(total_kg * 0.15)
-    return {"static_kg": static, "dynamic_kg": dynamic,
-            "note": "Dynamic = ±15% of static (general rule)"}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 1 — DATABASE LOADER
-# ═══════════════════════════════════════════════════════════════════
-
-def load_db():
-    return {
-        "pumps":      pd.read_excel(DB_PATH, sheet_name="Pump_Master_List"),
-        "comps":      pd.read_excel(DB_PATH, sheet_name="Component_Library"),
-        "mats":       pd.read_excel(DB_PATH, sheet_name="Material_Database"),
-        "vendors":    pd.read_excel(DB_PATH, sheet_name="Vendor_Database"),
-        "bom_tpl":    pd.read_excel(DB_PATH, sheet_name="BOM_Templates",          header=4),
-        "physics":    pd.read_excel(DB_PATH, sheet_name="Physics_Parameters",     header=4),
-        "mat_compat": pd.read_excel(DB_PATH, sheet_name="Material_Compatibility", header=4),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 2 — LEARNING STORE
-# ═══════════════════════════════════════════════════════════════════
-
-_DEFAULT = {
-    "feedback": [], "patterns": [], "corrections": [],
-    "weight_calibs": {},
-    "stats": {"total_sessions":0,"tier1_hits":0,"tier2_hits":0,
-              "corrections":0,"patterns_added":0},
-}
-
-def get_store():
-    if os.path.exists(LRN_PATH):
-        try:
-            with open(LRN_PATH) as f:
-                data = json.load(f)
-            for k, v in _DEFAULT.items():
-                if k not in data: data[k] = v
-            return data
-        except Exception:
-            pass
-    return {k: (v.copy() if isinstance(v,dict) else list(v))
-            for k,v in _DEFAULT.items()}
-
-def _save(store):
-    try:
-        with open(LRN_PATH,"w") as f:
-            json.dump(store, f, indent=2, default=str)
-    except Exception:
-        pass
-
-def log_feedback(specs, bom_df, tier, confirmed_pump_type,
-                 confirmed_moc, confirmed_weights, notes=""):
-    store = get_store()
-    store["feedback"].append({
-        "ts": datetime.datetime.now().isoformat(),
-        "specs": {k:v for k,v in specs.items() if v is not None},
-        "tier": tier, "pump_type": confirmed_pump_type,
-        "moc": confirmed_moc, "weights": confirmed_weights,
-        "bom_rows": len(bom_df), "notes": notes,
-        "ns": _ns(specs),
-    })
-    store["stats"]["total_sessions"] += 1
-    if tier == "tier1": store["stats"]["tier1_hits"] += 1
-    else:               store["stats"]["tier2_hits"]  += 1
-    _update_calibs(store, confirmed_pump_type, confirmed_weights, specs)
-    _save(store)
-
-def log_pattern(field, bad, correct, snippet, notes=""):
-    store = get_store()
-    store["patterns"].append({
-        "ts": datetime.datetime.now().isoformat(),
-        "field": field, "bad": str(bad), "correct": str(correct),
-        "snippet": snippet[:200], "notes": notes,
-    })
-    store["stats"]["patterns_added"] += 1
-    _save(store)
-
-def log_correction(specs, wrong, correct, notes=""):
-    store = get_store()
-    store["corrections"].append({
-        "ts": datetime.datetime.now().isoformat(),
-        "ns": _ns(specs), "fluid": (specs.get("fluid") or ""),
-        "wrong_type": wrong, "correct_type": correct, "notes": notes,
-    })
-    store["stats"]["corrections"] += 1
-    _save(store)
-
-def get_learned_correction(Ns, fluid):
-    store = get_store()
-    fl = (fluid or "").lower()
-    for c in reversed(store.get("corrections",[])):
-        c_ns = c.get("ns"); c_fl = (c.get("fluid") or "").lower()
-        ns_ok = not c_ns or not Ns or abs(c_ns-Ns)/max(Ns,1) < 0.30
-        fl_ok = any(w in c_fl for w in fl.split()[:3]) or \
-                any(w in fl   for w in c_fl.split()[:3])
-        if ns_ok and fl_ok and c.get("correct_type"):
-            return c["correct_type"]
-    return None
-
-def _ns(specs):
-    Q=specs.get("flow_m3h"); H=specs.get("head_m"); n=specs.get("speed_rpm",1450)
-    if Q and H and Q>0 and H>0:
-        try: return round(calc_specific_speed(Q,H,n),1)
-        except: pass
-    return None
-
-def _update_calibs(store, pump_type, weights, specs):
-    if not weights: return
-    pt  = (pump_type or "").lower()[:20]
-    kw  = float(specs.get("motor_kw") or 30)
-    if pt not in store["weight_calibs"]:
-        store["weight_calibs"][pt] = {"pump_coeff":1.0,"motor_coeff":1.0,"n_samples":0}
-    cal = store["weight_calibs"][pt]; n = cal["n_samples"]+1
-    pp = _base_pump_wt(pt,kw); pm = _base_motor_wt(kw)
-    ap = float(weights.get("pump_kg",0) or 0)
-    am = float(weights.get("motor_kg",0) or 0)
-    if pp>0 and ap>0: cal["pump_coeff"]  = (cal["pump_coeff"]*(n-1)+(ap/pp))/n
-    if pm>0 and am>0: cal["motor_coeff"] = (cal["motor_coeff"]*(n-1)+(am/pm))/n
-    cal["n_samples"] = n
-    _save(store)
-
-def _base_pump_wt(pt,kw):
-    if "slurry"  in pt: return 1.8*kw**0.85
-    if "turbine" in pt: return 0.45*kw**0.9*6**0.3
-    if "sump"    in pt: return 0.9*kw**0.85
-    return 2.1*kw**0.72
-
-def _base_motor_wt(kw):
-    return 6.2*kw**0.80 if kw>200 else 8.5*kw**0.75
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 3 — PDF EXTRACTION
-# ═══════════════════════════════════════════════════════════════════
-
-def extract_pdf_text(file_bytes):
-    try:
-        import pdfplumber
-        pages = []
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for p in pdf.pages:
-                t = p.extract_text()
-                if t: pages.append(t)
-        return "\n".join(pages), None
-    except Exception as e:
-        return "", str(e)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 4 — SPEC PARSER
-# ═══════════════════════════════════════════════════════════════════
-
-_PATTERNS = {
-    "flow_m3h": [
-        r"(?:[Rr]ated\s+)?(?:[Vv]olumetric\s+)?[Ff]low\s*(?:[Rr]ate|[Cc]apacity)?\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
-        r"[Ff]low\s*[:\-=]?\s*(\d+\.?\d*)\s*m\xb3/h",
-        r"[Cc]apacity\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
-        r"[Dd]ischarge\s*[:\-=]?\s*(\d+\.?\d*)\s*m3/h",
-        r"\bQ\s*[=:\-]\s*(\d+\.?\d*)\s*m3",
-        r"(\d+\.?\d*)\s*m3/hr",
-        r"[Cc]apacity\s+of\s+each\s+pump\s+(?:m3/h[r]?)?\s*(\d+\.?\d*)",
-        r"(?:Flow|Discharge|Capacity)\s+(?:m3/h[r]?|m\xb3/h[r]?)\s+(\d+\.?\d*)",
-        r"\b(\d{3,5}\.?\d*)\s*LPM\b",
-        r"\b(\d{3,5}\.?\d*)\s*L/[Mm]in\b",
-        r"\b(\d+\.?\d*)\s*[Ll][Pp][Ss]\b",
-        r"\b(\d+\.?\d*)\s*[Ll]/[Ss]\b",
-    ],
-    "head_m": [
-        r"[Pp]ump\s+[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
-        r"[Tt]otal\s+(?:[Dd]ynamic\s+)?[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
-        r"[Rr]ated\s+[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m[\b\s]",
-        r"\bTDH\s*[:\-=]?\s*(\d+\.?\d*)\s*m",
-        r"\bH\s*[=:\-]\s*(\d+\.?\d*)\s*m\b",
-        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*[Mm][Ww][Cc]",
-        r"(\d+\.?\d*)\s*[Mm][Ww][Cc]",
-        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*[Mm][Ll][Cc]",
-        r"(\d+\.?\d*)\s*[Mm][Ll][Cc]",
-        r"[Pp]ump\s+[Dd]ifferential\s+[Hh]ead[^\d]+(\d+\.?\d*)",
-        r"[Dd]ifferential\s+[Hh]ead[^\d]+(\d+\.?\d*)",
-        r"(\d{1,3}\.?\d*)\s*[Mm]tr\b",
-        r"[Hh]ead\s*[:\-=]?\s*(\d+\.?\d*)\s*m\b",
-    ],
-    "speed_rpm": [
-        r"[Ff]ull\s+[Ll]oad\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
-        r"[Rr]ated\s+[Ss]peed.*?(\d{3,4})\s*[Rr][Pp][Mm]",
-        r"[Ss]peed\s+of\s+[Pp]ump[^\d]+(\d{3,4})",
-        r"[Ss]peed\s*[:\-=]?\s*(\d{3,4})\s*[Rr][Pp][Mm]",
-        r"(\d{3,4})\s*[Rr][Pp][Mm]",
-    ],
-    "motor_kw": [
-        r"[Mm]otor\s+[Rr]ating\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Mm]otor\s+[Pp]ower\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Nn]ominal\s+[Pp]ower\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Rr]ated\s+[Oo]utput.*?(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Ss]elected\s+[Dd]rive\s+[Rr]ating.*?(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Ss]elected\s+[Mm]otor.*?(\d+\.?\d*)\s*[Kk][Ww]",
-        r"[Mm]otor\s*[:\-=]?\s*(\d+\.?\d*)\s*[Kk][Ww]",
-        r"(\d+\.?\d*)\s*[Kk][Ww]\s*(?:motor|Motor|MOTOR|nameplate)",
-        r"(\d+\.?\d*)\s*[Hh][Pp]\b",
-    ],
-    "temp_c": [
-        r"[Oo]p(?:erating)?\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
-        r"[Pp]rocess\s+[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0]?[Cc]",
-        r"[Tt]emp(?:erature)?\s+[Oo]f\s+[Ff]luid[^\d]*(\d+\.?\d*)",
-        r"[Tt]emp(?:erature)?\s*[:\-=]?\s*(\d+\.?\d*)\s*[°\xb0][Cc]",
-        r"(\d{2,3})\s*[Dd]eg\.?\s*[Cc]\b",
-        r"(\d{2,3})\s*[°\xb0][Cc]\b",
-        r"[Ff]luid\s+[Tt]emp[^\d]+(\d+\.?\d*)",
-    ],
-    "density_kgm3": [
-        r"[Dd]ensity\s*[:\-=]?\s*(\d{3,4}\.?\d*)\s*kg",
-        r"[Ss]pecific\s+[Gg]ravity\s*[:\-=]?\s*(\d\.?\d+)",
-        r"\bSG\s*[=:\-]\s*(\d\.?\d+)\b",
-        r"\bS\.?G\.?\s*[=:\-]\s*(\d\.?\d+)\b",
-        r"[Ss]p\.?\s*[Gg]r\.?\s*[=:\-]\s*(\d\.?\d+)",
-    ],
-    "stages": [
-        r"[Nn]o\.?\s+[Oo]f\s+[Ss]tages?\s*[:\-=]?\s*(\d+)",
-        r"[Nn]umber\s+[Oo]f\s+[Ss]tages?\s*[:\-=]?\s*(\d+)",
-        r"(\d+)\s*[Ss]tage\s+[Pp]ump",
-        r"(\d+)[- ][Ss]tage\b",
-    ],
-}
-
-_FLUID_MAP = [
-    ("live steam condensate",  "Live Steam Condensate"),
-    ("steam condensate",       "Live Steam Condensate"),
-    ("process condensate",     "Process Condensate"),
-    ("condensate",             "Process Condensate"),
-    ("caustic liquor",         "Caustic Liquor (Alumina)"),
-    ("alumina liquor",         "Caustic Liquor (Alumina)"),
-    ("caustic soda",           "Caustic Soda"),
-    ("caustic",                "Caustic Liquor"),
-    ("sulphuric acid",         "Dilute Sulphuric Acid"),
-    ("acid",                   "Dilute Acid"),
-    ("slurry",                 "Slurry"),
-    ("seawater",               "Seawater"),
-    ("sea water",              "Seawater"),
-    ("crude oil",              "Crude Oil"),
-    ("boiler feed",            "Boiler Feed Water"),
-    ("cooling water",          "Cooling Water"),
-    ("clear water",            "Clear Water"),
-    ("clean water",            "Clear Water"),
-    ("raw water",              "Clear Water"),
-    ("water",                  "Clear Water"),
-]
-
-_DENS_DEF = {
-    "Slurry":1300,"Caustic Liquor (Alumina)":1244,
-    "Live Steam Condensate":930,"Process Condensate":990,
-    "Dilute Sulphuric Acid":1050,"Seawater":1025,
-    "Boiler Feed Water":950,"Crude Oil":870,"Cooling Water":998,
-}
-
-_SANITY = {
-    "flow_m3h":(0,100000),"head_m":(0.5,2000),"speed_rpm":(200,10000),
-    "motor_kw":(0.1,5000),"temp_c":(-10,600),"density_kgm3":(500,5000),
-    "stages":(1,30),
-}
-
-def detect_multi_pump(text):
-    """
-    Detect if a PDF contains multiple distinct pump specifications.
-    Returns list of {"label": str, "text": str} dicts — one per pump.
-    Returns empty list if only one pump found (normal flow continues).
-
-    Detection strategy:
-      - Numbered pump sections: "1. Hydrant Pump", "2. Spray Pump"
-      - Service headers: "SERVICE: Jockey Pump"
-      - Repeated flow/head blocks — N occurrences of flow value = N pumps
-    """
-    t = text.replace("\r", "")
-
-    # Strategy 1: numbered pump sections (most reliable)
-    # Matches "1. Hydrant Water Pump", "2) Spray Pump", etc.
-    numbered = re.findall(
-        r"(?:^|\n)\s*(\d+[\.)\s]+[A-Z][A-Za-z ]{4,45}Pump)",
-        t, re.MULTILINE
-    )
-    if len(numbered) >= 2:
-        # Use their positions as segment boundaries
-        candidates = []
-        for m in re.finditer(
-            r"(?:^|\n)\s*(\d+[\.)\s]+[A-Z][A-Za-z ]{4,45}Pump)",
-            t, re.MULTILINE
-        ):
-            label = m.group(1).strip()
-            candidates.append((m.start(), label))
-        if len(candidates) >= 2:
-            segments = []
-            for i, (pos, label) in enumerate(candidates):
-                end = candidates[i+1][0] if i+1 < len(candidates) else len(t)
-                segments.append({"label": label, "text": t[pos:end]})
-            return segments
-
-    # Strategy 2: SERVICE / TAG labels repeating
-    service_matches = re.findall(
-        r"(?:Service|SERVICE|Tag|TAG|Equipment|EQUIPMENT)\s*[:\-]\s*([A-Za-z][A-Za-z ]{4,50})",
-        t
-    )
-    if len(service_matches) >= 2:
-        candidates = []
-        for m in re.finditer(
-            r"(?:Service|SERVICE|Tag|TAG)\s*[:\-]\s*([A-Za-z][A-Za-z ]{4,50})",
-            t
-        ):
-            label = m.group(1).strip().rstrip("\n,.")
-            candidates.append((m.start(), label))
-        if len(candidates) >= 2:
-            # Deduplicate
-            filtered = []; last_pos = -999
-            for pos, label in sorted(candidates):
-                if pos - last_pos > 150:
-                    filtered.append((pos, label)); last_pos = pos
-            if len(filtered) >= 2:
-                segments = []
-                for i,(pos,label) in enumerate(filtered):
-                    end = filtered[i+1][0] if i+1<len(filtered) else len(t)
-                    segments.append({"label": label, "text": t[pos:end]})
-                return segments
-
-    # Strategy 3: Count repeated "Flow" / "Capacity" lines — if 3+, likely multi-pump
-    flow_lines = re.findall(
-        r"(?:Flow|Capacity|Discharge).*?\d+\.?\d*\s*m3",
-        t, re.IGNORECASE
-    )
-    if len(flow_lines) >= 3:
-        # Try to split on blank lines between sections
-        chunks = re.split(r"\n{2,}", t)
-        pump_chunks = [c for c in chunks if re.search(r"\d+\.?\d*\s*m3", c, re.IGNORECASE)]
-        if len(pump_chunks) >= 2:
-            segments = []
-            for i, chunk in enumerate(pump_chunks):
-                label = f"Pump {i+1}"
-                # Try to extract a name from first line
-                first_line = chunk.strip().split("\n")[0][:60]
-                if len(first_line) > 5:
-                    label = first_line.strip()
-                segments.append({"label": label, "text": chunk})
-            return segments
-
-    return []
-
-
-def parse_specs(text, learned_patterns=None):
-    specs = {}
-    t = text.replace("\n"," ").replace("  "," ")
-    tl = t.lower()
-    for field, patterns in _PATTERNS.items():
-        for p in patterns:
-            try:
-                m = re.search(p, t)
-                if not m: continue
-                val = float(m.group(1))
-                # Unit conversions
-                if field == "flow_m3h":
-                    if any(x in p for x in ["LPM", "L/[Mm]in"]):
-                        val = round(val / 1000 * 60, 2)   # LPM → m³/h
-                    elif any(x in p for x in ["[Ll][Pp][Ss]", "[Ll]/[Ss]", "l/s"]):
-                        val = round(val * 3.6, 2)           # LPS → m³/h
-                if field == "motor_kw" and "[Hh][Pp]" in p:
-                    val = round(val * 0.7457, 2)            # HP → kW
-                if field == "density_kgm3" and val < 5:
-                    val = round(val * 1000, 1)              # SG → kg/m³
-                lo, hi = _SANITY.get(field,(None,None))
-                if lo is not None and not (lo < val < hi): continue
-                specs[field] = val; break
-            except: continue
-    if learned_patterns:
-        for lp in learned_patterns:
-            fld=lp.get("field"); snip=lp.get("snippet","")
-            if fld and snip and fld not in specs:
-                try:
-                    m = re.search(re.escape(" ".join(snip.split()[:3]))+r".*?(\d+\.?\d*)",
-                                  t, re.IGNORECASE)
-                    if m: specs[fld] = float(m.group(1))
-                except: pass
-    for kw, name in _FLUID_MAP:
-        if kw in tl: specs["fluid"] = name; break
-    if "fluid" not in specs: specs["fluid"] = "Clear Water"
-    if "density_kgm3" not in specs:
-        specs["density_kgm3"] = _DENS_DEF.get(specs["fluid"], 1000)
-    for p in [
-        r"[Pp]ump\s+[Mm]odel\s*[:\-=]?\s*([A-Za-z0-9][A-Za-z0-9\-\/\. ]{3,25})",
-        r"[Mm]odel\s*[:\-\/=]?\s*([A-Z][A-Z0-9\-\/]{3,20})",
-    ]:
-        m = re.search(p, t)
-        if m:
-            val = m.group(1).strip().rstrip(".,;")
-            if len(val)>=4: specs["model"]=val; break
-    for mfr in ["Flowserve","KSB","Metso","Sulzer","Wilo","Jyoti",
-                "Kirloskar","Grundfos","Ebara","Xylem","Andritz","Weir"]:
-        if mfr.lower() in tl: specs["manufacturer"]=mfr; break
-    return specs
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 5 — TIER 1  (database match)
-# ═══════════════════════════════════════════════════════════════════
-
-def tier1_match(specs, db):
-    pumps = db["pumps"].copy().dropna(subset=["Flow_m3h","Head_m"])
-    Q     = specs.get("flow_m3h")
-    H     = specs.get("head_m")
-    model = (specs.get("model") or "").upper().strip()
-    mfr   = (specs.get("manufacturer") or "").lower().strip()
-    if not Q and not H and not model:
-        return None, 0, "no_specs"
-    best_row, best_score, best_type = None, 0, "none"
-    for _, row in pumps.iterrows():
-        score = 0
-        db_model = str(row["Model"]).upper()
-        db_mfr   = str(row["Manufacturer"]).lower()
-        if model:
-            m1 = re.sub(r"[\s\-\/]","",model)
-            m2 = re.sub(r"[\s\-\/]","",db_model)
-            if   m1==m2:              score+=55
-            elif m1 in m2:            score+=50
-            elif m2 in m1:            score+=45
-            elif model[:6] in db_model: score+=25
-        if mfr and db_mfr and mfr[:5] in db_mfr: score+=15
-        if Q and pd.notna(row["Flow_m3h"]):
-            pct = abs(Q-row["Flow_m3h"])/max(row["Flow_m3h"],1)
-            score += 30 if pct<0.05 else 20 if pct<0.15 else 10 if pct<0.25 else 0
-        if H and pd.notna(row["Head_m"]):
-            pct = abs(H-row["Head_m"])/max(row["Head_m"],1)
-            score += 25 if pct<0.05 else 15 if pct<0.15 else 8 if pct<0.20 else 0
-        if score > best_score:
-            best_score=score; best_row=row
-            best_type = "exact" if score>=65 else "close" if score>=35 else "weak"
-    return best_row, best_score, best_type
-
-def get_bom_from_match(pump_row, db):
-    model  = str(pump_row["Model"])
-    pump_id= str(pump_row["Pump_ID"])
-    matched = db["comps"][db["comps"]["Pump_Model_Compatibility"].str.contains(
-        re.escape(model), case=False, na=False, regex=True
-    )].copy()
-
-    # Fill component weights from REAL_WEIGHTS where NaN
-    if pump_id in REAL_WEIGHTS:
-        wts = REAL_WEIGHTS[pump_id]
-        # Map category → weight key
-        cat_wt_map = {
-            "Pump":      ["Pump (bare)", "Pump assembly", "Pump (VTP complete)",
-                          "Pump (empty)", "Pump barrel + column"],
-            "Motor":     ["Motor (CGL 550kW)", "Motor (Innomotics 500kW)",
-                          "Motor (ABB 15kW)", "Motor (ABB 30kW)", "Motor (KECL 200kW)",
-                          "Motor (190kW)", "Motor (315kW)", "Motor (160kW)",
-                          "Motor (5.5kW)", "Motor (VTA)", "Motor (CGL VPC710 260kW)"],
-            "Baseplate": ["Baseplate (IS2062)", "Bed Frame with Motor Support",
-                          "Bed Frame with Motor", "Base frame + motor stool"],
-            "Enclosure": ["Acoustic Enclosure (ARK)"],
-            "Coupling":  ["Coupling (Rathi)", "V-Belt Guard"],
-            "Rotor":     ["Rotor Assembly"],
-            "Casing":    ["Top Casing Half"],
-        }
-        # Fill by category
-        for idx2, row in matched.iterrows():
-            if pd.notna(matched.at[idx2, "Weight_kg"]):
-                continue
-            cat = str(row.get("Category",""))
-            keys = cat_wt_map.get(cat, [])
-            for key in keys:
-                if key in wts and isinstance(wts[key], (int,float)):
-                    matched.at[idx2, "Weight_kg"] = wts[key]
-                    break
-
-    return matched
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 6 — TIER 2  (physics)
-# ═══════════════════════════════════════════════════════════════════
-
-_IEC = [0.18,0.25,0.37,0.55,0.75,1.1,1.5,2.2,3,4,5.5,7.5,11,15,18.5,22,30,
-        37,45,55,75,90,110,132,160,200,250,315,400,500,630,800,1000]
-
-def round_iec(kw):
-    for s in _IEC:
-        if s>=kw: return s
-    return round(kw,1)
-
-def calc_specific_speed(Q, H, n=1450):
-    if not Q or not H or Q<=0 or H<=0: return None
-    return n * math.sqrt(Q*4.403) / ((H*3.281)**0.75)
-
-def classify_pump_type(Ns, Q, H, fluid, stages=1, learned=None):
-    fl = (fluid or "").lower()
-    if any(k in fl for k in ["slurry","abrasive"]):
-        return "TPL-HSS-01","Horizontal Slurry Pump"
-    if any(k in fl for k in ["sulphuric","sulfuric","hydrochloric","acid"]):
-        return "TPL-VSP-01","Vertical Sump Pump"
-    if "live steam condensate" in fl:
-        return "TPL-VTP-02","Vertical Turbine Pump VS6 (Condensate)"
-    if "condensate" in fl:
-        return "TPL-VTP-02","Vertical Turbine Pump VS6 (Condensate)"
-    if "boiler feed" in fl:
-        return "TPL-MSC-01","Multistage Centrifugal (BFW)"
-    if learned: return "TPL-LEARNED", learned
-    if Ns is None: return "TPL-HSC-01","Horizontal Split Casing (default)"
-    if stages and stages>1 and H and H>150:
-        return "TPL-MSC-01","Multistage Centrifugal"
-    if Q and Q<20 and H and H>50:
-        return "TPL-VRT-01","Vertical Submersible"
-    if Ns < 1500:
-        return ("TPL-HSC-02","Horizontal Split Casing — High Head") \
-               if (H and H>150) else ("TPL-HSC-01","Horizontal Split Casing")
-    elif Ns < 4000: return "TPL-VTP-01","Vertical Turbine Pump"
-    else:           return "TPL-VTP-01","Vertical Turbine Pump (Axial)"
-
-def calc_motor_kw(Q, H, rho=1000, eta=0.78, eta_m=0.93, sf=1.10):
-    if not Q or not H or Q<=0 or H<=0: return None
-    return round_iec((Q*H*rho*9.81)/(eta*3600*1000)/eta_m*sf)
-
-def select_material(fluid, temp_c, pressure_kpa, db):
-    mc = db["mat_compat"].copy()
-    mc = mc.dropna(subset=["Rule_ID"])
-    mc = mc[mc["Rule_ID"].astype(str).str.startswith("MAT-", na=False)]
-    fl   = str(fluid or "").lower()
-    temp = float(temp_c or 30)
-    pres = float(pressure_kpa or 500)
-    mc["Temp_Min_C"]       = pd.to_numeric(mc["Temp_Min_C"],       errors="coerce").fillna(0)
-    mc["Temp_Max_C"]       = pd.to_numeric(mc["Temp_Max_C"],       errors="coerce").fillna(500)
-    mc["Pressure_Max_kPa"] = pd.to_numeric(mc["Pressure_Max_kPa"],errors="coerce").fillna(99999)
-    defaults = mc[mc["Rule_ID"].str.startswith("MAT-DEFAULT",na=False)]
-    rules    = mc[~mc["Rule_ID"].str.startswith("MAT-DEFAULT",na=False)]
-    valid = rules[
-        (rules["Temp_Min_C"]<=temp) & (rules["Temp_Max_C"]>=temp) &
-        (rules["Pressure_Max_kPa"]>=pres)
-    ]
-    exact = valid[valid["Fluid_Type"].str.lower().str.contains(fl[:12],na=False,case=False)]
-    if not exact.empty:
-        row = exact.iloc[0]
-    else:
-        cat_map = {"water":"Clean Water","caustic":"Alkali/Caustic",
-                   "acid":"Dilute Acid","slurry":"Abrasive Slurry",
-                   "condensate":"Condensate","oil":"Hydrocarbon",
-                   "seawater":"Seawater","boiler":"High Temp"}
-        cat = "Clean Water"
-        for k,v in cat_map.items():
-            if k in fl: cat=v; break
-        cm = valid[valid["Fluid_Category"]==cat]
-        row = cm.iloc[0] if not cm.empty \
-              else (defaults.iloc[0] if not defaults.empty else rules.iloc[0])
-    cols = ["Casing_MOC","Impeller_MOC","Shaft_MOC","Shaft_Sleeve_MOC",
-            "Wear_Ring_MOC","Seal_Type","Seal_Plan","Fastener_MOC"]
-    out = {c:(str(row[c]) if c in row.index and pd.notna(row[c]) else "VTA") for c in cols}
-    out["Rule_ID"]     = str(row.get("Rule_ID",""))
-    out["Fluid_Match"] = str(row.get("Fluid_Type",""))
-    return out
-
-def estimate_weight(pump_type_str, motor_kw, store=None):
-    P  = float(motor_kw or 30)
-    pt = (pump_type_str or "").lower()
-    pc = mc = 1.0
-    if store:
-        for key, cal in store.get("weight_calibs",{}).items():
-            if key in pt:
-                pc = cal.get("pump_coeff",1.0)
-                mc = cal.get("motor_coeff",1.0)
-                break
-    w = {}
-    if "slurry" in pt:
-        w["Pump (bare)"]    = round(_base_pump_wt(pt,P)*pc)
-        w["Motor"]          = round(_base_motor_wt(P)*mc)
-        w["Baseplate"]      = round(0.30*w["Pump (bare)"])
-        w["Guard"]          = round(0.10*w["Pump (bare)"])
-    elif "sump" in pt or "acid" in pt:
-        w["Pump (bare)"]    = round(_base_pump_wt(pt,P)*pc)
-        w["Motor"]          = round(_base_motor_wt(P)*mc)
-        w["Baseplate"]      = 20
-    elif "turbine" in pt or "vs6" in pt:
-        w["Pump (bare)"]    = round(_base_pump_wt(pt,P)*pc)
-        w["Motor"]          = round(_base_motor_wt(P)*mc)
-        w["Baseplate"]      = 60
-    else:
-        w["Pump (bare)"]    = round(_base_pump_wt(pt,P)*pc)
-        w["Rotor Assembly"] = round(w["Pump (bare)"]*0.15)
-        w["Motor"]          = round(_base_motor_wt(P)*mc)
-        w["Baseplate"]      = round(max(80, 0.18*P**1.02))
-        w["Coupling"]       = max(10, round(0.015*P))
-    w["TOTAL PACKAGE"] = sum(w.values())
-    return w
-
-def get_bom_template(template_id, db):
-    sec_b = pd.read_excel(DB_PATH, sheet_name="BOM_Templates", header=16)
-    sec_b.columns = [str(c).strip() for c in sec_b.columns]
-    if "Template_ID" in sec_b.columns:
-        tpl = sec_b[sec_b["Template_ID"].astype(str).str.strip()==template_id.strip()]
-        if not tpl.empty: return tpl
-    return sec_b[sec_b["Template_ID"].astype(str).str.contains("HSC-01",na=False)]
-
-def tier2_generate(specs, db, store=None):
-    Q=specs.get("flow_m3h"); H=specs.get("head_m")
-    n=specs.get("speed_rpm") or 1450
-    fluid=specs.get("fluid") or "Clear Water"
-    temp=specs.get("temp_c") or 30
-    rho=specs.get("density_kgm3") or 1000
-    stages=specs.get("stages") or 1
-    motor_input=specs.get("motor_kw")
-    Ns  = calc_specific_speed(Q,H,n)
-    lrn = get_learned_correction(Ns,fluid) if Ns else None
-    tpl_id, pump_type = classify_pump_type(Ns,Q,H,fluid,stages,lrn)
-    eta = 0.75 if (Ns and Ns<1500) else 0.82
-    mkw = motor_input or calc_motor_kw(Q,H,rho,eta)
-    moc = select_material(fluid,temp,500,db)
-    wts = estimate_weight(pump_type, mkw, store)
-    tpl = get_bom_template(tpl_id, db)
-    moc_map = {
-        "Casing":"Casing_MOC","Impeller":"Impeller_MOC","Shaft":"Shaft_MOC",
-        "Sleeve":"Shaft_Sleeve_MOC","Wear Ring":"Wear_Ring_MOC",
-        "Seal":"Seal_Type","Fasteners":"Fastener_MOC",
-    }
-    wt_map = {
-        "Pump":"Pump (bare)","Motor":"Motor",
-        "Baseplate":"Baseplate","Coupling":"Coupling",
-    }
-    rows = []
-    for i,(_, tc) in enumerate(tpl.iterrows(), 1):
-        cat = str(tc.get("Component_Category",""))
-        sub = str(tc.get("Component_Subcategory",""))
-        req = str(tc.get("Req_Type","M"))
-        qty = str(tc.get("Qty_Logic","1"))
-        mat = moc.get(moc_map.get(cat,"Casing_MOC"),"Per Service")
-        if mat in ["nan","VTA","None",""]: mat="Engineer to Specify"
-        h_info = HIERARCHY.get(cat, ("Z. OTHER", 3, "Other"))
-        rows.append({
-            "No":           i,
-            "Component_ID": f"CALC-{tpl_id}-{i:03d}",
-            "Category":     cat,
-            "Sub_Assembly": h_info[2],
-            "Description":  sub if sub and sub!=cat else cat,
-            "MOC":          mat,
-            "MOC_Rule":     moc.get("Rule_ID",""),
-            "Qty":          qty,
-            "Req_Type":     req,
-            "Weight_kg":    wts.get(wt_map.get(cat,""),""),
-            "Source":       "Tier 2 — Physics",
-            "Notes":        str(tc.get("Notes_for_BOM_Generator",""))[:80],
-        })
-    summary = {
-        "specific_speed_Ns":  round(Ns,1) if Ns else "N/A",
-        "pump_type":          pump_type,
-        "template_used":      tpl_id,
-        "motor_kw_calc":      mkw,
-        "eta_pump_assumed":   round(eta*100,1),
-        "material_rule":      moc.get("Rule_ID",""),
-        "fluid_matched":      moc.get("Fluid_Match",""),
-        "seal_plan":          moc.get("Seal_Plan",""),
-        "weights":            wts,
-        "moc":                moc,
-        "learned_correction": lrn,
-    }
-    return pd.DataFrame(rows), summary
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 7 — HIERARCHICAL GROUPING
-# ═══════════════════════════════════════════════════════════════════
-
 def group_bom(bom_df):
-    """
-    Returns list of (section_name, sub_assembly, rows_df) tuples
-    ordered by SECTION_ORDER.
-    Adds hierarchy metadata: Section, Sub_Assembly, Level
-    """
-    if bom_df is None or bom_df.empty: return []
-    cat_col = "Category" if "Category" in bom_df.columns else bom_df.columns[2]
+    """Group BOM by section and sub-assembly. Returns [(section, sub, df)]."""
+    if bom_df is None or bom_df.empty:
+        return []
+
+    sec_col = "Section" if "Section" in bom_df.columns else None
+    sub_col = "Sub_Assembly" if "Sub_Assembly" in bom_df.columns else None
+
+    if not sec_col:
+        return [("ALL", "All Components", bom_df)]
+
+    sec_order = {s: i for i, s in enumerate(SECTION_ORDER)}
     df = bom_df.copy()
-    def _hier(cat):
-        return HIERARCHY.get(str(cat).strip(), ("Z. OTHER", 3, "Other"))
-    df["_section"]      = df[cat_col].apply(lambda c: _hier(c)[0])
-    df["_level"]        = df[cat_col].apply(lambda c: _hier(c)[1])
-    df["_sub_assembly"] = df[cat_col].apply(lambda c: _hier(c)[2])
-
-    # Order by section
-    sec_order = {s:i for i,s in enumerate(SECTION_ORDER)}
-    df["_sec_ord"] = df["_section"].apply(lambda s: sec_order.get(s, 99))
-    df = df.sort_values("_sec_ord").reset_index(drop=True)
-
-    # Re-number
+    df["_ord"] = df[sec_col].apply(lambda s: sec_order.get(str(s).strip(), 99))
+    df = df.sort_values("_ord").reset_index(drop=True)
     df["No"] = range(1, len(df)+1)
 
-    # Group
     result = []
     for sec in SECTION_ORDER:
-        sec_rows = df[df["_section"]==sec].copy()
-        if sec_rows.empty: continue
-        # Further group by sub_assembly within section
-        for sub in sec_rows["_sub_assembly"].unique():
-            sub_rows = sec_rows[sec_rows["_sub_assembly"]==sub].copy()
-            sub_rows = sub_rows.drop(columns=["_section","_level","_sub_assembly","_sec_ord"])
-            result.append((sec, sub, sub_rows))
+        sec_rows = df[df[sec_col].str.strip() == sec]
+        if sec_rows.empty:
+            continue
+        if sub_col:
+            for sub in sec_rows[sub_col].unique():
+                sub_rows = sec_rows[sec_rows[sub_col] == sub].copy()
+                sub_rows = sub_rows.drop(columns=["_ord"], errors="ignore")
+                result.append((sec, str(sub), sub_rows))
+        else:
+            sec_rows2 = sec_rows.drop(columns=["_ord"], errors="ignore")
+            result.append((sec, sec, sec_rows2))
 
-    # Ungrouped
-    other = df[df["_section"]=="Z. OTHER"].copy()
+    other = df[~df[sec_col].str.strip().isin(SECTION_ORDER)]
     if not other.empty:
-        other = other.drop(columns=["_section","_level","_sub_assembly","_sec_ord"])
+        other = other.drop(columns=["_ord"], errors="ignore")
         result.append(("Z. OTHER", "Other", other))
 
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 8 — WEIGHT SCHEDULE BUILDER
+# PDF EXTRACTION (still pdfplumber — free, local)
 # ═══════════════════════════════════════════════════════════════════
 
-def build_weight_schedule(pump_id, tier, calc_summary=None):
-    """
-    Returns (weight_dict, crane_cat, foundation_dict)
-    Uses real data for Tier 1, calculated for Tier 2.
-    """
-    if tier == "tier1" and pump_id in REAL_WEIGHTS:
-        wts = REAL_WEIGHTS[pump_id]
-    elif calc_summary and calc_summary.get("weights"):
-        wts = calc_summary["weights"]
-    else:
-        wts = {}
-
-    total = wts.get("TOTAL PACKAGE") or wts.get("total_kg") or sum(
-        v for k,v in wts.items()
-        if k not in ("TOTAL PACKAGE","total_kg","Heaviest Single Lift","Heaviest Lift Item")
-        and isinstance(v,(int,float))
-    )
-
-    crane = crane_category(total)
-    found = foundation_loads(total)
-
-    return wts, crane, found
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 9 — ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════
-
-def _safe(v):
-    if v is None: return None
-    if isinstance(v,str): return v.strip() or None
+def extract_pdf_text(file_bytes):
+    """Extract text from PDF using pdfplumber."""
     try:
-        f=float(v); return f if f==f else None
-    except: return v
-
-def generate_bom(specs, db, store=None):
-    specs = {k:_safe(v) for k,v in (specs or {}).items()}
-    pump_row, score, mtype = tier1_match(specs, db)
-    if pump_row is not None and score>=30:
-        bom = get_bom_from_match(pump_row, db)
-        if not bom.empty:
-            out = bom[["Component_ID","Category","Subcategory",
-                        "Component_Name","Material_Spec","Qty_Per_Unit",
-                        "Unit","Weight_kg","Vendor_Name","Notes"]].copy()
-            # Add hierarchy columns
-            def _hier(cat):
-                return HIERARCHY.get(str(cat).strip(),("Z. OTHER",3,"Other"))
-            out["Sub_Assembly"] = out["Category"].apply(lambda c: _hier(c)[2])
-            out["MOC_Rule"]     = ""   # real data — rule implicit in Material_Spec
-            out.insert(0,"No", range(1,len(out)+1))
-            out.insert(9,"Source","Tier 1 — Database")
-            return out, "tier1", {
-                "pump_id":    pump_row["Pump_ID"],
-                "model":      pump_row["Model"],
-                "score":      score,
-                "match_type": mtype,
-            }, None
-    bom_df, summary = tier2_generate(specs, db, store)
-    return bom_df, "tier2", None, summary
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for p in pdf.pages:
+                t = p.extract_text()
+                if t:
+                    pages.append(t)
+        return "\n".join(pages), None
+    except Exception as e:
+        return "", str(e)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 10 — EXCEL EXPORT  (4-tab professional output)
+# EXCEL EXPORT  *** BUG FIX: removed hfont() helper that conflicted
+#               *** with openpyxl internals. Now uses Font() directly.
 # ═══════════════════════════════════════════════════════════════════
 
-def export_bom_excel(bom_df, specs, tier, match_info, calc_summary,
-                     pump_id=None):
+def export_excel(bom_df, pump_specs, priced=False):
+    """Export BOM to professional Excel with cover + grouped BOM + optional pricing."""
     from openpyxl import Workbook
-    from openpyxl.styles import (Font, PatternFill, Alignment,
-                                  Border, Side, GradientFill)
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
-    wb = Workbook()
-    thin = Side(style="thin",  color="CCCCCC")
-    med  = Side(style="medium", color="1F4E79")
-    bdr  = Border(left=thin,right=thin,top=thin,bottom=thin)
+    wb  = Workbook()
+    thin = Side(style="thin", color="CCCCCC")
+    bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    def hfill(color): return PatternFill("solid",start_color=color)
-    def font(bold=False,size=9,color="000000"):
-        return Font(bold=bold,size=size,color=color)
-    def align(h="left",wrap=False):
-        return Alignment(horizontal=h,vertical="center",wrap_text=wrap)
-
-    # ── TAB 1: COVER PAGE ────────────────────────────────────────
-    ws0 = wb.active; ws0.title = "Cover"
+    # ── Cover ─────────────────────────────────────────────────────
+    ws0 = wb.active
+    ws0.title = "Cover"
     ws0.sheet_view.showGridLines = False
-    ws0.column_dimensions["A"].width = 35
+    ws0.column_dimensions["A"].width = 30
     ws0.column_dimensions["B"].width = 55
 
-    # Title block
     ws0.merge_cells("A1:B1")
-    c = ws0["A1"]; c.value = "BILL OF MATERIALS"
-    c.font = Font(bold=True,size=18,color="FFFFFF")
-    c.fill = hfill("1F4E79")
-    c.alignment = align("center"); ws0.row_dimensions[1].height=36
+    title_cell = ws0["A1"]
+    title_cell.value = "BILL OF MATERIALS"
+    title_cell.font = Font(name="Arial", bold=True, size=18, color="FFFFFF")
+    title_cell.fill = PatternFill("solid", fgColor="1F4E79")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws0.row_dimensions[1].height = 36
 
-    ws0.merge_cells("A2:B2")
-    c = ws0["A2"]
-    model_str = (specs or {}).get("model","") or \
-                (calc_summary or {}).get("pump_type","Generated BOM")
-    c.value = model_str
-    c.font = Font(bold=True,size=13,color="1F4E79")
-    c.alignment = align("center"); ws0.row_dimensions[2].height=28
-
-    ws0.merge_cells("A3:B3"); ws0.row_dimensions[3].height=10
-
-    # Project info
-    info = [
-        ("BOM Method",
-         f"Tier 1 — Database Match ({(match_info or {}).get('model','')})"
-         if tier=="tier1"
-         else f"Tier 2 — Physics Calculated ({(calc_summary or {}).get('pump_type','')})"),
-        ("Flow",        f"{(specs or {}).get('flow_m3h','—')} m³/h"),
-        ("Head",        f"{(specs or {}).get('head_m','—')} m"),
-        ("Fluid",       (specs or {}).get('fluid','—')),
-        ("Temperature", f"{(specs or {}).get('temp_c','—')} °C"),
-        ("Motor",       f"{(specs or {}).get('motor_kw') or (calc_summary or {}).get('motor_kw_calc','—')} kW"),
-        ("Generated",   pd.Timestamp.now().strftime("%d-%b-%Y %H:%M")),
-    ]
-    if tier=="tier1" and match_info:
-        info += [
-            ("Match Score", f"{match_info.get('score',0)}/100 ({match_info.get('match_type','')})"),
-            ("Pump ID",     match_info.get("pump_id","")),
+    specs = pump_specs if isinstance(pump_specs, dict) else {}
+    info_items = []
+    if isinstance(specs.get("pumps"), list) and specs["pumps"]:
+        p = specs["pumps"][0]
+        info_items = [
+            ("Pump Model",       p.get("model", "—")),
+            ("Manufacturer",     p.get("manufacturer", "—")),
+            ("Type",             p.get("type", "—")),
+            ("Tag Numbers",      p.get("tag_numbers", "—")),
+            ("Flow (m³/h)",      p.get("flow_m3h", "—")),
+            ("Head (m)",         p.get("head_m", "—")),
+            ("Motor (kW)",       p.get("motor_kw", "—")),
+            ("Shaft Power (kW)", p.get("shaft_power_kw", "—")),
+            ("Speed (RPM)",      p.get("speed_rpm", "—")),
+            ("Fluid",            p.get("fluid", "—")),
+            ("Temperature (°C)", p.get("temp_c", "—")),
+            ("Density (kg/m³)",  p.get("density_kgm3", "—")),
+            ("Standard",         p.get("standard", "—")),
+            ("Quantity",         p.get("quantity", "—")),
+            ("Project",          specs.get("project", "—")),
         ]
-    if tier=="tier2" and calc_summary:
-        info += [
-            ("Specific Speed (Ns)", calc_summary.get("specific_speed_Ns","—")),
-            ("Seal Plan",           calc_summary.get("seal_plan","—")),
-            ("Material Rule",       calc_summary.get("material_rule","—")),
+    else:
+        info_items = [
+            ("Pump",    specs.get("pump_label", "—")),
+            ("Flow",    specs.get("flow_m3h", "—")),
+            ("Head",    specs.get("head_m", "—")),
+            ("Motor",   specs.get("motor_kw", "—")),
+            ("Fluid",   specs.get("fluid", "—")),
         ]
 
-    r = 4
-    for lbl, val in info:
-        c1 = ws0.cell(r,1,lbl);     c1.font=font(True); c1.fill=hfill("EEF2F7"); c1.border=bdr; c1.alignment=align()
-        c2 = ws0.cell(r,2,str(val)); c2.font=font();    c2.fill=hfill("F7F9FC"); c2.border=bdr; c2.alignment=align()
-        ws0.row_dimensions[r].height=18; r+=1
+    r = 3
+    for lbl, val in info_items:
+        lbl_cell = ws0.cell(r, 1, lbl)
+        lbl_cell.font = Font(name="Arial", bold=True, size=10)
+        lbl_cell.fill = PatternFill("solid", fgColor="EEF2F7")
+        lbl_cell.border = bdr
 
-    # ── TAB 2: HIERARCHICAL BOM ──────────────────────────────────
-    ws1 = wb.create_sheet("BOM — Grouped")
+        val_cell = ws0.cell(r, 2, str(val) if val else "—")
+        val_cell.font = Font(name="Arial", size=10)
+        val_cell.border = bdr
+        r += 1
+
+    gen_cell_lbl = ws0.cell(r + 1, 1, "Generated")
+    gen_cell_lbl.font = Font(name="Arial", bold=True, size=10)
+    gen_cell_val = ws0.cell(r + 1, 2, pd.Timestamp.now().strftime("%d-%b-%Y %H:%M"))
+    gen_cell_val.font = Font(name="Arial", size=10)
+
+    # ── BOM Sheet ─────────────────────────────────────────────────
+    ws1 = wb.create_sheet("BOM")
     ws1.sheet_view.showGridLines = False
-    col_w = [5,22,18,30,38,28,6,6,10,22,14,40]
-    for i,w in enumerate(col_w):
-        ws1.column_dimensions[get_column_letter(i+1)].width=w
 
-    # Header
-    ws1.merge_cells(f"A1:{get_column_letter(len(col_w))}1")
-    c=ws1["A1"]; c.value="BILL OF MATERIALS — SUB-ASSEMBLY GROUPED VIEW"
-    c.font=Font(bold=True,size=12,color="FFFFFF"); c.fill=hfill("1F4E79")
-    c.alignment=align("center"); ws1.row_dimensions[1].height=24
+    if priced and "Total_Price_INR" in bom_df.columns:
+        cols = ["No", "Section", "Sub_Assembly", "Component", "Description", "MOC",
+                "Qty", "Weight_kg", "Req_Type", "Unit_Price_INR", "Total_Price_INR",
+                "GST_18pct", "Price_With_GST", "Price_Confidence", "Notes"]
+    else:
+        cols = ["No", "Section", "Sub_Assembly", "Component", "Description", "MOC",
+                "Qty", "Weight_kg", "Req_Type", "Notes"]
+    cols = [c for c in cols if c in bom_df.columns]
 
-    HEADERS = ["No","Component ID","Sub-Assembly","Category","Description / Name",
-               "Material (MOC)","MOC Rule","Qty","Unit","Weight (kg)","Vendor","Notes"]
-    r=2
-    for j,h in enumerate(HEADERS):
-        c=ws1.cell(r,j+1,h); c.font=font(True,9,"FFFFFF"); c.fill=hfill("2E75B6")
-        c.alignment=align("center",True); c.border=bdr
-    ws1.row_dimensions[r].height=26; r+=1
-
-    ws1.freeze_panes="A3"
-
-    SECTION_COLORS = {
-        "A. PUMP HYDRAULICS":        "1A3A5C",
-        "B. ROTATING ASSEMBLY":      "1A3A5C",
-        "C. BEARINGS & LUBRICATION": "2E5984",
-        "D. SHAFT SEALING":          "2E5984",
-        "E. DRIVE & COUPLING":       "366092",
-        "F. MOTOR / DRIVER":         "17375E",
-        "G. STRUCTURAL":             "4F6228",
-        "H. PIPING & NOZZLES":       "4F6228",
-        "I. FASTENERS & GASKETS":    "595959",
-        "J. INSTRUMENTATION":        "595959",
-        "K. ACOUSTIC & SAFETY":      "7F7F7F",
-        "L. COMPLETE ASSEMBLY":      "1F4E79",
-        "Z. OTHER":                  "444444",
+    widths = {
+        "No": 5, "Section": 22, "Sub_Assembly": 20, "Component": 30,
+        "Description": 40, "MOC": 25, "Qty": 8, "Weight_kg": 10,
+        "Req_Type": 6, "Unit_Price_INR": 14, "Total_Price_INR": 14,
+        "GST_18pct": 12, "Price_With_GST": 14, "Price_Confidence": 10, "Notes": 35,
     }
 
-    groups = group_bom(bom_df)
-    current_section = None
-    alt1 = hfill("EEF4FB"); alt2 = hfill("FFFFFF")
-    row_count = 0
+    # Title row
+    ws1.merge_cells(f"A1:{get_column_letter(len(cols))}1")
+    bom_title = ws1["A1"]
+    bom_title.value = "BILL OF MATERIALS"
+    bom_title.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    bom_title.fill = PatternFill("solid", fgColor="1F4E79")
+    bom_title.alignment = Alignment(horizontal="center")
+    ws1.row_dimensions[1].height = 24
 
-    for sec, sub, gdf in groups:
-        # Section header (new section only)
-        if sec != current_section:
-            current_section = sec
-            ws1.merge_cells(f"A{r}:{get_column_letter(len(col_w))}{r}")
-            sc = ws1.cell(r,1,f"   {sec}")
-            sc.font=Font(bold=True,size=9,color="FFFFFF")
-            sc.fill=hfill(SECTION_COLORS.get(sec,"444444"))
-            sc.alignment=align()
-            ws1.row_dimensions[r].height=16; r+=1
+    # Header row
+    r = 2
+    for j, col in enumerate(cols):
+        hdr = ws1.cell(r, j + 1, col.replace("_", " "))
+        hdr.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
+        hdr.fill = PatternFill("solid", fgColor="2E75B6")
+        hdr.alignment = Alignment(horizontal="center", wrap_text=True)
+        hdr.border = bdr
+        ws1.column_dimensions[get_column_letter(j + 1)].width = widths.get(col, 14)
+    ws1.row_dimensions[r].height = 26
+    r += 1
 
-        # Sub-assembly header (if more than one in section)
-        ws1.merge_cells(f"A{r}:{get_column_letter(len(col_w))}{r}")
-        sc2 = ws1.cell(r,1,f"      ▶  {sub}")
-        sc2.font=Font(bold=True,size=8,color="1F4E79")
-        sc2.fill=hfill("DCE6F1"); sc2.alignment=align()
-        ws1.row_dimensions[r].height=14; r+=1
+    # Data rows
+    alt_fill_1 = PatternFill("solid", fgColor="EEF4FB")
+    alt_fill_2 = PatternFill("solid", fgColor="FFFFFF")
 
-        is_t1 = "Component_Name" in gdf.columns
-        for i,(_, row_s) in enumerate(gdf.iterrows()):
-            rf = alt1 if row_count%2==0 else alt2
-            row_count+=1
-            def v(cols):
-                for c in (cols if isinstance(cols,list) else [cols]):
-                    if c in row_s.index and pd.notna(row_s[c]) and str(row_s[c]).strip():
-                        return row_s[c]
-                return ""
-            vals=[
-                v("No"),
-                v("Component_ID"),
-                v("Sub_Assembly") if "Sub_Assembly" in row_s.index else sub,
-                v("Category"),
-                v(["Component_Name","Description"]),
-                v(["Material_Spec","MOC"]),
-                v("MOC_Rule"),
-                v(["Qty_Per_Unit","Qty"]),
-                v("Unit"),
-                v("Weight_kg"),
-                v("Vendor_Name"),
-                v("Notes"),
-            ]
-            for j,val in enumerate(vals):
-                c=ws1.cell(r,j+1,val if pd.notna(val) else "")
-                c.font=font(size=8); c.fill=rf; c.border=bdr
-                c.alignment=align(wrap=True)
-            ws1.row_dimensions[r].height=16; r+=1
+    for i, (_, row) in enumerate(bom_df.iterrows()):
+        row_fill = alt_fill_1 if i % 2 == 0 else alt_fill_2
+        for j, col in enumerate(cols):
+            val = row.get(col, "")
+            if pd.isna(val):
+                val = ""
+            if col in ("Unit_Price_INR", "Total_Price_INR", "GST_18pct", "Price_With_GST"):
+                try:
+                    if val and val != "":
+                        val = f"₹{int(float(val)):,}"
+                except (ValueError, TypeError):
+                    pass
+            cell = ws1.cell(r, j + 1, val)
+            cell.font = Font(name="Arial", size=8)
+            cell.fill = row_fill
+            cell.border = bdr
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws1.row_dimensions[r].height = 16
+        r += 1
 
-    # ── TAB 3: WEIGHT SCHEDULE ───────────────────────────────────
-    ws2 = wb.create_sheet("Weight Schedule")
-    ws2.sheet_view.showGridLines = False
-    ws2.column_dimensions["A"].width=40
-    ws2.column_dimensions["B"].width=18
-    ws2.column_dimensions["C"].width=35
-
-    ws2.merge_cells("A1:C1")
-    c=ws2["A1"]; c.value="WEIGHT SCHEDULE & LIFTING REQUIREMENTS"
-    c.font=Font(bold=True,size=12,color="FFFFFF"); c.fill=hfill("1F4E79")
-    c.alignment=align("center"); ws2.row_dimensions[1].height=24
-
-    pid = pump_id or (match_info or {}).get("pump_id","")
-    wts, crane, found = build_weight_schedule(pid, tier, calc_summary)
-
-    r=2
-    def ws_hdr(text, color="2E75B6"):
-        ws2.merge_cells(f"A{r}:C{r}")
-        c=ws2.cell(r,1,text); c.font=font(True,9,"FFFFFF")
-        c.fill=hfill(color); c.alignment=align()
-        ws2.row_dimensions[r].height=16
-
-    def ws_row(label, val, note="", shade=False):
-        bg = "F2F7FC" if shade else "FFFFFF"
-        c1=ws2.cell(r,1,label); c1.font=font(True,9); c1.fill=hfill(bg); c1.border=bdr; c1.alignment=align()
-        c2=ws2.cell(r,2,str(val)+" kg" if isinstance(val,(int,float)) else str(val))
-        c2.font=font(size=9); c2.fill=hfill(bg); c2.border=bdr; c2.alignment=align("center")
-        c3=ws2.cell(r,3,note); c3.font=font(size=8,color="595959"); c3.fill=hfill(bg); c3.border=bdr; c3.alignment=align(wrap=True)
-        ws2.row_dimensions[r].height=16
-
-    # Component weights
-    ws_hdr("A. COMPONENT WEIGHT BREAKDOWN"); r+=1
-    shade=False
-    for k,v in wts.items():
-        if k in ("Heaviest Single Lift","Heaviest Lift Item"): continue
-        is_total = "TOTAL" in str(k).upper()
-        note = "From GA drawing (actual)" if tier=="tier1" else "Empirical estimate ±20%"
-        if is_total: note = "Sum of above"
-        ws_row(k, v, note, shade)
-        if is_total:
-            ws2.cell(r-1,1).font=Font(bold=True,size=9)
-            ws2.cell(r-1,2).font=Font(bold=True,size=9)
-            ws2.cell(r-1,1).fill=hfill("D6E4F0")
-            ws2.cell(r-1,2).fill=hfill("D6E4F0")
-            ws2.cell(r-1,3).fill=hfill("D6E4F0")
-        shade=not shade; r+=1
-    r+=1
-
-    # Heaviest single lift
-    ws_hdr("B. HEAVIEST SINGLE LIFT", "4F6228"); r+=1
-    hlift = wts.get("Heaviest Single Lift","—")
-    hitem = wts.get("Heaviest Lift Item","See component breakdown")
-    ws_row("Heaviest Item", hitem, ""); r+=1
-    ws_row("Heaviest Single Lift Weight", hlift,
-           "Crane must be rated for this + rigging factor 1.25"); r+=2
-
-    # Crane requirement
-    ws_hdr("C. CRANE SELECTION", "17375E"); r+=1
-    total_kg = wts.get("TOTAL PACKAGE") or wts.get("total_kg",0)
-    ws_row("Total Package Weight", total_kg, "Dry weight"); r+=1
-    ws_row("Crane Requirement", crane, "Based on total package weight"); r+=1
-    ws_row("Rigging Safety Factor", "1.25×",
-           "Per IS 3938 / good engineering practice"); r+=2
-
-    # Foundation loads
-    ws_hdr("D. FOUNDATION LOADS", "366092"); r+=1
-    ws_row("Static Load (total package)",   found["static_kg"],  "Dead weight on foundation"); r+=1
-    ws_row("Dynamic Load (estimated)",      found["dynamic_kg"], found["note"]); r+=1
-    ws_row("Recommended Foundation Type",
-           "RCC block with non-shrink grout",
-           "Fosroc Conbextra GP2 or equivalent"); r+=2
-
-    # Notes
-    ws_hdr("E. NOTES", "595959"); r+=1
-    notes = [
-        "All weights are dry weights unless stated.",
-        "Operating weight = Dry weight + fluid fill weight.",
-        f"Basis: {'Actual GA drawing data' if tier=='tier1' else 'Empirical correlations ±20%'}",
-        "Civil structural engineer to design foundation for static + dynamic loads.",
-        "Transport route survey required for packages > 10,000 kg.",
-    ]
-    for n in notes:
-        ws2.merge_cells(f"A{r}:C{r}")
-        c=ws2.cell(r,1,f"• {n}"); c.font=font(size=8,color="444444")
-        ws2.row_dimensions[r].height=14; r+=1
-
-    # ── TAB 4: MATERIAL TRACEABILITY ─────────────────────────────
-    ws3 = wb.create_sheet("Material Traceability")
-    ws3.sheet_view.showGridLines = False
-    for i,w in enumerate([22,20,25,18,18,18,30]):
-        ws3.column_dimensions[get_column_letter(i+1)].width=w
-
-    ws3.merge_cells("A1:G1")
-    c=ws3["A1"]; c.value="MATERIAL TRACEABILITY — MOC LINKED TO FLUID-TEMPERATURE RULES"
-    c.font=Font(bold=True,size=12,color="FFFFFF"); c.fill=hfill("1F4E79")
-    c.alignment=align("center"); ws3.row_dimensions[1].height=24
-
-    hdrs=["Component","Category","Material (MOC)","Fluid Service",
-          "Temp Range","Seal Plan","Traceability Rule"]
-    r=2
-    for j,h in enumerate(hdrs):
-        c=ws3.cell(r,j+1,h); c.font=font(True,9,"FFFFFF")
-        c.fill=hfill("2E75B6"); c.alignment=align("center"); c.border=bdr
-    ws3.row_dimensions[r].height=22; r+=1
-
-    # Build traceability rows
-    moc_info = (calc_summary or {}).get("moc",{})
-    fluid_match = (calc_summary or {}).get("fluid_matched","—")
-    mat_rule    = (calc_summary or {}).get("material_rule","—")
-    seal_plan   = (calc_summary or {}).get("seal_plan","—")
-    temp_c      = (specs or {}).get("temp_c","—")
-
-    shade=False
-    alt1=hfill("EEF4FB"); alt2=hfill("FFFFFF")
-    for _,row_s in bom_df.iterrows():
-        cat = str(row_s.get("Category",""))
-        is_t1 = "Component_Name" in row_s.index
-        name  = str(row_s.get("Component_Name","") or row_s.get("Description",""))
-        mat   = str(row_s.get("Material_Spec","") or row_s.get("MOC",""))
-        rule  = str(row_s.get("MOC_Rule","") or mat_rule)
-        rf    = alt1 if shade else alt2; shade=not shade
-
-        # Determine seal plan per component
-        sp = seal_plan if cat in ("Seal","Mechanical Seal","Gland") else "—"
-
-        row_vals=[name[:45], cat, mat[:35], fluid_match[:25],
-                  f"{temp_c}°C" if temp_c!="—" else "—",
-                  sp, rule]
-        for j,val in enumerate(row_vals):
-            c=ws3.cell(r,j+1,str(val) if val else ""); c.font=font(size=8)
-            c.fill=rf; c.border=bdr; c.alignment=align(wrap=True)
-        ws3.row_dimensions[r].height=14; r+=1
-
-    # MOC summary box
-    if moc_info:
-        r+=1
-        ws3.merge_cells(f"A{r}:G{r}")
-        c=ws3.cell(r,1,"MATERIAL SELECTION SUMMARY — FROM COMPATIBILITY MATRIX")
-        c.font=font(True,9,"FFFFFF"); c.fill=hfill("2E5984")
-        ws3.row_dimensions[r].height=16; r+=1
-        moc_rows=[
-            ("Fluid Service",    fluid_match),
-            ("Casing MOC",       moc_info.get("Casing_MOC","—")),
-            ("Impeller MOC",     moc_info.get("Impeller_MOC","—")),
-            ("Shaft MOC",        moc_info.get("Shaft_MOC","—")),
-            ("Shaft Sleeve MOC", moc_info.get("Shaft_Sleeve_MOC","—")),
-            ("Wear Ring MOC",    moc_info.get("Wear_Ring_MOC","—")),
-            ("Seal Plan",        moc_info.get("Seal_Plan","—")),
-            ("Fastener MOC",     moc_info.get("Fastener_MOC","—")),
-            ("Compatibility Rule", mat_rule),
-        ]
-        shade2=False
-        for lbl,val in moc_rows:
-            rf2=hfill("EEF4FB") if shade2 else hfill("FFFFFF"); shade2=not shade2
-            c1=ws3.cell(r,1,lbl); c1.font=font(True,8); c1.fill=rf2; c1.border=bdr
-            ws3.merge_cells(f"B{r}:G{r}")
-            c2=ws3.cell(r,2,str(val)); c2.font=font(size=8); c2.fill=rf2; c2.border=bdr
-            ws3.row_dimensions[r].height=14; r+=1
+    ws1.freeze_panes = "A3"
 
     buf = BytesIO()
-    wb.save(buf); buf.seek(0)
+    wb.save(buf)
+    buf.seek(0)
     return buf
