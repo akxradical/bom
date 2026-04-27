@@ -39,36 +39,42 @@ def _get_api_key(key_name):
     return st.secrets.get(key_name, "")
 
 
-def _call_openai_compatible(url, key, model, prompt, system="", max_tokens=4000):
-    """Generic caller for OpenAI-compatible APIs (Groq, Cerebras, etc.)."""
-    import urllib.request
-    body = {
-        "model": model,
-        "messages": [],
-        "max_tokens": max_tokens,
-        "temperature": 0.1,
-    }
-    if system:
-        body["messages"].append({"role": "system", "content": system})
-    body["messages"].append({"role": "user", "content": prompt})
 
-    data_bytes = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data_bytes,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["message"]["content"].strip()
+def _http_post(url, headers, body_dict, timeout=120, retries=3):
+    """POST with retry on 503/429. Returns parsed JSON dict."""
+    import urllib.request, urllib.error
+    data_bytes = json.dumps(body_dict).encode("utf-8")
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data_bytes, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            status = e.code
+            body = ""
+            try:
+                body = e.read().decode("utf-8")[:200]
+            except Exception:
+                pass
+            if status in (429, 503) and attempt < retries - 1:
+                wait = 10 * (attempt + 1)  # 10s, 20s
+                time.sleep(wait)
+                last_err = e
+                continue
+            # 403 = bad key, 400 = bad request — no point retrying
+            raise Exception(f"HTTP {status}: {body or e.reason}")
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            raise
+    raise last_err
 
 
 def _call_gemini(prompt, system="", max_tokens=8000):
-    """Google Gemini 2.5 Flash. Free tier, 1M context window."""
-    import urllib.request
+    """Google Gemini 2.5 Flash. Free, 1M context window. Best for datasheets."""
     key = _get_api_key("GEMINI_API_KEY")
     if not key:
         raise ValueError("GEMINI_API_KEY not set")
@@ -81,34 +87,65 @@ def _call_gemini(prompt, system="", max_tokens=8000):
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
-    data_bytes = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data_bytes,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = _http_post(url, {"Content-Type": "application/json"}, body)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 def _call_groq(prompt, system="", max_tokens=4000):
-    """Groq — Llama 3.3 70B. Free, very fast."""
+    """Groq — Llama 3.3 70B. Free, very fast. Model verified April 2026."""
     key = _get_api_key("GROQ_API_KEY")
     if not key:
         raise ValueError("GROQ_API_KEY not set")
-    return _call_openai_compatible(
+
+    body = {
+        "model": "llama-3.3-70b-versatile",  # current production model
+        "messages": [],
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+    }
+    if system:
+        body["messages"].append({"role": "system", "content": system})
+    body["messages"].append({"role": "user", "content": prompt})
+
+    data = _http_post(
         "https://api.groq.com/openai/v1/chat/completions",
-        key, "llama-3.3-70b-versatile", prompt, system, max_tokens)
+        {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        body,
+    )
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def _call_cerebras(prompt, system="", max_tokens=4000):
-    """Cerebras — Llama 3.3 70B. Free, 14400 req/day."""
+    """Cerebras — llama3.1-8b. Free. Note: Cerebras dropped llama-3.3-70b,
+    current free models are llama3.1-8b and openai-gpt-oss."""
     key = _get_api_key("CEREBRAS_API_KEY")
     if not key:
         raise ValueError("CEREBRAS_API_KEY not set")
-    return _call_openai_compatible(
-        "https://api.cerebras.ai/v1/chat/completions",
-        key, "llama-3.3-70b", prompt, system, max_tokens)
+
+    # Try llama3.1-8b first (confirmed available), fallback to openai-gpt-oss-20b
+    for model in ["llama3.1-8b", "openai-gpt-oss-20b"]:
+        body = {
+            "model": model,
+            "messages": [],
+            "max_tokens": min(max_tokens, 4000),
+            "temperature": 0.1,
+        }
+        if system:
+            body["messages"].append({"role": "system", "content": system})
+        body["messages"].append({"role": "user", "content": prompt})
+
+        try:
+            data = _http_post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                body,
+            )
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if "404" in str(e) or "model" in str(e).lower():
+                continue  # try next model
+            raise
+    raise Exception("No working Cerebras model found. Check https://inference-docs.cerebras.ai/models/overview")
 
 
 def _call_claude(prompt, system="", max_tokens=4000):
