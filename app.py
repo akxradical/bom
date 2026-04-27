@@ -170,6 +170,7 @@ if st.session_state.page == "upload":
                 (90,  "Compiling extracted data..."),
                 (100, "Document analysis complete ✓"),
             ]
+            api_error = None
             for pct, msg in steps:
                 prog.progress(pct)
                 stat.markdown(
@@ -181,15 +182,47 @@ if st.session_state.page == "upload":
                         specs_data = claude_extract_specs(text)
                         st.session_state.extracted_specs = specs_data
                     except Exception as e:
-                        st.error(f"Analysis error: {e}")
-                        import traceback; st.code(traceback.format_exc())
+                        api_error = e
+                        import traceback
+                        st.error(f"❌ Analysis error: {e}")
+                        st.code(traceback.format_exc())
                         st.stop()
                 elif pct < 100:
                     time.sleep(0.15)
 
-            if st.session_state.extracted_specs:
+            # ── Navigate to specs page ────────────────────────────
+            specs = st.session_state.extracted_specs
+
+            # Case 1: good parse with pumps → go to specs page
+            if specs and isinstance(specs, dict) and specs.get("pumps"):
                 st.session_state.page = "specs"
                 st.rerun()
+
+            # Case 2: parsed but no pumps array — show debug and let user proceed
+            elif specs and isinstance(specs, dict):
+                st.warning("⚠️ Document parsed but no pump specs found. Check raw output below.")
+                st.json(specs)
+                if st.button("→ Try Review Specs anyway"):
+                    st.session_state.page = "specs"
+                    st.rerun()
+
+            # Case 3: _parse_json returned None — LLM gave bad JSON
+            else:
+                st.error(
+                    "❌ LLM returned a response but it couldn't be parsed as JSON.\n\n"
+                    "This usually means:\n"
+                    "• The LLM added extra text around the JSON\n"
+                    "• The response was cut off (token limit)\n"
+                    "• The LLM API returned an error silently"
+                )
+                # Show raw response if available for debugging
+                raw_debug = getattr(st.session_state, "_last_raw_response", None)
+                if raw_debug:
+                    with st.expander("🔍 Raw LLM response (for debugging)"):
+                        st.code(raw_debug[:3000])
+                if st.button("🔄 Retry"):
+                    st.session_state.extracted_specs = None
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════
