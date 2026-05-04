@@ -752,6 +752,14 @@ elif st.session_state.page == "pricing":
             unsafe_allow_html=True)
 
         if st.button("▶  Run Cost Estimation", type="primary", use_container_width=False):
+            # Pricing REQUIRES Claude (web search). Check key first.
+            if not st.secrets.get("ANTHROPIC_API_KEY", ""):
+                st.error(
+                    "❌ Should-cost pricing requires Claude API with web search.\n\n"
+                    "Add `ANTHROPIC_API_KEY = \"sk-ant-...\"` to your Streamlit secrets.\n"
+                    "Get a key at https://console.anthropic.com — the cost is ~₹2-3 per BOM."
+                )
+                st.stop()
             prog = st.progress(0)
             stat = st.empty()
 
