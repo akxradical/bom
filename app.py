@@ -158,66 +158,85 @@ if st.session_state.page == "upload":
             st.session_state.raw_text = text
             st.success(f"✅ {len(text.split())} words extracted from {uploaded.name}")
 
-            # ── Claude reads the document ─────────────────────────
+            # ── Step 1: Call API FIRST, then show progress ────────
             prog = st.progress(0)
             stat = st.empty()
 
-            steps = [
-                (10,  "Reading document structure..."),
-                (30,  "Identifying pump specifications..."),
-                (55,  "Extracting performance parameters..."),
-                (75,  "Analysing material of construction..."),
-                (90,  "Compiling extracted data..."),
-                (100, "Document analysis complete ✓"),
-            ]
-            api_error = None
-            for pct, msg in steps:
+            def _update(pct, msg):
                 prog.progress(pct)
                 stat.markdown(
                     f'<p style="color:#8b949e;font-family:IBM Plex Mono;'
                     f'font-size:12px;">◉ {msg}</p>',
                     unsafe_allow_html=True)
-                if pct == 30:
-                    try:
-                        specs_data = claude_extract_specs(text)
-                        st.session_state.extracted_specs = specs_data
-                    except Exception as e:
-                        api_error = e
-                        import traceback
-                        st.error(f"❌ Analysis error: {e}")
-                        st.code(traceback.format_exc())
-                        st.stop()
-                elif pct < 100:
-                    time.sleep(0.15)
 
-            if st.session_state.extracted_specs:
-                specs = st.session_state.extracted_specs
+            _update(10, "Reading document structure...")
+            time.sleep(0.2)
+            _update(30, "Identifying specifications...")
 
-                # ── Warn if not a pump document ───────────────────
-                if not specs.get("is_pump_document", True):
-                    warning = specs.get("document_warning", "")
-                    doc_type = specs.get("document_type", "unknown")
-                    st.warning(
-                        f"⚠️ **This does not look like a pump datasheet.**\n\n"
-                        f"Document detected as: **{doc_type}**\n\n"
-                        f"{warning}\n\n"
-                        f"Please upload a pump datasheet that contains flow rate and head data. "
-                        f"If you uploaded a motor spec, valve spec, or other document by mistake, "
-                        f"go back and upload the correct pump datasheet PDF."
-                    )
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("← Upload correct file", use_container_width=True):
-                            st.session_state.extracted_specs = None
-                            st.session_state.page = "upload"
-                            st.rerun()
-                    with col2:
-                        if st.button("Continue anyway →", use_container_width=True):
-                            st.session_state.page = "specs"
-                            st.rerun()
-                else:
-                    st.session_state.page = "specs"
+            try:
+                specs_data = claude_extract_specs(text)
+                st.session_state.extracted_specs = specs_data
+            except Exception as e:
+                import traceback
+                st.error(f"❌ Analysis error: {e}")
+                st.code(traceback.format_exc())
+                st.stop()
+
+            # Animate remaining steps after API returns
+            for pct, msg in [(55, "Extracting performance parameters..."),
+                             (75, "Analysing material of construction..."),
+                             (90, "Compiling extracted data..."),
+                             (100, "Document analysis complete ✓")]:
+                _update(pct, msg)
+                time.sleep(0.15)
+
+            specs = st.session_state.extracted_specs
+
+            # ── CASE 1: Parse failed completely ───────────────────
+            if not specs or not isinstance(specs, dict):
+                st.error("❌ Could not parse the LLM response as JSON.")
+                raw_debug = st.session_state.get("_last_raw_response", "")
+                if raw_debug:
+                    with st.expander("🔍 Raw LLM response"):
+                        st.code(raw_debug[:3000])
+                if st.button("🔄 Retry"):
+                    st.session_state.extracted_specs = None
                     st.rerun()
+
+            # ── CASE 2: Wrong document type (motor, valve, etc.) ──
+            elif not specs.get("is_pump_document", True):
+                warning  = specs.get("document_warning", "")
+                doc_type = specs.get("document_type", "unknown")
+                st.warning(
+                    f"⚠️ **This does not look like a pump datasheet.**\n\n"
+                    f"Detected as: **{doc_type}**. {warning}\n\n"
+                    f"Please upload a pump datasheet with flow rate and head data."
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("← Upload correct file", use_container_width=True):
+                        st.session_state.extracted_specs = None
+                        st.rerun()
+                with c2:
+                    if st.button("Continue anyway →", use_container_width=True):
+                        st.session_state.page = "specs"
+                        st.rerun()
+
+            # ── CASE 3: Parsed but pumps list is empty ────────────
+            elif not specs.get("pumps"):
+                st.warning("⚠️ Document parsed but no pump specs found.")
+                with st.expander("🔍 What was extracted"):
+                    st.json(specs)
+                if st.button("← Try another file"):
+                    st.session_state.extracted_specs = None
+                    st.rerun()
+
+            # ── CASE 4: SUCCESS — navigate to specs page ──────────
+            else:
+                provider = specs.get("_llm_provider", "LLM")
+                st.success(f"✅ Specs extracted via {provider}. Loading review page...")
+                st.session_state.page = "specs"
+                st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════
