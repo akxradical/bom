@@ -567,6 +567,55 @@ Other rules:
   drive type, motor electrical data, NPSHA/NPSHR, vibration/noise limits."""
 
 
+def _call_claude_direct(prompt, system="", max_tokens=4000):
+    """
+    Claude-primary caller with token budget cap (max 4000 output).
+    Falls back to free LLMs only if Claude key missing or credits exhausted.
+    """
+    key = _get_api_key("ANTHROPIC_API_KEY")
+    if not key:
+        raw, provider = _call_llm(prompt, system=system, max_tokens=max_tokens)
+        return raw, provider
+    try:
+        import anthropic
+    except ImportError:
+        raw, provider = _call_llm(prompt, system=system, max_tokens=max_tokens)
+        return raw, provider
+
+    client = anthropic.Anthropic(api_key=key)
+    kwargs = {
+        "model":     "claude-sonnet-4-20250514",
+        "max_tokens": min(max_tokens, 4000),
+        "messages":  [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+
+    for attempt in range(3):
+        try:
+            resp = client.messages.create(**kwargs)
+            text = "\n".join(b.text for b in resp.content if hasattr(b, "text"))
+            return text.strip(), "Claude"
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                wait = 20 * (attempt + 1)
+                try:
+                    import streamlit as st
+                    st.toast(f"⏳ Claude rate limit — waiting {wait}s...")
+                except Exception:
+                    pass
+                time.sleep(wait)
+                continue
+            elif "credit" in err.lower() or ("400" in err and "credit" in err.lower()):
+                break
+            raise
+
+    # Claude failed — fallback to free LLMs
+    raw, provider = _call_llm(prompt, system=system, max_tokens=max_tokens)
+    return raw, f"{provider} (fallback)"
+
+
 def claude_extract_specs(pdf_text):
     """Extract specs from PDF text. Works for pump datasheets, GA drawings, specs."""
     prompt = f"""Read this technical document and extract all specifications.
@@ -690,7 +739,7 @@ If this is NOT a pump document, still fill "pumps" array with whatever equipment
 is available, but set is_pump_document: false and document_warning with a clear message.
 Be accurate. Use null for missing fields — never guess."""
 
-    raw, provider = _call_llm(prompt, system=SPEC_SYSTEM, max_tokens=6000)
+    raw, provider = _call_claude_direct(prompt, system=SPEC_SYSTEM, max_tokens=4000)
 
     try:
         import streamlit as st
@@ -703,23 +752,20 @@ Be accurate. Use null for missing fields — never guess."""
     if not data or not isinstance(data, dict):
         return None
 
-    # Ensure pumps key exists as a list
     if "pumps" not in data or not isinstance(data.get("pumps"), list):
-        if any(k in data for k in ["flow_m3h", "head_m", "motor_kw", "fluid", "type"]):
+        if any(k in data for k in ["flow_m3h", "head_m", "motor_kw", "fluid"]):
             data = {"pumps": [data], "document_type": "pump_datasheet",
                     "is_pump_document": True, "multi_pump": False,
                     "manufacturer": data.get("manufacturer")}
         else:
             data["pumps"] = []
 
-    # Default is_pump_document if not set
     if "is_pump_document" not in data:
         pumps = data.get("pumps", [])
-        has_pump_data = any(
+        data["is_pump_document"] = any(
             p.get("flow_m3h") or p.get("head_m")
             for p in pumps if isinstance(p, dict)
         )
-        data["is_pump_document"] = has_pump_data
 
     data["_llm_provider"] = provider
     return data
@@ -795,7 +841,7 @@ IMPORTANT:
 Respond with ONLY the JSON array — no preamble, no explanation.
 Keep descriptions under 80 characters to avoid truncation."""
 
-    raw, provider = _call_llm(prompt, system=BOM_SYSTEM, max_tokens=8000)
+    raw, provider = _call_claude_direct(prompt, system=BOM_SYSTEM, max_tokens=4000)
     data = _parse_json(raw)
 
     # Normalize: always return a list of dicts
