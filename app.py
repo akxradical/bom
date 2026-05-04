@@ -190,38 +190,33 @@ if st.session_state.page == "upload":
                 elif pct < 100:
                     time.sleep(0.15)
 
-            # ── Navigate to specs page ────────────────────────────
-            specs = st.session_state.extracted_specs
+            if st.session_state.extracted_specs:
+                specs = st.session_state.extracted_specs
 
-            # Case 1: good parse with pumps → go to specs page
-            if specs and isinstance(specs, dict) and specs.get("pumps"):
-                st.session_state.page = "specs"
-                st.rerun()
-
-            # Case 2: parsed but no pumps array — show debug and let user proceed
-            elif specs and isinstance(specs, dict):
-                st.warning("⚠️ Document parsed but no pump specs found. Check raw output below.")
-                st.json(specs)
-                if st.button("→ Try Review Specs anyway"):
+                # ── Warn if not a pump document ───────────────────
+                if not specs.get("is_pump_document", True):
+                    warning = specs.get("document_warning", "")
+                    doc_type = specs.get("document_type", "unknown")
+                    st.warning(
+                        f"⚠️ **This does not look like a pump datasheet.**\n\n"
+                        f"Document detected as: **{doc_type}**\n\n"
+                        f"{warning}\n\n"
+                        f"Please upload a pump datasheet that contains flow rate and head data. "
+                        f"If you uploaded a motor spec, valve spec, or other document by mistake, "
+                        f"go back and upload the correct pump datasheet PDF."
+                    )
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("← Upload correct file", use_container_width=True):
+                            st.session_state.extracted_specs = None
+                            st.session_state.page = "upload"
+                            st.rerun()
+                    with col2:
+                        if st.button("Continue anyway →", use_container_width=True):
+                            st.session_state.page = "specs"
+                            st.rerun()
+                else:
                     st.session_state.page = "specs"
-                    st.rerun()
-
-            # Case 3: _parse_json returned None — LLM gave bad JSON
-            else:
-                st.error(
-                    "❌ LLM returned a response but it couldn't be parsed as JSON.\n\n"
-                    "This usually means:\n"
-                    "• The LLM added extra text around the JSON\n"
-                    "• The response was cut off (token limit)\n"
-                    "• The LLM API returned an error silently"
-                )
-                # Show raw response if available for debugging
-                raw_debug = getattr(st.session_state, "_last_raw_response", None)
-                if raw_debug:
-                    with st.expander("🔍 Raw LLM response (for debugging)"):
-                        st.code(raw_debug[:3000])
-                if st.button("🔄 Retry"):
-                    st.session_state.extracted_specs = None
                     st.rerun()
 
 
