@@ -1,13 +1,20 @@
 """
-BOM Engine — Free Multi-LLM Edition
-════════════════════════════════════
-Zero dependency on Claude. Uses FREE LLM APIs for everything:
-  - Gemini 2.5 Flash (primary) — best for datasheet reading (huge context)
-  - Groq Llama 3.3 70B — fastest, good for JSON generation
-  - Cerebras Llama 3.3 70B — highest quota (14,400 req/day)
-  - Claude — OPTIONAL paid fallback (only if you have key + all free fail)
+BOM Engine — 10-Provider Free LLM Router
+═════════════════════════════════════════
+Tries providers in priority order. If one fails → next one instantly.
+With 10 providers, the system almost never fails completely.
 
-Cost per BOM: ₹0 (free tier) vs ₹11 with Claude.
+Provider priority (best quality + reliability first):
+  1. Gemini 2.5 Flash     — 1M context, best for datasheets
+  2. Groq (Llama 3.3 70B) — fastest, most reliable free API
+  3. Mistral Large 3       — European, high quality, 500K TPM
+  4. OpenRouter (free)     — 35+ free models, auto-routes
+  5. Cerebras              — ultra-fast, updated model names
+  6. GitHub Models         — GPT-4o free, needs GitHub token
+  7. NVIDIA NIM            — 100+ models, developer free
+  8. Cohere Command A      — reliable, 1000 calls/month
+  9. LLM7.io              — no registration needed
+ 10. Claude (paid)         — optional last resort
 
 Author: Ayush Kamle
 """
@@ -16,32 +23,19 @@ import json, re, time, os
 import pandas as pd
 from io import BytesIO
 
+
 # ─────────────────────────────────────────────────────────────────
-# MULTI-PROVIDER LLM CLIENT (FREE-FIRST)
-# ─────────────────────────────────────────────────────────────────
-# For SPEC EXTRACTION (needs big context window):
-#   1. Gemini 2.5 Flash — 1M token context, perfect for datasheets
-#   2. Groq / Cerebras — 128k context, good enough for most docs
-#   3. Claude — only if ANTHROPIC_API_KEY is set and all above fail
-#
-# For BOM GENERATION (needs good JSON output):
-#   1. Gemini 2.5 Flash — great structured output
-#   2. Groq Llama 3.3 70B — fast JSON generation
-#   3. Cerebras Llama 3.3 70B — reliable fallback
-#   4. Claude — paid fallback
-#
-# For PRICING: should-cost model runs locally (no LLM needed for 90%+)
+# CORE HELPERS
 # ─────────────────────────────────────────────────────────────────
 
 def _get_api_key(key_name):
-    """Get API key from Streamlit secrets, return empty string if not set."""
+    """Get API key from Streamlit secrets."""
     import streamlit as st
     return st.secrets.get(key_name, "")
 
 
-
-def _http_post(url, headers, body_dict, timeout=120, retries=3):
-    """POST with retry on 503/429. Returns parsed JSON dict."""
+def _http_post(url, headers, body_dict, timeout=90, retries=2):
+    """POST with auto-retry on 503/429. Returns parsed JSON."""
     import urllib.request, urllib.error
     data_bytes = json.dumps(body_dict).encode("utf-8")
     last_err = None
@@ -52,187 +46,348 @@ def _http_post(url, headers, body_dict, timeout=120, retries=3):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             status = e.code
-            body = ""
             try:
-                body = e.read().decode("utf-8")[:200]
+                body = e.read().decode("utf-8")[:300]
             except Exception:
-                pass
-            if status in (429, 503) and attempt < retries - 1:
-                wait = 10 * (attempt + 1)  # 10s, 20s
-                time.sleep(wait)
-                last_err = e
+                body = str(e.reason)
+            if status in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(8 * (attempt + 1))
+                last_err = Exception(f"HTTP {status}: {body}")
                 continue
-            # 403 = bad key, 400 = bad request — no point retrying
-            raise Exception(f"HTTP {status}: {body or e.reason}")
+            raise Exception(f"HTTP {status}: {body}")
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(5)
+                time.sleep(4)
                 continue
             raise
     raise last_err
 
 
+def _openai_compat(url, key, model, prompt, system="", max_tokens=4000):
+    """Call any OpenAI-compatible API endpoint."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = {"model": model, "messages": messages,
+            "max_tokens": max_tokens, "temperature": 0.1}
+    data = _http_post(url,
+                      {"Content-Type": "application/json",
+                       "Authorization": f"Bearer {key}"},
+                      body)
+    return data["choices"][0]["message"]["content"].strip()
+
+
+# ─────────────────────────────────────────────────────────────────
+# PROVIDER FUNCTIONS  (each raises on failure, returns string on success)
+# ─────────────────────────────────────────────────────────────────
+
 def _call_gemini(prompt, system="", max_tokens=8000):
-    """Google Gemini 2.5 Flash. Free, 1M context window. Best for datasheets."""
+    """Gemini 2.5 Flash — 1M context, 250 RPD free. Best for datasheets."""
     key = _get_api_key("GEMINI_API_KEY")
     if not key:
         raise ValueError("GEMINI_API_KEY not set")
-
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"gemini-2.5-flash:generateContent?key={key}")
     data = _http_post(url, {"Content-Type": "application/json"}, body)
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 def _call_groq(prompt, system="", max_tokens=4000):
-    """Groq — Llama 3.3 70B. Free, very fast. Model verified April 2026."""
+    """Groq — Llama 3.3 70B, 14,400 RPD free. Very fast."""
     key = _get_api_key("GROQ_API_KEY")
     if not key:
         raise ValueError("GROQ_API_KEY not set")
+    # Try best model first, fall back if quota hit
+    for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+        try:
+            return _openai_compat(
+                "https://api.groq.com/openai/v1/chat/completions",
+                key, model, prompt, system, max_tokens)
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower():
+                continue   # try smaller model
+            raise
+    raise Exception("Groq: all models rate-limited")
 
-    body = {
-        "model": "llama-3.3-70b-versatile",  # current production model
-        "messages": [],
-        "max_tokens": max_tokens,
-        "temperature": 0.1,
-    }
-    if system:
-        body["messages"].append({"role": "system", "content": system})
-    body["messages"].append({"role": "user", "content": prompt})
 
-    data = _http_post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-        body,
-    )
-    return data["choices"][0]["message"]["content"].strip()
+def _call_mistral(prompt, system="", max_tokens=4000):
+    """Mistral Large 3 — 500K TPM, ~1 RPS free. European provider."""
+    key = _get_api_key("MISTRAL_API_KEY")
+    if not key:
+        raise ValueError("MISTRAL_API_KEY not set")
+    # Try large first, fall back to small
+    for model in ["mistral-large-latest", "mistral-small-latest"]:
+        try:
+            return _openai_compat(
+                "https://api.mistral.ai/v1/chat/completions",
+                key, model, prompt, system, min(max_tokens, 4000))
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower():
+                time.sleep(2)
+                continue
+            raise
+    raise Exception("Mistral: rate limited")
+
+
+def _call_openrouter(prompt, system="", max_tokens=4000):
+    """OpenRouter — 35+ free models, 200 RPD. Auto-routes to best available."""
+    key = _get_api_key("OPENROUTER_API_KEY")
+    if not key:
+        raise ValueError("OPENROUTER_API_KEY not set")
+    # Best free models for engineering/JSON tasks
+    for model in [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "qwen/qwen3.6-plus:free",
+        "google/gemma-4-31b-it:free",
+    ]:
+        try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            body = {"model": model, "messages": messages,
+                    "max_tokens": max_tokens, "temperature": 0.1}
+            data = _http_post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                {"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}",
+                 "HTTP-Referer": "https://pumpbom.streamlit.app",
+                 "X-Title": "BOM Generator"},
+                body)
+            result = data["choices"][0]["message"]["content"].strip()
+            if result and len(result) > 10:
+                return result
+        except Exception as e:
+            if "429" in str(e) or "503" in str(e) or "overloaded" in str(e).lower():
+                time.sleep(2)
+                continue
+            raise
+    raise Exception("OpenRouter: all free models failed")
 
 
 def _call_cerebras(prompt, system="", max_tokens=4000):
-    """Cerebras — llama3.1-8b. Free. Note: Cerebras dropped llama-3.3-70b,
-    current free models are llama3.1-8b and openai-gpt-oss."""
+    """Cerebras — ultra-fast, 14,400 RPD free. Updated model names."""
     key = _get_api_key("CEREBRAS_API_KEY")
     if not key:
         raise ValueError("CEREBRAS_API_KEY not set")
-
-    # Try llama3.1-8b first (confirmed available), fallback to openai-gpt-oss-20b
-    for model in ["llama3.1-8b", "openai-gpt-oss-20b"]:
-        body = {
-            "model": model,
-            "messages": [],
-            "max_tokens": min(max_tokens, 4000),
-            "temperature": 0.1,
-        }
-        if system:
-            body["messages"].append({"role": "system", "content": system})
-        body["messages"].append({"role": "user", "content": prompt})
-
+    # Current models per inference-docs.cerebras.ai/models/overview
+    for model in ["gpt-oss-120b", "llama3.1-8b"]:
         try:
-            data = _http_post(
+            return _openai_compat(
                 "https://api.cerebras.ai/v1/chat/completions",
-                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-                body,
-            )
-            return data["choices"][0]["message"]["content"].strip()
+                key, model, prompt, system, min(max_tokens, 8000))
         except Exception as e:
             if "404" in str(e) or "model" in str(e).lower():
-                continue  # try next model
+                continue
+            if "429" in str(e):
+                time.sleep(3)
+                continue
             raise
-    raise Exception("No working Cerebras model found. Check https://inference-docs.cerebras.ai/models/overview")
+    raise Exception("Cerebras: no working model")
+
+
+def _call_github_models(prompt, system="", max_tokens=4000):
+    """GitHub Models — GPT-4o free, 50 RPD. Needs GitHub PAT token."""
+    key = _get_api_key("GITHUB_TOKEN")
+    if not key:
+        raise ValueError("GITHUB_TOKEN not set")
+    for model in ["gpt-4o", "Meta-Llama-3.3-70B", "gpt-4.1-mini"]:
+        try:
+            return _openai_compat(
+                "https://models.inference.ai.azure.com/chat/completions",
+                key, model, prompt, system, min(max_tokens, 4000))
+        except Exception as e:
+            if "429" in str(e) or "503" in str(e):
+                continue
+            raise
+    raise Exception("GitHub Models: all models failed")
+
+
+def _call_nvidia_nim(prompt, system="", max_tokens=4000):
+    """NVIDIA NIM — 100+ models, no daily token cap, developer free."""
+    key = _get_api_key("NVIDIA_API_KEY")
+    if not key:
+        raise ValueError("NVIDIA_API_KEY not set")
+    for model in ["meta/llama-3.3-70b-instruct",
+                  "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+                  "qwen/qwen2.5-72b-instruct"]:
+        try:
+            return _openai_compat(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                key, model, prompt, system, min(max_tokens, 4000))
+        except Exception as e:
+            if "429" in str(e) or "503" in str(e):
+                time.sleep(2)
+                continue
+            raise
+    raise Exception("NVIDIA NIM: rate limited")
+
+
+def _call_cohere(prompt, system="", max_tokens=4000):
+    """Cohere Command A — 1,000 calls/month free. Good JSON output."""
+    key = _get_api_key("COHERE_API_KEY")
+    if not key:
+        raise ValueError("COHERE_API_KEY not set")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = {"model": "command-a-03-2025",
+            "messages": messages,
+            "max_tokens": min(max_tokens, 4000),
+            "temperature": 0.1}
+    data = _http_post(
+        "https://api.cohere.com/v2/chat",
+        {"Content-Type": "application/json",
+         "Authorization": f"Bearer {key}"},
+        body)
+    return data["message"]["content"][0]["text"].strip()
+
+
+def _call_llm7(prompt, system="", max_tokens=4000):
+    """LLM7.io — no registration, 30 RPM free. Last free resort."""
+    # No key needed for basic access
+    for model in ["deepseek-v3-0324", "gemini-2.5-flash-lite",
+                  "mistral-small-3.1-24b"]:
+        try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            body = {"model": model, "messages": messages,
+                    "max_tokens": min(max_tokens, 4000), "temperature": 0.1}
+            # Optional token for higher limits
+            key = _get_api_key("LLM7_TOKEN")
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            data = _http_post("https://api.llm7.io/v1/chat/completions",
+                               headers, body)
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            if "429" in str(e) or "503" in str(e):
+                time.sleep(3)
+                continue
+            raise
+    raise Exception("LLM7: all models failed")
 
 
 def _call_claude(prompt, system="", max_tokens=4000):
-    """Claude — OPTIONAL paid fallback. Only used if key exists + all free fail."""
+    """Claude — OPTIONAL paid fallback. Only used if key set + all free fail."""
     key = _get_api_key("ANTHROPIC_API_KEY")
     if not key:
-        raise ValueError("ANTHROPIC_API_KEY not set — skipping Claude")
-
+        raise ValueError("ANTHROPIC_API_KEY not set")
     try:
         import anthropic
     except ImportError:
-        raise ValueError("anthropic package not installed. Run: pip install anthropic")
-
+        raise ValueError("pip install anthropic needed for Claude fallback")
     client = anthropic.Anthropic(api_key=key)
-    kwargs = {
-        "model":      "claude-sonnet-4-5",
-        "max_tokens":  max_tokens,
-        "messages":   [{"role": "user", "content": prompt}],
-    }
+    kwargs = {"model": "claude-sonnet-4-5", "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": prompt}]}
     if system:
         kwargs["system"] = system
-
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             resp = client.messages.create(**kwargs)
-            parts = []
-            for block in resp.content:
-                if hasattr(block, "text"):
-                    parts.append(block.text)
-            return "\n".join(parts).strip()
+            return "\n".join(b.text for b in resp.content if hasattr(b, "text"))
         except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
+            if "429" in str(e):
                 time.sleep(30 * (2 ** attempt))
             else:
                 raise
     raise Exception("Claude rate limit exceeded.")
 
 
-def _call_llm(prompt, system="", max_tokens=4000):
-    """Universal LLM caller. Tries ALL providers, free-first.
-    Returns (response_text, provider_name).
-    
-    Priority: Gemini → Groq → Cerebras → Claude (paid, optional)
-    """
-    providers = [
-        ("Gemini",   _call_gemini),
-        ("Groq",     _call_groq),
-        ("Cerebras", _call_cerebras),
-        ("Claude",   _call_claude),
-    ]
+# ─────────────────────────────────────────────────────────────────
+# PROVIDER REGISTRY
+# Each entry: (name, secret_key_needed, function)
+# Ordered by: quality → reliability → quota
+# ─────────────────────────────────────────────────────────────────
+_PROVIDERS = [
+    ("Gemini",        "GEMINI_API_KEY",      _call_gemini),
+    ("Groq",          "GROQ_API_KEY",        _call_groq),
+    ("Mistral",       "MISTRAL_API_KEY",     _call_mistral),
+    ("OpenRouter",    "OPENROUTER_API_KEY",  _call_openrouter),
+    ("Cerebras",      "CEREBRAS_API_KEY",    _call_cerebras),
+    ("GitHub",        "GITHUB_TOKEN",        _call_github_models),
+    ("NVIDIA NIM",    "NVIDIA_API_KEY",      _call_nvidia_nim),
+    ("Cohere",        "COHERE_API_KEY",      _call_cohere),
+    ("LLM7",          None,                  _call_llm7),   # no key needed
+    ("Claude",        "ANTHROPIC_API_KEY",   _call_claude),
+]
 
+# Keys that show which providers are configured
+_FREE_PROVIDER_KEYS = [
+    ("GEMINI_API_KEY",     "Gemini",     "https://aistudio.google.com"),
+    ("GROQ_API_KEY",       "Groq",       "https://console.groq.com"),
+    ("MISTRAL_API_KEY",    "Mistral",    "https://console.mistral.ai"),
+    ("OPENROUTER_API_KEY", "OpenRouter", "https://openrouter.ai/keys"),
+    ("CEREBRAS_API_KEY",   "Cerebras",   "https://cloud.cerebras.ai"),
+    ("GITHUB_TOKEN",       "GitHub",     "https://github.com/settings/tokens"),
+    ("NVIDIA_API_KEY",     "NVIDIA NIM", "https://build.nvidia.com"),
+    ("COHERE_API_KEY",     "Cohere",     "https://dashboard.cohere.com"),
+]
+
+
+def _call_llm(prompt, system="", max_tokens=4000):
+    """
+    Try ALL configured providers in priority order.
+    Returns (response_text, provider_name).
+    Falls through to next provider on ANY failure.
+    LLM7 is tried even without a key (no-registration fallback).
+    """
     errors = []
-    for name, fn in providers:
+    tried = []
+
+    for name, key_name, fn in _PROVIDERS:
+        # Skip unconfigured paid providers (not LLM7 — it needs no key)
+        if key_name and not _get_api_key(key_name):
+            continue
+
+        tried.append(name)
         try:
             result = fn(prompt, system=system, max_tokens=max_tokens)
             if result and len(result.strip()) > 10:
                 return result, name
+            errors.append(f"{name}: empty response")
         except Exception as e:
-            err_msg = str(e)[:120]
-            # Don't log "not set" as an error — it's expected
-            if "not set" not in err_msg.lower():
-                errors.append(f"{name}: {err_msg}")
+            err = str(e)[:150]
+            if "not set" not in err.lower():
+                errors.append(f"{name}: {err}")
             continue
 
-    # Build helpful error message
-    configured = []
-    for key_name, label in [("GEMINI_API_KEY","Gemini"), ("GROQ_API_KEY","Groq"),
-                             ("CEREBRAS_API_KEY","Cerebras"), ("ANTHROPIC_API_KEY","Claude")]:
-        if _get_api_key(key_name):
-            configured.append(label)
+    # Nothing worked — build a useful error message
+    configured = [n for _, k, _ in _PROVIDERS
+                  if k is None or _get_api_key(k)]
 
-    if not configured:
-        raise Exception(
-            "No LLM API keys configured!\n"
-            "Add at least ONE to .streamlit/secrets.toml:\n"
-            "  GEMINI_API_KEY = \"AIza...\"    (FREE — https://aistudio.google.com)\n"
-            "  GROQ_API_KEY = \"gsk_...\"      (FREE — https://console.groq.com)\n"
-            "  CEREBRAS_API_KEY = \"csk-...\"  (FREE — https://cloud.cerebras.ai)\n"
-            "  ANTHROPIC_API_KEY = \"sk-...\"  (PAID — https://console.anthropic.com)"
+    if not configured and name != "LLM7":
+        signup_lines = "\n".join(
+            f'  {label:<12} = "..."   # FREE — {url}'
+            for key, label, url in _FREE_PROVIDER_KEYS
         )
-    else:
         raise Exception(
-            f"All configured providers failed ({', '.join(configured)}):\n" +
-            "\n".join(errors) +
-            "\nTry again in a minute, or add more API keys."
+            "No LLM API keys configured. Add at least ONE to .streamlit/secrets.toml:\n\n"
+            + signup_lines +
+            "\n\nAll are free. Gemini or Groq are recommended to start."
         )
+
+    raise Exception(
+        f"All {len(tried)} providers failed: {', '.join(tried)}\n\n"
+        + "\n".join(errors) +
+        "\n\nFixes:\n"
+        "  • Add more API keys to secrets.toml (more providers = more reliability)\n"
+        "  • Wait 1 minute and retry (rate limits reset)\n"
+        "  • Check provider status pages"
+    )
 
 
 def _parse_json(text):
@@ -712,659 +867,345 @@ def bom_to_dataframe(bom_list):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STEP 3 — SHOULD-COST MODEL
+# STEP 3 — SHOULD-COST ENGINE (Claude + Web Search)
 # ═══════════════════════════════════════════════════════════════════
-# Purpose: Reverse-engineer the SUPPLIER'S manufacturing cost.
-# This is NOT "what we pay" — it's "what it costs HIM to make it."
 #
-# Cost structure for every component:
-#   Raw Material Cost  = net weight × material ₹/kg (grade-specific)
-#   Machining Cost     = complexity factor × raw material cost
-#   Surface Treatment  = painting / plating / heat treatment
-#   ───────────────────────────────────────────
-#   Manufactured Cost  = raw + machining + surface
+# Simple, clean logic for presentation:
 #
-#   Bought-out items   = market price (web lookup) + supplier markup 5-6%
-#   (motors, bearings, seals, instruments — supplier doesn't make these)
+#  For MANUFACTURED components (casing, impeller, shaft, etc.):
+#    Raw Material Cost = weight × live ₹/kg (from SAIL/LME/IndiaMART)
+#    + Machining Cost  = operations × shop rate
+#    ─────────────────────────────────────────────
+#    = Manufacturing Cost (NO overhead, NO margin)
 #
-# This model works for ANY engineered product: pumps, valves, 
-# heat exchangers, gearboxes, vessels, skids, etc.
+#  For BOUGHT-OUT items (motor, bearings, seals):
+#    = Current market price from IndiaMART/TradeIndia
+#      (what the supplier actually pays to procure)
+#
+#  Total Should-Cost vs Actual PO Price = Supplier's margin
 # ═══════════════════════════════════════════════════════════════════
 
-# ── RAW MATERIAL RATES (₹/kg) ────────────────────────────────────
-# These are RAW MATERIAL costs — what the foundry/forge pays for metal.
-# NOT finished price. Machining is added separately.
-# Sources: Metal Bulletin India, LME India, SAIL price lists, IndiaMart
-RAW_MATERIAL_RATES = {
-    # Carbon Steel
-    "A216 WCB":       130,   # CS casting raw
-    "WCB":            130,
-    "SA 216":         130,
-    "IS 2062":        72,    # Structural plate/section
-    "MS":             72,    # Mild steel plate
-    "MILD STEEL":     72,
-    "CARBON STEEL":   85,
-    "A105":           95,    # CS forging
-    # Alloy Steel
-    "EN-19":          180,   # Alloy steel bar (Cr-Mo)
-    "EN19":           180,
-    "EN-24":          200,   # Ni-Cr-Mo steel bar
-    "EN24":           200,
-    "SS410":          210,   # Martensitic SS bar
-    "4140":           175,
-    "4340":           210,
-    # Stainless Steel
-    "SS304":          280,   # Austenitic SS
-    "CF8":            320,   # SS304 casting
-    "SS316":          340,   # SS316 bar/plate
-    "CF8M":           380,   # SS316 casting
-    "SS316L":         350,
-    "DUPLEX":         520,   # Duplex SS (2205)
-    "CD4MCU":         550,   # Duplex casting
-    "SUPER DUPLEX":   680,
-    # High Alloy
-    "MONEL":          2200,
-    "INCONEL":        3200,
-    "HASTELLOY":      3800,
-    "TITANIUM":       3500,
-    # Chrome Iron
-    "A532":           280,   # High chrome white iron casting (raw)
-    "HIGH CHROME":    280,
-    "ASTM A487":      220,   # 12% chrome steel casting
-    "12% CHROME":     220,
-    # Cast Iron
-    "GREY CAST IRON": 65,    # GCI raw
-    "CAST IRON":      65,
-    "CI":             65,
-    "SG IRON":        85,    # Spheroidal graphite (ductile)
-    "DUCTILE IRON":   85,
-    # Special
-    "A193 B7":        250,   # High-strength alloy bolting bar
-    "A197":           150,   # Nut material
-    "RUBBER":         180,   # Lined/moulded rubber
-    "PTFE":           800,
-    "EPDM":           350,
-}
-
-# ── MACHINING COMPLEXITY MULTIPLIERS ─────────────────────────────
-# Applied on top of raw material cost.
-# Factor = additional cost as % of raw material cost.
-# E.g. 0.8 means machining costs 80% of raw material cost.
-MACHINING_FACTORS = {
-    # Heavy castings — pattern + moulding + rough machining + finish
-    "pump_casing":       0.90,   # Complex casting, internal passages, flange faces
-    "impeller":          1.20,   # Complex curved vanes, balancing, close tolerances
-    "wear_ring":         0.60,   # Simple turned ring, interference fit
-    "volute_liner":      0.70,
-    "diffuser":          1.00,
-    # Rotating parts — forging/bar + turning + grinding
-    "shaft":             0.85,   # Multi-diameter turning, keyways, threading
-    "shaft_sleeve":      0.50,   # Simple OD/ID turning
-    "coupling_half":     0.55,
-    "impeller_nut":      0.30,
-    # Housings — casting + boring + face machining
-    "bearing_housing":   0.65,   # Bore machining, face finishing, oil channels
-    "seal_housing":      0.70,
-    "gland_plate":       0.45,   # Flat plate, bolt holes, bore
-    "stuffing_box":      0.60,
-    # Fabrication — cutting + welding + machining
-    "baseplate":         0.40,   # Cut, weld, drill, machine pads
-    "base_frame":        0.40,
-    "skid":              0.35,
-    # Simple machined parts
-    "key":               0.25,
-    "spacer":            0.20,
-    "bolt":              0.30,
-    "nut":               0.20,
-    "flange":            0.45,   # Forging + drilling + face machining
-    "gasket":            0.15,   # Die cut or spiral wound
-    # Default
-    "default_casting":   0.70,
-    "default_forging":   0.55,
-    "default_machined":  0.50,
-    "default_fabricated":0.35,
-    "default":           0.50,
-}
-
-# ── SURFACE TREATMENT COSTS (₹/kg) ──────────────────────────────
-SURFACE_TREATMENT = {
-    "painting":          8,     # Standard industrial primer + topcoat
-    "hot_dip_galv":      18,    # Hot-dip galvanizing
-    "electroplating":    35,    # Chrome/nickel plating
-    "heat_treatment":    25,    # Normalizing/stress relieving
-    "shot_blasting":     5,     # Surface prep
-    "none":              0,
-}
-
-# ── BOUGHT-OUT ITEM REFERENCE PRICES (₹) ────────────────────────
-# These are MARKET prices for items the supplier doesn't manufacture.
-# The supplier just buys these and adds 5-6% margin.
-# Sources: IndiaMart, TradeIndia, IEEMA motor price index
-BOUGHT_OUT_PRICES = {
-    # Motors — ₹/kW (OEM price to pump vendor)
-    "motor_per_kw_ht_690v":    3800,    # HT/MV motor ≥200kW
-    "motor_per_kw_lt_415v":    4800,    # LT motor <200kW
-    "motor_per_kw_lt_small":   6500,    # Small LT motor <30kW (higher ₹/kW)
-    # Bearings (OEM price)
-    "skf_6200_series":         800,     # Small deep groove
-    "skf_6300_series":         1800,    # Medium deep groove
-    "skf_7300_series":         3500,    # Angular contact medium
-    "timken_taper_medium":     5500,    # Taper roller 80-120mm bore
-    "timken_taper_large":      9000,    # Taper roller >120mm bore
-    "skf_spherical_large":     15000,   # Spherical roller >150mm
-    # Mechanical Seals (OEM price, supplier buys from EagleBurgmann/John Crane)
-    "mech_seal_single_small":  22000,   # Single, <50mm shaft
-    "mech_seal_single_medium": 55000,   # Single, 50-80mm shaft
-    "mech_seal_single_large":  110000,  # Single, >80mm shaft
-    "mech_seal_double":        180000,  # Double with barrier fluid
-    "mech_seal_cartridge":     140000,  # Cartridge type
-    "seal_sld_device":         25000,   # Synthetic Lubricating Device add-on
-    # Coupling (OEM price)
-    "coupling_disc_small":     8000,
-    "coupling_disc_large":     28000,
-    "coupling_gear":           45000,
-    # V-belts
-    "vbelt_set_small":         4000,    # <50kW
-    "vbelt_set_medium":        8000,    # 50-200kW
-    "vbelt_set_large":         14000,   # >200kW
-    "vbelt_guard":             3500,
-    # Pulleys
-    "pulley_small":            3000,
-    "pulley_large":            8000,
-    # Instrumentation
-    "rtd_pt100":               1200,
-    "dial_thermometer":        800,
-    "pressure_gauge":          1500,
-    "vibration_switch":        4500,
-    # Flanges & Gaskets (bought-out)
-    "companion_flange_4inch":  1200,
-    "companion_flange_6inch":  2200,
-    "companion_flange_8inch":  3500,
-    "companion_flange_10inch": 5500,
-    "companion_flange_12inch": 7500,
-    "gasket_spiral_wound_4":   400,
-    "gasket_spiral_wound_6":   550,
-    "gasket_spiral_wound_8":   700,
-    "gasket_spiral_wound_10":  900,
-    "gasket_compressed":       200,
-    # Foundation hardware
-    "foundation_bolt_m24":     180,
-    "foundation_bolt_m30":     280,
-    "foundation_bolt_m36":     400,
-    # First fill
-    "grease_first_fill_kg":    350,     # per kg
-    "oil_first_fill_litre":    250,     # per litre
-}
-
-# Supplier markup on bought-out items
-SUPPLIER_MARKUP = 0.06  # 6%
-
-# ── REFERENCE URLS for price verification ────────────────────────
-PRICE_REFERENCE_URLS = {
-    "motors":    "https://www.indiamart.com/search.mp?ss=industrial+electric+motor",
-    "bearings":  "https://www.indiamart.com/search.mp?ss=skf+timken+bearing",
-    "seals":     "https://www.indiamart.com/search.mp?ss=mechanical+seal+pump",
-    "castings":  "https://www.indiamart.com/search.mp?ss=steel+casting+price+per+kg",
-    "flanges":   "https://www.indiamart.com/search.mp?ss=ansi+flanges",
-    "metals":    "https://www.metalmarket.in",
-    "steel":     "https://www.steelmint.com",
-    "lme":       "https://www.westmetall.com/en/markdaten.php",
-}
-
-
+# ── COMPONENT CLASSIFIER ─────────────────────────────────────────
 def _classify_component(component_name, moc="", description=""):
-    """Classify a component as MANUFACTURED or BOUGHT-OUT.
-    Returns (category, machining_key, surface_treatment)."""
+    """Classify as 'manufactured', 'bought_out', or 'compliance'."""
     comp = (component_name or "").upper()
-    desc = (description or "").upper()
-    moc_u = (moc or "").upper()
 
-    # ── BOUGHT-OUT (supplier doesn't make, just procures) ─────────
-    if any(x in comp for x in ["MOTOR", "ELECTRIC MOTOR", "SCIM", "SQUIRREL CAGE"]):
-        if not any(x in comp for x in ["BOLT", "MOUNT", "BASE", "PULLEY", "SIDE", "BRACKET"]):
-            return "bought_out", "motor", "none"
-
-    if any(x in comp for x in ["BEARING"]) and "HOUSING" not in comp:
-        return "bought_out", "bearing", "none"
-
+    # BOUGHT-OUT: supplier procures from OEM, doesn't make
+    if "MOTOR" in comp and not any(x in comp for x in
+            ["BOLT", "MOUNT", "BASE", "PULLEY", "SIDE", "BRACKET", "HOUSING"]):
+        return "bought_out", "motor"
+    if "BEARING" in comp and "HOUSING" not in comp:
+        return "bought_out", "bearing"
     if any(x in comp for x in ["MECHANICAL SEAL", "MECH SEAL", "CARTRIDGE SEAL"]):
-        return "bought_out", "seal", "none"
-
-    if "SLD" in comp and ("DEVICE" in comp or "SYNTHETIC" in comp):
-        return "bought_out", "seal_accessory", "none"
-
-    if any(x in comp for x in ["RTD", "THERMOCOUPLE", "THERMOMETER", "PRESSURE GAUGE",
-                                "VIBRATION SWITCH", "TRANSMITTER"]):
-        return "bought_out", "instrument", "none"
-
-    if "V-BELT" in comp or "V BELT" in comp or "VBELT" in comp:
-        return "bought_out", "vbelt", "none"
-
+        return "bought_out", "seal"
+    if any(x in comp for x in ["V-BELT", "V BELT", "VBELT"]):
+        return "bought_out", "vbelt"
     if "COMPANION FLANGE" in comp or "COUNTER FLANGE" in comp:
-        return "bought_out", "flange_set", "none"
-
+        return "bought_out", "flange_set"
     if "GASKET" in comp:
-        return "bought_out", "gasket", "none"
-
+        return "bought_out", "gasket"
     if "FOUNDATION" in comp and "BOLT" in comp:
-        return "bought_out", "foundation_bolt", "none"
+        return "bought_out", "fastener"
+    if any(x in comp for x in ["FIRST FILL", "GREASE", "LUBRICANT"]):
+        return "bought_out", "lubricant"
+    if any(x in comp for x in ["RTD", "THERMOCOUPLE", "PRESSURE GAUGE",
+                                "VIBRATION SWITCH"]):
+        return "bought_out", "instrument"
+    if "GUARD" in comp:
+        return "bought_out", "guard"
+    if "SLD" in comp:
+        return "bought_out", "seal_accessory"
 
-    if "GREASE" in comp or "LUBRICANT" in comp or "FIRST FILL" in comp:
-        return "bought_out", "lubricant", "none"
+    # COMPLIANCE: no separate cost
+    if any(x in comp for x in ["COMPLETE ASSEMBLY", "NOISE LEVEL",
+                                "VIBRATION LIMIT", "PERFORMANCE TEST",
+                                "SURFACE PREP", "FACTORY TEST"]):
+        return "compliance", "none"
 
-    if "GUARD" in comp and ("BELT" in comp or "COUPLING" in comp):
-        return "bought_out", "guard", "none"
-
-    # ── MANUFACTURED (supplier makes in his shop) ─────────────────
-    if "CASING" in comp and "BOLT" not in comp:
-        return "manufactured", "pump_casing", "painting"
-
-    if "IMPELLER" in comp and "WEAR" not in comp and "NUT" not in comp:
-        return "manufactured", "impeller", "none"
-
-    if "WEAR RING" in comp:
-        return "manufactured", "wear_ring", "none"
-
-    if "SHAFT" in comp and "SLEEVE" not in comp and "KEY" not in comp:
-        return "manufactured", "shaft", "none"
-
-    if "SLEEVE" in comp:
-        return "manufactured", "shaft_sleeve", "none"
-
-    if "GLAND" in comp or "SEAL PLATE" in comp:
-        return "manufactured", "gland_plate", "none"
-
-    if "BEARING HOUSING" in comp or "PEDESTAL" in comp:
-        return "manufactured", "bearing_housing", "painting"
-
-    if "BASE" in comp or "BASEPLATE" in comp or "FRAME" in comp or "SKID" in comp:
-        return "manufactured", "baseplate", "painting"
-
-    if "PULLEY" in comp or "SHEAVE" in comp:
-        return "manufactured", "coupling_half", "painting"
-
-    if "KEY" in comp:
-        return "manufactured", "key", "none"
-
-    if "BOLT" in comp or "NUT" in comp or "STUD" in comp or "FASTENER" in comp:
-        return "manufactured", "bolt", "none"
-
-    if "NOZZLE" in comp:
-        return "manufactured", "flange", "painting"  # integral, priced as casting
-
-    if "ANCHOR" in comp:
-        return "bought_out", "foundation_bolt", "hot_dip_galv"
-
-    # ── COMPLIANCE / ASSEMBLY (no separate cost) ──────────────────
-    if any(x in comp for x in ["COMPLETE ASSEMBLY", "NOISE LEVEL", "VIBRATION",
-                                "COMPLIANCE", "PROVISION", "SURFACE PREP",
-                                "PERFORMANCE TEST"]):
-        return "compliance", "none", "none"
-
-    # Default: manufactured
-    return "manufactured", "default", "painting"
+    # MANUFACTURED: everything else
+    return "manufactured", "general"
 
 
-def _get_raw_material_rate(moc):
-    """Find the ₹/kg rate for a given MOC string."""
-    moc_upper = (moc or "").upper()
-    for mat_key, rate in RAW_MATERIAL_RATES.items():
-        if mat_key in moc_upper:
-            return rate, mat_key
-    return None, None
-
-
-def _price_manufactured(comp_name, moc, weight_kg, qty_str, machining_key, surface_key):
-    """Should-cost for a manufactured component.
-    Returns dict with cost breakdown."""
-    result = {
-        "raw_material_cost": 0,
-        "machining_cost": 0,
-        "surface_cost": 0,
-        "total_cost": 0,
-        "confidence": "low",
-        "breakdown": "",
-    }
-
-    if not weight_kg or weight_kg <= 0:
-        return result
-
-    # Parse qty
+# ── CLAUDE WEB-SEARCH PRICING ────────────────────────────────────
+def _call_claude_with_search(prompt, system="", max_tokens=3000):
+    """Call Claude with web_search tool enabled for live price lookup."""
+    key = _get_api_key("ANTHROPIC_API_KEY")
+    if not key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
     try:
-        q = int(re.search(r'\d+', str(qty_str)).group()) if re.search(r'\d+', str(qty_str)) else 1
-    except Exception:
-        q = 1
+        import anthropic
+    except ImportError:
+        raise ValueError("pip install anthropic needed")
 
-    # Gross weight = net weight × 1.08 (8% machining allowance on castings)
-    is_casting = machining_key in ("pump_casing", "impeller", "wear_ring", "bearing_housing",
-                                     "gland_plate", "default_casting")
-    gross_weight = weight_kg * 1.08 if is_casting else weight_kg
-
-    # Raw material cost
-    rate, matched_mat = _get_raw_material_rate(moc)
-    if rate is None:
-        rate = 100  # conservative fallback
-        matched_mat = "unknown (₹100/kg default)"
-        result["confidence"] = "low"
-    else:
-        result["confidence"] = "high"
-
-    raw_cost = rate * gross_weight * q
-    result["raw_material_cost"] = int(raw_cost)
-
-    # Machining cost
-    mach_factor = MACHINING_FACTORS.get(machining_key, MACHINING_FACTORS["default"])
-    mach_cost = raw_cost * mach_factor
-    result["machining_cost"] = int(mach_cost)
-
-    # Surface treatment
-    surf_rate = SURFACE_TREATMENT.get(surface_key, 0)
-    surf_cost = surf_rate * weight_kg * q
-    result["surface_cost"] = int(surf_cost)
-
-    # Total
-    total = raw_cost + mach_cost + surf_cost
-    result["total_cost"] = int(total)
-    result["breakdown"] = (
-        f"Raw: ₹{rate}/kg × {gross_weight:.0f}kg = ₹{int(raw_cost):,} ({matched_mat}) | "
-        f"Machining: ×{mach_factor} = ₹{int(mach_cost):,} | "
-        f"Surface: ₹{int(surf_cost):,}"
-    )
-    return result
-
-
-def _price_bought_out(comp_name, moc, weight_kg, qty_str, sub_type, pump_specs):
-    """Should-cost for bought-out items.
-    Returns dict with cost breakdown."""
-    comp = (comp_name or "").upper()
-    pump = pump_specs if isinstance(pump_specs, dict) else {}
-    result = {
-        "raw_material_cost": 0,    # = market price for bought-out
-        "machining_cost": 0,       # = 0 for bought-out
-        "surface_cost": 0,         # = supplier markup
-        "total_cost": 0,
-        "confidence": "medium",
-        "breakdown": "",
+    client = anthropic.Anthropic(api_key=key)
+    kwargs = {
+        "model":     "claude-sonnet-4-5",
+        "max_tokens": max_tokens,
+        "tools":     [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages":  [{"role": "user", "content": prompt}],
     }
+    if system:
+        kwargs["system"] = system
 
-    try:
-        q = int(re.search(r'\d+', str(qty_str)).group()) if re.search(r'\d+', str(qty_str)) else 1
-    except Exception:
-        q = 1
-
-    market_price = 0
-    source = ""
-
-    # ── MOTOR ──
-    if sub_type == "motor":
-        kw = pump.get("motor_kw") or 0
+    for attempt in range(3):
         try:
-            kw = float(kw)
-        except (ValueError, TypeError):
-            kw = 0
-        voltage = str((pump.get("motor", {}) or {}).get("voltage_v", "415V"))
-
-        if kw >= 200 or "690" in voltage:
-            rate = BOUGHT_OUT_PRICES["motor_per_kw_ht_690v"]
-        elif kw >= 30:
-            rate = BOUGHT_OUT_PRICES["motor_per_kw_lt_415v"]
-        else:
-            rate = BOUGHT_OUT_PRICES["motor_per_kw_lt_small"]
-
-        market_price = int(kw * rate)
-        source = f"₹{rate}/kW × {kw}kW ({voltage})"
-        result["confidence"] = "high"
-
-    # ── BEARING ──
-    elif sub_type == "bearing":
-        if "TAPER" in comp or "TAPERED" in comp:
-            if weight_kg and weight_kg > 5:
-                market_price = BOUGHT_OUT_PRICES["timken_taper_large"]
+            resp = client.messages.create(**kwargs)
+            parts = [b.text for b in resp.content if hasattr(b, "text")]
+            return "\n".join(parts).strip()
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                time.sleep(30 * (2 ** attempt))
             else:
-                market_price = BOUGHT_OUT_PRICES["timken_taper_medium"]
-        elif "SPHERICAL" in comp:
-            market_price = BOUGHT_OUT_PRICES["skf_spherical_large"]
-        elif "ANGULAR" in comp:
-            market_price = BOUGHT_OUT_PRICES["skf_7300_series"]
-        else:
-            market_price = BOUGHT_OUT_PRICES["skf_6300_series"]
-        source = "OEM bearing price"
+                raise
+    raise Exception("Claude rate limit exceeded.")
 
-    # ── MECHANICAL SEAL ──
-    elif sub_type == "seal":
-        if "DOUBLE" in comp:
-            market_price = BOUGHT_OUT_PRICES["mech_seal_double"]
-        elif "CARTRIDGE" in comp:
-            market_price = BOUGHT_OUT_PRICES["mech_seal_cartridge"]
-        elif any(x in comp for x in ["SLD", "PLAN 62", "LARGE"]):
-            market_price = BOUGHT_OUT_PRICES["mech_seal_single_large"]
-        elif "MEDIUM" in comp or (weight_kg and weight_kg > 10):
-            market_price = BOUGHT_OUT_PRICES["mech_seal_single_medium"]
-        else:
-            market_price = BOUGHT_OUT_PRICES["mech_seal_single_small"]
-        source = "OEM seal price (EagleBurgmann/John Crane class)"
 
-    elif sub_type == "seal_accessory":
-        market_price = BOUGHT_OUT_PRICES["seal_sld_device"]
-        source = "SLD device"
+SHOULD_COST_SYSTEM = """You are a procurement cost engineer at an Indian EPC company.
 
-    # ── V-BELT ──
-    elif sub_type == "vbelt":
-        kw = pump.get("motor_kw") or 0
-        try:
-            kw = float(kw)
-        except Exception:
-            kw = 100
-        if kw > 200:
-            market_price = BOUGHT_OUT_PRICES["vbelt_set_large"]
-        elif kw > 50:
-            market_price = BOUGHT_OUT_PRICES["vbelt_set_medium"]
-        else:
-            market_price = BOUGHT_OUT_PRICES["vbelt_set_small"]
-        source = f"V-belt set for {kw}kW"
+Your job: find the RAW MANUFACTURING COST of pump/valve components.
+This means ONLY: Raw Material + Machining. NO overhead. NO profit. NO markup.
 
-    # ── COMPANION FLANGE SET ──
-    elif sub_type == "flange_set":
-        if "200" in comp or "8" in comp or "SUCTION" in comp:
-            market_price = BOUGHT_OUT_PRICES["companion_flange_8inch"]
-        elif "150" in comp or "6" in comp or "DISCHARGE" in comp:
-            market_price = BOUGHT_OUT_PRICES["companion_flange_6inch"]
-        elif "250" in comp or "10" in comp:
-            market_price = BOUGHT_OUT_PRICES["companion_flange_10inch"]
-        else:
-            market_price = BOUGHT_OUT_PRICES["companion_flange_6inch"]
-        source = "Flange + gasket + bolt set"
+You MUST use web_search to find CURRENT prices (2025-26) from:
+- SAIL, RINL, MSTC for steel/alloy prices
+- IndiaMART for castings, forgings, machined parts
+- LME India for non-ferrous metals
+- TradeIndia for bought-out items
 
-    # ── GASKET ──
-    elif sub_type == "gasket":
-        if "SPIRAL" in comp:
-            market_price = BOUGHT_OUT_PRICES["gasket_spiral_wound_8"]
-        else:
-            market_price = BOUGHT_OUT_PRICES["gasket_compressed"]
-        source = "Standard gasket"
-
-    # ── FOUNDATION BOLT ──
-    elif sub_type == "foundation_bolt":
-        count = 8  # typical
-        if q > 1:
-            count = q
-        market_price = BOUGHT_OUT_PRICES["foundation_bolt_m30"] * count
-        source = f"{count}× M30 foundation bolts"
-
-    # ── INSTRUMENT ──
-    elif sub_type == "instrument":
-        if "RTD" in comp:
-            market_price = BOUGHT_OUT_PRICES["rtd_pt100"]
-        elif "THERMO" in comp:
-            market_price = BOUGHT_OUT_PRICES["dial_thermometer"]
-        elif "PRESSURE" in comp:
-            market_price = BOUGHT_OUT_PRICES["pressure_gauge"]
-        elif "VIBRATION" in comp:
-            market_price = BOUGHT_OUT_PRICES["vibration_switch"]
-        else:
-            market_price = 2000
-        source = "Standard instrument"
-
-    # ── LUBRICANT ──
-    elif sub_type == "lubricant":
-        market_price = BOUGHT_OUT_PRICES["grease_first_fill_kg"] * max(weight_kg or 2, 2)
-        source = "First fill grease/oil"
-
-    # ── GUARD ──
-    elif sub_type == "guard":
-        market_price = BOUGHT_OUT_PRICES["vbelt_guard"]
-        source = "Belt/coupling guard"
-
-    else:
-        market_price = 5000
-        result["confidence"] = "low"
-        source = "Generic bought-out estimate"
-
-    market_price = market_price * q
-    supplier_markup_amt = int(market_price * SUPPLIER_MARKUP)
-
-    result["raw_material_cost"] = int(market_price)  # "raw" = OEM market price
-    result["surface_cost"] = supplier_markup_amt      # "surface" = supplier's margin
-    result["total_cost"] = int(market_price + supplier_markup_amt)
-    result["breakdown"] = f"Market: ₹{int(market_price):,} + Supplier markup {SUPPLIER_MARKUP*100:.0f}%: ₹{supplier_markup_amt:,} | {source}"
-
-    return result
+Be specific. Search for the exact grade mentioned in MOC.
+Give numbers you can justify from search results.
+All amounts in Indian Rupees (INR). Be conservative (use lower end of range)."""
 
 
 def claude_price_bom(bom_df, pump_specs, progress_callback=None):
     """
-    SHOULD-COST MODEL: Reverse-engineer the supplier's manufacturing cost.
-    
-    For manufactured items:  Raw Material + Machining + Surface Treatment
-    For bought-out items:    Market Price + Supplier Markup (5-6%)
-    
-    Uses free LLMs only for items that can't be classified locally.
-    Claude is the absolute last fallback.
+    Should-cost engine: Claude searches live prices for each component.
+    Returns Raw Material Cost + Machining Cost per component.
+    NO overhead, NO margin — just bare manufacturing cost.
+    Compare total with actual PO to see supplier's margin.
     """
     if bom_df is None or bom_df.empty:
         return bom_df
 
     pump = pump_specs if isinstance(pump_specs, dict) else {}
+    pump_fluid  = pump.get("fluid", "")
+    pump_kw     = pump.get("motor_kw", "")
+    pump_type   = pump.get("type", "centrifugal pump")
 
     if progress_callback:
-        progress_callback(10, "Classifying components: manufactured vs bought-out...")
+        progress_callback(8, "Classifying components...")
+
+    # Classify all components
+    classified = []
+    for _, row in bom_df.iterrows():
+        comp = str(row.get("Component", ""))
+        moc  = str(row.get("MOC", ""))
+        desc = str(row.get("Description", ""))
+        cat, sub = _classify_component(comp, moc, desc)
+        classified.append({
+            "row":    row.to_dict(),
+            "no":     row.get("No", 0),
+            "comp":   comp,
+            "moc":    moc,
+            "weight": row.get("Weight_kg"),
+            "qty":    str(row.get("Qty", "1")),
+            "cat":    cat,
+            "sub":    sub,
+        })
+
+    mfg_items  = [c for c in classified if c["cat"] == "manufactured"]
+    bo_items   = [c for c in classified if c["cat"] == "bought_out"]
+    comp_items = [c for c in classified if c["cat"] == "compliance"]
+
+    if progress_callback:
+        progress_callback(12, f"{len(mfg_items)} manufactured, "
+                              f"{len(bo_items)} bought-out to price...")
 
     result_rows = []
-    unpriced = []
 
-    for _, row in bom_df.iterrows():
-        rd = row.to_dict()
-        comp_name = str(row.get("Component", ""))
-        moc = str(row.get("MOC", ""))
-        desc = str(row.get("Description", ""))
-        weight = row.get("Weight_kg")
-        qty_str = str(row.get("Qty", "1"))
-        no = row.get("No", 0)
+    # ── PRICE MANUFACTURED ITEMS (batch of 4) ────────────────────
+    BATCH = 4
+    for i in range(0, len(mfg_items), BATCH):
+        batch = mfg_items[i:i + BATCH]
+        pct   = 15 + int((i / max(len(mfg_items), 1)) * 50)
+        names = ", ".join(c["comp"][:20] for c in batch)
+        if progress_callback:
+            progress_callback(pct, f"Searching live prices: {names}...")
 
-        category, sub_type, surface = _classify_component(comp_name, moc, desc)
+        items_json = json.dumps([{
+            "no":        c["no"],
+            "component": c["comp"],
+            "moc":       c["moc"],
+            "weight_kg": c["weight"],
+            "qty":       c["qty"],
+        } for c in batch], default=str)
 
-        if category == "manufactured":
-            cost = _price_manufactured(comp_name, moc, weight, qty_str, sub_type, surface)
-        elif category == "bought_out":
-            cost = _price_bought_out(comp_name, moc, weight, qty_str, sub_type, pump)
-        elif category == "compliance":
-            cost = {
-                "raw_material_cost": 0, "machining_cost": 0, "surface_cost": 0,
-                "total_cost": 0, "confidence": "high",
-                "breakdown": "Compliance/assembly item — no separate cost",
-            }
-        else:
-            cost = None
+        prompt = f"""Find the RAW MANUFACTURING COST for these {pump_type} components.
+Fluid service: {pump_fluid}. Motor: {pump_kw} kW.
 
-        if cost and (cost["total_cost"] > 0 or cost["confidence"] == "high"):
-            total = cost["total_cost"]
-            gst = int(total * 0.18)
-            rd["Raw_Material_INR"]   = cost["raw_material_cost"]
-            rd["Machining_INR"]      = cost["machining_cost"]
-            rd["Surface_INR"]        = cost["surface_cost"]
-            rd["Unit_Price_INR"]     = total
-            rd["Total_Price_INR"]    = total
-            rd["GST_18pct"]          = gst
-            rd["Price_With_GST"]     = total + gst
-            rd["Price_Confidence"]   = cost["confidence"]
-            rd["Price_Source"]       = cost["breakdown"]
-            rd["Price_Notes"]        = f"Category: {category}"
-            rd["Component_Type"]     = category
-            result_rows.append(rd)
-        elif cost and cost["total_cost"] == 0 and category == "compliance":
-            rd["Raw_Material_INR"]   = 0
-            rd["Machining_INR"]      = 0
-            rd["Surface_INR"]        = 0
-            rd["Unit_Price_INR"]     = 0
-            rd["Total_Price_INR"]    = 0
-            rd["GST_18pct"]          = 0
-            rd["Price_With_GST"]     = 0
-            rd["Price_Confidence"]   = "high"
-            rd["Price_Source"]       = cost["breakdown"]
-            rd["Price_Notes"]        = "No separate cost"
-            rd["Component_Type"]     = "compliance"
-            result_rows.append(rd)
-        else:
-            unpriced.append((rd, no))
+Use web_search to find CURRENT 2025-26 Indian market prices for each material grade.
 
-    if progress_callback:
-        n_priced = len(result_rows)
-        progress_callback(60, f"Should-costed {n_priced}/{len(bom_df)} locally. LLM for {len(unpriced)} remaining...")
+Components:
+{items_json}
 
-    # Use free LLM for remaining unpriced
-    if unpriced:
-        unpriced_list = [{"no": no, "component": rd.get("Component",""),
-                          "moc": rd.get("MOC",""), "qty": rd.get("Qty","1"),
-                          "weight_kg": rd.get("Weight_kg")}
-                         for rd, no in unpriced]
+For each component calculate:
+1. RAW MATERIAL COST:
+   - Search: "[MOC grade] price per kg India 2025" (e.g. "SS316 plate price India 2025")
+   - Use SAIL/RINL for steel, LME India for Cu/Al, IndiaMART for castings
+   - Gross weight = finished weight × 1.35 for castings, × 1.15 for bar/forging
+   - Raw material cost = gross weight × ₹/kg × qty
 
-        prompt = f"""Estimate the MANUFACTURING COST (not selling price) for these components.
-Break down each into: raw_material_cost (₹/kg × weight), machining_cost, total.
-Indian rates 2025-26. Conservative estimates.
+2. MACHINING COST (realistic for the component type):
+   - Casting: pattern+moulding ₹15-20/kg gross weight
+   - CNC turning/boring: ₹1000-1400/hr, estimate realistic hours
+   - Fabrication (welding+cutting): ₹90-120/kg
+   - Simple parts (keys, sleeves): ₹400-600/hr conventional
 
-Components: {json.dumps(unpriced_list, default=str)}
+3. NO overhead. NO margin. Just raw material + machining.
 
-Return JSON array:
-[{{"no":<n>,"raw_material_cost":<int>,"machining_cost":<int>,"total_cost":<int>,"confidence":"medium","breakdown":"brief"}}]
-JSON only."""
+Return JSON array ONLY:
+[{{
+  "no": <item no>,
+  "raw_material_rate_inr_per_kg": <₹/kg searched>,
+  "material_source": "SAIL/RINL/IndiaMART/etc + search query used",
+  "gross_weight_kg": <with allowance>,
+  "raw_material_cost_inr": <int>,
+  "machining_operations": "brief: op1 Xhr + op2 Xhr",
+  "machining_cost_inr": <int>,
+  "total_manufacturing_cost_inr": <raw + machining>,
+  "confidence": "high|medium|low",
+  "notes": "one line basis"
+}}]"""
 
         try:
-            raw, provider = _call_llm(prompt, max_tokens=2000)
-            if progress_callback:
-                progress_callback(80, f"Got costs from {provider}...")
-            llm_prices = _parse_json(raw)
-            price_map = {}
-            if isinstance(llm_prices, list):
-                for p in llm_prices:
-                    if isinstance(p, dict) and "no" in p:
-                        price_map[p["no"]] = p
+            raw = _call_claude_with_search(prompt, system=SHOULD_COST_SYSTEM)
+            parsed = _parse_json(raw)
+            if not isinstance(parsed, list):
+                parsed = [parsed] if isinstance(parsed, dict) else []
+            price_map = {p["no"]: p for p in parsed
+                         if isinstance(p, dict) and "no" in p}
 
-            for rd, no in unpriced:
-                pr = price_map.get(no, {})
-                raw_mat = int(pr.get("raw_material_cost", 0))
-                mach    = int(pr.get("machining_cost", 0))
-                total   = int(pr.get("total_cost", raw_mat + mach))
-                gst     = int(total * 0.18)
-                rd["Raw_Material_INR"]  = raw_mat
-                rd["Machining_INR"]     = mach
-                rd["Surface_INR"]       = 0
-                rd["Unit_Price_INR"]    = total
-                rd["Total_Price_INR"]   = total
-                rd["GST_18pct"]         = gst
-                rd["Price_With_GST"]    = total + gst
-                rd["Price_Confidence"]  = str(pr.get("confidence", "low"))
-                rd["Price_Source"]      = f"{provider}: {str(pr.get('breakdown', ''))}"
-                rd["Price_Notes"]       = "LLM estimate"
-                rd["Component_Type"]    = "unknown"
+            for c in batch:
+                rd  = c["row"].copy()
+                p   = price_map.get(c["no"], {})
+                raw_cost  = int(p.get("raw_material_cost_inr", 0))
+                mach_cost = int(p.get("machining_cost_inr", 0))
+                total     = int(p.get("total_manufacturing_cost_inr",
+                                      raw_cost + mach_cost))
+                gst = int(total * 0.18)
+
+                rd["Raw_Material_INR"]      = raw_cost
+                rd["Machining_INR"]         = mach_cost
+                rd["Total_Manufacturing_INR"] = total
+                rd["Unit_Price_INR"]        = total
+                rd["Total_Price_INR"]       = total
+                rd["GST_18pct"]             = gst
+                rd["Price_With_GST"]        = total + gst
+                rd["Price_Confidence"]      = p.get("confidence", "medium")
+                rd["Price_Source"]          = p.get("material_source", "")
+                rd["Price_Notes"]           = (
+                    f"RM: ₹{p.get('raw_material_rate_inr_per_kg',0)}/kg "
+                    f"× {p.get('gross_weight_kg',0)}kg | "
+                    f"Machining: {p.get('machining_operations','')}"
+                )
+                rd["Component_Type"]        = "manufactured"
                 result_rows.append(rd)
+
         except Exception as e:
-            for rd, no in unpriced:
-                rd.update({"Raw_Material_INR":0,"Machining_INR":0,"Surface_INR":0,
-                           "Unit_Price_INR":0,"Total_Price_INR":0,"GST_18pct":0,
-                           "Price_With_GST":0,"Price_Confidence":"none",
-                           "Price_Source":f"Failed: {str(e)[:50]}",
-                           "Price_Notes":"Manual costing required","Component_Type":"unknown"})
+            for c in batch:
+                rd = c["row"].copy()
+                rd.update(_zero_cost_row("manufactured", f"Error: {str(e)[:80]}"))
                 result_rows.append(rd)
+
+        # Small delay between batches
+        if i + BATCH < len(mfg_items):
+            time.sleep(3)
+
+    # ── PRICE BOUGHT-OUT ITEMS (batch of 6) ──────────────────────
+    BO_BATCH = 6
+    for i in range(0, len(bo_items), BO_BATCH):
+        batch = bo_items[i:i + BO_BATCH]
+        pct   = 67 + int((i / max(len(bo_items), 1)) * 22)
+        names = ", ".join(c["comp"][:20] for c in batch)
+        if progress_callback:
+            progress_callback(pct, f"Live market price: {names}...")
+
+        items_json = json.dumps([{
+            "no":        c["no"],
+            "component": c["comp"],
+            "moc":       c["moc"],
+            "weight_kg": c["weight"],
+            "qty":       c["qty"],
+        } for c in batch], default=str)
+
+        prompt = f"""Find the current MARKET PRICE for these bought-out items.
+This is what the pump vendor PAYS to procure them from OEM.
+Pump: {pump_type}, {pump_kw} kW, fluid: {pump_fluid}.
+
+Use web_search to find CURRENT 2025-26 prices from IndiaMART/TradeIndia/IEEMA.
+
+Items:
+{items_json}
+
+Search examples:
+- Motor: "ABB Siemens {pump_kw}kW HT motor price India 2025"
+- Bearing: "SKF TIMKEN taper roller bearing price India"
+- Seal: "EagleBurgmann mechanical seal price India"
+- Flanges: "ANSI 300 flange price per kg India"
+
+Return JSON array ONLY:
+[{{
+  "no": <item no>,
+  "market_price_inr": <what vendor pays to OEM — integer>,
+  "search_source": "IndiaMART/TradeIndia/IEEMA/vendor site",
+  "search_query": "exact search query used",
+  "confidence": "high|medium|low",
+  "notes": "model/size/make referenced"
+}}]"""
+
+        try:
+            raw = _call_claude_with_search(prompt, system=SHOULD_COST_SYSTEM)
+            parsed = _parse_json(raw)
+            if not isinstance(parsed, list):
+                parsed = [parsed] if isinstance(parsed, dict) else []
+            price_map = {p["no"]: p for p in parsed
+                         if isinstance(p, dict) and "no" in p}
+
+            for c in batch:
+                rd    = c["row"].copy()
+                p     = price_map.get(c["no"], {})
+                price = int(p.get("market_price_inr", 0))
+                gst   = int(price * 0.18)
+
+                rd["Raw_Material_INR"]        = price
+                rd["Machining_INR"]           = 0
+                rd["Total_Manufacturing_INR"] = price
+                rd["Unit_Price_INR"]          = price
+                rd["Total_Price_INR"]         = price
+                rd["GST_18pct"]               = gst
+                rd["Price_With_GST"]          = price + gst
+                rd["Price_Confidence"]        = p.get("confidence", "medium")
+                rd["Price_Source"]            = p.get("search_source", "")
+                rd["Price_Notes"]             = (
+                    f"Query: {p.get('search_query','')} | "
+                    f"{p.get('notes','')}"
+                )
+                rd["Component_Type"]          = "bought_out"
+                result_rows.append(rd)
+
+        except Exception as e:
+            for c in batch:
+                rd = c["row"].copy()
+                rd.update(_zero_cost_row("bought_out", f"Error: {str(e)[:80]}"))
+                result_rows.append(rd)
+
+        if i + BO_BATCH < len(bo_items):
+            time.sleep(3)
+
+    # ── COMPLIANCE / ZERO-COST ────────────────────────────────────
+    for c in comp_items:
+        rd = c["row"].copy()
+        rd.update(_zero_cost_row("compliance", "Compliance/assembly item"))
+        result_rows.append(rd)
 
     if progress_callback:
         progress_callback(92, "Compiling should-cost report...")
@@ -1372,46 +1213,641 @@ JSON only."""
     return pd.DataFrame(result_rows)
 
 
+def _zero_cost_row(comp_type, note=""):
+    return {
+        "Raw_Material_INR": 0, "Machining_INR": 0,
+        "Total_Manufacturing_INR": 0,
+        "Unit_Price_INR": 0, "Total_Price_INR": 0,
+        "GST_18pct": 0, "Price_With_GST": 0,
+        "Price_Confidence": "none" if comp_type != "compliance" else "high",
+        "Price_Source": note, "Price_Notes": note,
+        "Component_Type": comp_type,
+    }
+
+
+def build_cost_summary(priced_df):
+    """Build should-cost summary. No overhead/margin — raw manufacturing only."""
+    if priced_df is None or priced_df.empty:
+        return {}
+
+    def _s(col):
+        return int(priced_df[col].sum()) if col in priced_df.columns else 0
+
+    total_raw  = _s("Raw_Material_INR")
+    total_mach = _s("Machining_INR")
+    total_mfg  = _s("Total_Manufacturing_INR")
+    total_gst  = _s("GST_18pct")
+    total_inc  = _s("Price_With_GST")
+
+    sub_col    = "Sub_Assembly" if "Sub_Assembly" in priced_df.columns else "Section"
+    sub_totals = (priced_df.groupby(sub_col)["Total_Price_INR"]
+                  .sum().sort_values(ascending=False).to_dict()
+                  if "Total_Price_INR" in priced_df.columns else {})
+
+    top5 = (priced_df.nlargest(5, "Total_Price_INR")
+            [["Component", "Total_Price_INR",
+              "Raw_Material_INR", "Machining_INR",
+              "Price_Confidence", "Price_Source"]]
+            .to_dict("records")) if "Total_Price_INR" in priced_df.columns else []
+
+    conf       = priced_df["Price_Confidence"].value_counts().to_dict() \
+                 if "Price_Confidence" in priced_df.columns else {}
+    type_split = priced_df["Component_Type"].value_counts().to_dict() \
+                 if "Component_Type" in priced_df.columns else {}
+
+    return {
+        "total_raw_material":  total_raw,
+        "total_machining":     total_mach,
+        "total_ex_gst":        total_mfg,
+        "total_gst":           total_gst,
+        "total_incl_gst":      total_inc,
+        "sub_totals":          {k: int(v) for k, v in sub_totals.items()},
+        "top5_drivers":        top5,
+        "confidence":          conf,
+        "component_count":     len(priced_df),
+        "type_split":          type_split,
+        "note": (
+            "Should-Cost = Raw Material (live prices) + Machining only. "
+            "NO overhead, NO margin. "
+            "Difference vs actual PO = supplier's overhead + profit."
+        ),
+    }
+#
+#  MANUFACTURED items (supplier makes in his shop):
+#  ┌─────────────────────────────────────────────────────────────┐
+#  │ 1. Raw Material    = weight × LME/SAIL/market rate (₹/kg)  │
+#  │    → LLM searches: "SS316 casting scrap price India today"  │
+#  │ 2. Machining       = hours × shop rate (₹/hr)              │
+#  │    → LLM searches: "CNC turning rate India per hour 2025"   │
+#  │ 3. Welding/FAB     = joints × weld rate or ₹/kg fab        │
+#  │ 4. Surface treat   = area/weight × treatment rate           │
+#  │ 5. QC/Testing      = % of manufactured cost                 │
+#  │ ─────────────────────────────────────────────              │
+#  │    Manufactured Cost = sum of above                         │
+#  └─────────────────────────────────────────────────────────────┘
+#
+#  BOUGHT-OUT items (supplier just procures from OEM):
+#  ┌─────────────────────────────────────────────────────────────┐
+#  │ 1. OEM market price → LLM searches IndiaMART/TradeIndia    │
+#  │ 2. Supplier markup  = 5–8% on bought-out                   │
+#  │ ─────────────────────────────────────────────              │
+#  │    Bought-out cost = OEM price + markup                     │
+#  └─────────────────────────────────────────────────────────────┘
+#
+#  SUPPLIER OVERHEAD on total manufactured cost:
+#  ┌─────────────────────────────────────────────────────────────┐
+#  │ Factory overhead   = 25–35% of manufactured cost            │
+#  │ Profit margin      = 10–15% of (manufactured + overhead)    │
+#  │ ─────────────────────────────────────────────              │
+#  │ SELLING PRICE = manufactured + overhead + margin            │
+#  └─────────────────────────────────────────────────────────────┘
+#
+# The LLM searches the internet for EACH rate, not the final price.
+# This makes the model transparent and verifiable.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── CLASSIFICATION: what type is each component ──────────────────
+# Determines which cost model to apply
+
+def _classify_component(component_name, moc="", description=""):
+    """Classify component as 'manufactured', 'bought_out', or 'compliance'.
+    Returns (category, sub_type)."""
+    comp = (component_name or "").upper()
+    moc_u = (moc or "").upper()
+
+    # ── BOUGHT-OUT: supplier doesn't make, just buys from OEM ─────
+    if any(x in comp for x in ["ELECTRIC MOTOR", "SCIM", "SQUIRREL CAGE"]):
+        return "bought_out", "motor"
+    if "MOTOR" in comp and not any(x in comp for x in
+            ["BOLT", "MOUNT", "BASE", "PULLEY", "SIDE", "BRACKET", "HOUSING"]):
+        return "bought_out", "motor"
+    if "BEARING" in comp and "HOUSING" not in comp and "BRACKET" not in comp:
+        return "bought_out", "bearing"
+    if any(x in comp for x in ["MECHANICAL SEAL", "MECH SEAL", "CARTRIDGE SEAL",
+                                "LIP SEAL", "OIL SEAL"]):
+        return "bought_out", "seal"
+    if "SLD" in comp and "DEVICE" in comp:
+        return "bought_out", "seal_accessory"
+    if any(x in comp for x in ["V-BELT", "V BELT", "VBELT", "TIMING BELT"]):
+        return "bought_out", "vbelt"
+    if "COMPANION FLANGE" in comp or "COUNTER FLANGE" in comp:
+        return "bought_out", "flange_set"
+    if any(x in comp for x in ["SPIRAL WOUND GASKET", "RING JOINT GASKET",
+                                "COMPRESSED FIBRE GASKET"]):
+        return "bought_out", "gasket"
+    if "FOUNDATION" in comp and "BOLT" in comp:
+        return "bought_out", "foundation_bolt"
+    if "ANCHOR BOLT" in comp:
+        return "bought_out", "foundation_bolt"
+    if any(x in comp for x in ["FIRST FILL", "GREASE FILL", "OIL FILL",
+                                "LUBRICANT FILL"]):
+        return "bought_out", "lubricant"
+    if "BELT GUARD" in comp or "COUPLING GUARD" in comp:
+        return "bought_out", "guard"
+    if any(x in comp for x in ["RTD", "THERMOCOUPLE", "DIAL THERMOMETER",
+                                "PRESSURE GAUGE", "VIBRATION SWITCH",
+                                "LEVEL SWITCH", "FLOW METER"]):
+        return "bought_out", "instrument"
+    if "GASKET" in comp:
+        return "bought_out", "gasket"
+
+    # ── COMPLIANCE / ZERO COST ────────────────────────────────────
+    if any(x in comp for x in ["COMPLETE ASSEMBLY", "COMPLETE PUMP",
+                                "NOISE LEVEL", "VIBRATION LIMIT",
+                                "SURFACE PREP", "PERFORMANCE TEST",
+                                "FACTORY TEST", "HYDRO TEST"]):
+        return "compliance", "none"
+
+    # ── MANUFACTURED: supplier makes in his workshop ──────────────
+    if "CASING" in comp and "BOLT" not in comp:
+        if any(x in comp for x in ["PUMP CASING", "VOLUTE", "SPIRAL"]):
+            return "manufactured", "pump_casing"
+        if "BEARING" in comp:
+            return "manufactured", "bearing_housing"
+        return "manufactured", "casing_general"
+
+    if "IMPELLER" in comp and "WEAR" not in comp and "NUT" not in comp:
+        return "manufactured", "impeller"
+    if "WEAR RING" in comp:
+        return "manufactured", "wear_ring"
+    if "SHAFT SLEEVE" in comp or "SLEEVE" in comp:
+        return "manufactured", "shaft_sleeve"
+    if "SHAFT" in comp and "KEY" not in comp and "SLEEVE" not in comp:
+        return "manufactured", "shaft"
+    if "BEARING HOUSING" in comp or "PEDESTAL" in comp:
+        return "manufactured", "bearing_housing"
+    if "GLAND" in comp or "SEAL PLATE" in comp or "STUFFING BOX" in comp:
+        return "manufactured", "gland_plate"
+    if "PULLEY" in comp or "SHEAVE" in comp:
+        return "manufactured", "pulley"
+    if any(x in comp for x in ["BASE FRAME", "BASEPLATE", "BASE PLATE",
+                                "COMMON BASE", "SKID"]):
+        return "manufactured", "baseframe"
+    if "KEY" in comp or "KEYWAY" in comp:
+        return "manufactured", "key"
+    if any(x in comp for x in ["BOLT", "NUT", "STUD", "FASTENER",
+                                "HARDWARE", "SCREW"]):
+        return "manufactured", "fastener"
+    if "NOZZLE" in comp:
+        return "manufactured", "nozzle"
+    if "DIFFUSER" in comp or "RETURN CHANNEL" in comp:
+        return "manufactured", "diffuser"
+    if "COUPLING HALF" in comp or "HUB" in comp:
+        return "manufactured", "coupling_half"
+    if "DIAPHRAGM" in comp:
+        return "manufactured", "diaphragm"
+
+    # Default: manufactured
+    return "manufactured", "general"
+
+
+# ── SHOULD-COST SYSTEM PROMPT ─────────────────────────────────────
+SHOULD_COST_SYSTEM = """You are a senior cost engineer at an Indian EPC company.
+Your job is to estimate the MANUFACTURING COST (should-cost) of engineered components.
+
+This is NOT the market selling price. This is what it actually COSTS the supplier to make.
+
+For each component you MUST break down:
+1. Raw Material Cost: actual grade × weight × current Indian market rate (₹/kg)
+   - Search "SS316 scrap price India 2025" or "IS 2062 steel plate price"
+   - Use SAIL, RINL, LME India, or Metal Bulletin rates
+   - This is raw stock cost, NOT finished price
+
+2. Machining/Processing Cost: based on actual operations needed
+   - Turning/milling: ₹800-1500/hr for CNC, ₹400-600/hr for conventional
+   - Welding: ₹500-900/hr MIG/TIG, ₹300-500/hr arc
+   - Pattern+moulding (castings): ₹15-25/kg of casting weight
+   - Heat treatment: ₹8-15/kg
+   - Estimate hours realistically from complexity
+
+3. Surface Treatment: painting, plating, shot blast
+   - Industrial primer+topcoat: ₹25-40/sqm
+   - Shot blasting: ₹8-12/sqm
+
+4. Quality/Testing: 2-4% of manufacturing cost for routine, 5-8% for critical
+
+The LLM should SEARCH for current rates, not guess from memory.
+Give actual numbers with source. Be conservative (lower bound of range).
+All amounts in Indian Rupees (INR)."""
+
+
+def _build_should_cost_prompt(component, moc, weight_kg, qty, sub_type,
+                               pump_specs, category):
+    """Build a targeted search+calculate prompt for one component or batch."""
+
+    pump_fluid = (pump_specs or {}).get("fluid", "water")
+    pump_kw    = (pump_specs or {}).get("motor_kw", "")
+
+    if category == "bought_out":
+        return f"""Find the current MARKET PRICE (what the pump vendor PAYS to procure this):
+
+Component: {component}
+MOC/Spec:  {moc}
+Qty:       {qty}
+Pump fluid: {pump_fluid}
+Pump size:  {pump_kw} kW
+
+Search IndiaMART / TradeIndia for current Indian market price.
+The vendor adds 5-8% markup on top when selling to us.
+
+Return JSON:
+{{
+  "component": "{component}",
+  "oem_market_price_inr": <integer, what vendor pays to OEM>,
+  "vendor_markup_pct": <5 to 8>,
+  "vendor_cost_inr": <oem_price + markup>,
+  "search_source": "IndiaMART / TradeIndia / IEEMA / etc",
+  "basis": "brief explanation of how you arrived at this price"
+}}"""
+
+    else:  # manufactured
+        return f"""Calculate the MANUFACTURING COST (should-cost) for this component.
+Break down every cost layer. Search for current Indian rates.
+
+Component:   {component}
+Material:    {moc}
+Weight:      {weight_kg} kg (finished)
+Qty:         {qty}
+Sub-type:    {sub_type}
+Pump fluid:  {pump_fluid}
+
+Step 1 — Search current raw material rate for "{moc}" in India (₹/kg):
+  Examples: SAIL HR coil, RINL billet, SS316 scrap, A532 high chrome castings
+  Gross weight for castings = finished weight × 1.35 (allowance for risers/gates)
+  Gross weight for forgings/bar = finished weight × 1.15
+
+Step 2 — List machining operations needed and estimate hours:
+  e.g. rough turning 2hr, finish bore 1hr, face milling 0.5hr, heat treat...
+
+Step 3 — Any surface treatment? (painting, plating, shot blast)
+
+Step 4 — QC/testing cost (% of manufacturing)
+
+Return JSON:
+{{
+  "component": "{component}",
+  "raw_material_rate_per_kg": <current ₹/kg from search>,
+  "gross_weight_kg": <with allowance>,
+  "raw_material_cost_inr": <rate × gross_weight × qty>,
+  "machining_operations": ["op1 X hrs", "op2 Y hrs"],
+  "machining_cost_inr": <total machining>,
+  "surface_treatment_cost_inr": <0 if none>,
+  "qc_cost_inr": <2-5% of above total>,
+  "total_manufacturing_cost_inr": <sum of all above>,
+  "material_source": "SAIL/RINL/LME/IndiaMART/etc",
+  "basis": "brief calculation summary"
+}}"""
+
+
+def claude_price_bom(bom_df, pump_specs, progress_callback=None):
+    """
+    LLM-DRIVEN SHOULD-COST MODEL.
+    
+    The LLM searches for EACH cost layer (raw material, machining, surface)
+    independently, then sums them up. Transparent and verifiable.
+    
+    Cost stack:
+      Manufactured: Raw Material + Machining + Surface + QC
+      Bought-out:   OEM Market Price + Vendor Markup (5-8%)
+      Supplier overhead on total: ~30% factory overhead + 12% margin
+    """
+    if bom_df is None or bom_df.empty:
+        return bom_df
+
+    pump = pump_specs if isinstance(pump_specs, dict) else {}
+
+    if progress_callback:
+        progress_callback(8, "Classifying components: manufactured vs bought-out...")
+
+    # ── Step 1: Classify all components ──────────────────────────
+    classified = []
+    for _, row in bom_df.iterrows():
+        comp  = str(row.get("Component", ""))
+        moc   = str(row.get("MOC", ""))
+        desc  = str(row.get("Description", ""))
+        cat, sub = _classify_component(comp, moc, desc)
+        classified.append({
+            "row":     row.to_dict(),
+            "no":      row.get("No", 0),
+            "comp":    comp,
+            "moc":     moc,
+            "weight":  row.get("Weight_kg"),
+            "qty":     str(row.get("Qty", "1")),
+            "cat":     cat,
+            "sub":     sub,
+        })
+
+    mfg_items  = [c for c in classified if c["cat"] == "manufactured"]
+    bo_items   = [c for c in classified if c["cat"] == "bought_out"]
+    comp_items = [c for c in classified if c["cat"] == "compliance"]
+
+    total = len(classified)
+    if progress_callback:
+        progress_callback(12, f"Found {len(mfg_items)} manufactured, "
+                              f"{len(bo_items)} bought-out, "
+                              f"{len(comp_items)} compliance items.")
+
+    result_rows = []
+    priced_count = 0
+
+    # ── Step 2: Price manufactured items via LLM should-cost ─────
+    # Batch 3-4 similar items per call to stay within rate limits
+    MFG_BATCH = 3
+
+    for batch_start in range(0, len(mfg_items), MFG_BATCH):
+        batch = mfg_items[batch_start:batch_start + MFG_BATCH]
+
+        pct = 15 + int((batch_start / max(len(mfg_items), 1)) * 45)
+        if progress_callback:
+            names = ", ".join(c["comp"][:25] for c in batch)
+            progress_callback(pct, f"Should-costing: {names}...")
+
+        # Build a combined prompt for the batch
+        batch_items_str = json.dumps([{
+            "no":        c["no"],
+            "component": c["comp"],
+            "moc":       c["moc"],
+            "weight_kg": c["weight"],
+            "qty":       c["qty"],
+            "sub_type":  c["sub"],
+        } for c in batch], default=str)
+
+        prompt = f"""Calculate MANUFACTURING COST (should-cost) for each component.
+Search for CURRENT Indian market rates (2025-26) for raw materials.
+
+Pump context: {json.dumps({
+    "fluid": pump.get("fluid",""),
+    "motor_kw": pump.get("motor_kw",""),
+    "type": pump.get("type","")
+}, default=str)}
+
+Components:
+{batch_items_str}
+
+For EACH component, find:
+1. Raw material rate (₹/kg) — search SAIL/RINL/LME India/IndiaMART for current price
+   - Gross weight = finished weight × 1.35 (castings) or × 1.15 (forgings/bar)
+2. Machining cost (₹) — realistic hours × shop rate
+   - CNC turning/boring: ₹1000-1500/hr
+   - Conventional: ₹500-700/hr  
+   - Casting pattern+mould: ₹18-22/kg gross weight
+3. Surface treatment (₹) — painting/shot blast if needed
+4. QC/testing (₹) — 3-5% of manufacturing cost
+5. Supplier overhead: 30% of manufactured cost (factory overhead, power, labour burden)
+6. Supplier profit: 12% of (manufactured + overhead)
+7. Selling price to Zetwerk = manufactured + overhead + profit
+
+Return JSON array:
+[{{
+  "no": <item no>,
+  "raw_material_rate_inr_per_kg": <₹/kg>,
+  "raw_material_cost_inr": <int>,
+  "machining_cost_inr": <int>,
+  "surface_cost_inr": <int>,
+  "qc_cost_inr": <int>,
+  "manufactured_cost_inr": <sum of above 4>,
+  "supplier_overhead_inr": <30% of manufactured>,
+  "supplier_profit_inr": <12% of manufactured+overhead>,
+  "selling_price_inr": <total>,
+  "material_source": "SAIL/RINL/LME/etc",
+  "confidence": "high|medium|low",
+  "basis": "brief: rate source + key operations"
+}}]
+JSON only."""
+
+        try:
+            raw, provider = _call_llm(prompt, system=SHOULD_COST_SYSTEM, max_tokens=3000)
+            parsed = _parse_json(raw)
+            if not isinstance(parsed, list):
+                parsed = [parsed] if isinstance(parsed, dict) else []
+
+            price_map = {p["no"]: p for p in parsed
+                         if isinstance(p, dict) and "no" in p}
+
+            for c in batch:
+                rd  = c["row"].copy()
+                p   = price_map.get(c["no"], {})
+                raw_mat  = int(p.get("raw_material_cost_inr", 0))
+                mach     = int(p.get("machining_cost_inr", 0))
+                surface  = int(p.get("surface_cost_inr", 0))
+                qc       = int(p.get("qc_cost_inr", 0))
+                mfg_cost = int(p.get("manufactured_cost_inr", raw_mat+mach+surface+qc))
+                overhead = int(p.get("supplier_overhead_inr", mfg_cost * 0.30))
+                profit   = int(p.get("supplier_profit_inr", (mfg_cost+overhead) * 0.12))
+                selling  = int(p.get("selling_price_inr", mfg_cost+overhead+profit))
+                gst      = int(selling * 0.18)
+
+                rd["Raw_Material_INR"]      = raw_mat
+                rd["Machining_INR"]         = mach
+                rd["Surface_INR"]           = surface
+                rd["QC_INR"]               = qc
+                rd["Manufactured_Cost_INR"] = mfg_cost
+                rd["Supplier_Overhead_INR"] = overhead
+                rd["Supplier_Profit_INR"]   = profit
+                rd["Unit_Price_INR"]        = selling
+                rd["Total_Price_INR"]       = selling
+                rd["GST_18pct"]             = gst
+                rd["Price_With_GST"]        = selling + gst
+                rd["Price_Confidence"]      = p.get("confidence", "medium")
+                rd["Price_Source"]          = f"{provider}: {p.get('material_source','')}"
+                rd["Price_Notes"]           = p.get("basis", "")
+                rd["Component_Type"]        = "manufactured"
+                result_rows.append(rd)
+                priced_count += 1
+
+        except Exception as e:
+            for c in batch:
+                rd = c["row"].copy()
+                rd.update(_zero_cost_row("manufactured", f"Error: {str(e)[:80]}"))
+                result_rows.append(rd)
+
+        # Rate limit guard between batches
+        if batch_start + MFG_BATCH < len(mfg_items):
+            time.sleep(5)
+
+    # ── Step 3: Price bought-out items ────────────────────────────
+    BO_BATCH = 5
+
+    for batch_start in range(0, len(bo_items), BO_BATCH):
+        batch = bo_items[batch_start:batch_start + BO_BATCH]
+
+        pct = 62 + int((batch_start / max(len(bo_items), 1)) * 25)
+        if progress_callback:
+            names = ", ".join(c["comp"][:25] for c in batch)
+            progress_callback(pct, f"Market pricing: {names}...")
+
+        batch_items_str = json.dumps([{
+            "no":        c["no"],
+            "component": c["comp"],
+            "moc":       c["moc"],
+            "weight_kg": c["weight"],
+            "qty":       c["qty"],
+            "sub_type":  c["sub"],
+        } for c in batch], default=str)
+
+        prompt = f"""Find current OEM MARKET PRICES for these bought-out items.
+These are items the pump vendor PROCURES (does not manufacture).
+Search IndiaMART, TradeIndia, IEEMA price index for current 2025-26 rates.
+
+Pump context: motor {pump.get("motor_kw","")} kW, fluid: {pump.get("fluid","")}
+
+Items to price:
+{batch_items_str}
+
+For EACH item:
+- Find what the pump vendor PAYS to the OEM supplier (not retail price)
+- Vendor adds 5-8% markup when selling to Zetwerk
+- For motors: search "ABB/Siemens {pump.get("motor_kw","")}kW HT motor India price"
+- For bearings: search "SKF/TIMKEN bearing price India"
+- For seals: search "EagleBurgmann/John Crane mechanical seal price India"
+- For flanges: search "ANSI 300 flange price India per kg"
+
+Return JSON array:
+[{{
+  "no": <item no>,
+  "oem_price_inr": <what vendor pays to OEM>,
+  "vendor_markup_pct": <5 to 8>,
+  "selling_price_inr": <oem + markup>,
+  "search_source": "IndiaMART/TradeIndia/IEEMA/vendor quote",
+  "confidence": "high|medium|low",
+  "basis": "brief: model/size searched + source"
+}}]
+JSON only."""
+
+        try:
+            raw, provider = _call_llm(prompt, system=SHOULD_COST_SYSTEM, max_tokens=2000)
+            parsed = _parse_json(raw)
+            if not isinstance(parsed, list):
+                parsed = [parsed] if isinstance(parsed, dict) else []
+
+            price_map = {p["no"]: p for p in parsed
+                         if isinstance(p, dict) and "no" in p}
+
+            for c in batch:
+                rd  = c["row"].copy()
+                p   = price_map.get(c["no"], {})
+                oem      = int(p.get("oem_price_inr", 0))
+                markup_p = float(p.get("vendor_markup_pct", 6)) / 100
+                selling  = int(p.get("selling_price_inr", int(oem * (1 + markup_p))))
+                gst      = int(selling * 0.18)
+
+                rd["Raw_Material_INR"]      = oem
+                rd["Machining_INR"]         = 0
+                rd["Surface_INR"]           = int(oem * markup_p)
+                rd["QC_INR"]               = 0
+                rd["Manufactured_Cost_INR"] = oem
+                rd["Supplier_Overhead_INR"] = int(oem * markup_p)
+                rd["Supplier_Profit_INR"]   = 0
+                rd["Unit_Price_INR"]        = selling
+                rd["Total_Price_INR"]       = selling
+                rd["GST_18pct"]             = gst
+                rd["Price_With_GST"]        = selling + gst
+                rd["Price_Confidence"]      = p.get("confidence", "medium")
+                rd["Price_Source"]          = f"{provider}: {p.get('search_source','')}"
+                rd["Price_Notes"]           = p.get("basis", "")
+                rd["Component_Type"]        = "bought_out"
+                result_rows.append(rd)
+                priced_count += 1
+
+        except Exception as e:
+            for c in batch:
+                rd = c["row"].copy()
+                rd.update(_zero_cost_row("bought_out", f"Error: {str(e)[:80]}"))
+                result_rows.append(rd)
+
+        if batch_start + BO_BATCH < len(bo_items):
+            time.sleep(3)
+
+    # ── Step 4: Compliance / zero-cost items ─────────────────────
+    for c in comp_items:
+        rd = c["row"].copy()
+        rd.update(_zero_cost_row("compliance", "Compliance/assembly item"))
+        result_rows.append(rd)
+
+    if progress_callback:
+        progress_callback(92, f"Should-costed {priced_count}/{total} components. "
+                              f"Building report...")
+
+    return pd.DataFrame(result_rows)
+
+
+def _zero_cost_row(comp_type, note=""):
+    """Return a zero-cost dict for failed / compliance items."""
+    return {
+        "Raw_Material_INR": 0, "Machining_INR": 0, "Surface_INR": 0,
+        "QC_INR": 0, "Manufactured_Cost_INR": 0,
+        "Supplier_Overhead_INR": 0, "Supplier_Profit_INR": 0,
+        "Unit_Price_INR": 0, "Total_Price_INR": 0,
+        "GST_18pct": 0, "Price_With_GST": 0,
+        "Price_Confidence": "none" if comp_type != "compliance" else "high",
+        "Price_Source": note, "Price_Notes": note,
+        "Component_Type": comp_type,
+    }
+
+
 def build_cost_summary(priced_df):
     """Build a should-cost summary from priced BOM."""
     if priced_df is None or priced_df.empty:
         return {}
 
-    total_raw  = int(priced_df.get("Raw_Material_INR", pd.Series([0])).sum())
-    total_mach = int(priced_df.get("Machining_INR", pd.Series([0])).sum())
-    total_surf = int(priced_df.get("Surface_INR", pd.Series([0])).sum())
-    total_ex   = int(priced_df["Total_Price_INR"].sum())
-    total_gst  = int(priced_df["GST_18pct"].sum())
-    total_inc  = int(priced_df["Price_With_GST"].sum())
+    def _safe_sum(col):
+        return int(priced_df[col].sum()) if col in priced_df.columns else 0
 
-    sub_col = "Sub_Assembly" if "Sub_Assembly" in priced_df.columns else "Section"
+    total_raw     = _safe_sum("Raw_Material_INR")
+    total_mach    = _safe_sum("Machining_INR")
+    total_surface = _safe_sum("Surface_INR")
+    total_qc      = _safe_sum("QC_INR")
+    total_mfg     = _safe_sum("Manufactured_Cost_INR")
+    total_ovhd    = _safe_sum("Supplier_Overhead_INR")
+    total_profit  = _safe_sum("Supplier_Profit_INR")
+    total_ex      = _safe_sum("Total_Price_INR")
+    total_gst     = _safe_sum("GST_18pct")
+    total_inc     = _safe_sum("Price_With_GST")
+
+    sub_col    = "Sub_Assembly" if "Sub_Assembly" in priced_df.columns else "Section"
     sub_totals = (priced_df.groupby(sub_col)["Total_Price_INR"]
                   .sum().sort_values(ascending=False).to_dict())
 
     top5 = (priced_df.nlargest(5, "Total_Price_INR")
-            [["Component","Description","Total_Price_INR","Price_Confidence"]]
-            .to_dict("records"))
+            [["Component", "Description", "Total_Price_INR",
+              "Manufactured_Cost_INR", "Price_Confidence"]]
+            .to_dict("records")) if "Total_Price_INR" in priced_df.columns else []
 
-    conf = priced_df["Price_Confidence"].value_counts().to_dict()
+    conf = priced_df["Price_Confidence"].value_counts().to_dict() \
+        if "Price_Confidence" in priced_df.columns else {}
 
-    # Count manufactured vs bought-out
-    type_col = "Component_Type" if "Component_Type" in priced_df.columns else None
-    type_split = priced_df[type_col].value_counts().to_dict() if type_col else {}
+    type_split = priced_df["Component_Type"].value_counts().to_dict() \
+        if "Component_Type" in priced_df.columns else {}
+
+    # Supplier margin % — what's on top of manufactured cost
+    supplier_add = total_ovhd + total_profit
+    supplier_margin_pct = round(supplier_add / max(total_mfg, 1) * 100, 1)
 
     return {
-        "total_raw_material": total_raw,
-        "total_machining":    total_mach,
-        "total_surface":      total_surf,
-        "total_ex_gst":       total_ex,
-        "total_gst":          total_gst,
-        "total_incl_gst":     total_inc,
-        "sub_totals":         {k: int(v) for k, v in sub_totals.items()},
-        "top5_drivers":       top5,
-        "confidence":         conf,
-        "component_count":    len(priced_df),
-        "type_split":         type_split,
-        "note": ("SHOULD-COST estimate: supplier's manufacturing cost, not selling price. "
-                 "Use for procurement negotiation. Verify with vendor quotation."),
+        # Cost stack breakdown
+        "total_raw_material":  total_raw,
+        "total_machining":     total_mach,
+        "total_surface":       total_surface,
+        "total_qc":            total_qc,
+        "total_manufactured":  total_mfg,
+        "total_overhead":      total_ovhd,
+        "total_profit":        total_profit,
+        # Totals
+        "total_ex_gst":        total_ex,
+        "total_gst":           total_gst,
+        "total_incl_gst":      total_inc,
+        # Analytics
+        "supplier_margin_pct": supplier_margin_pct,
+        "sub_totals":          {k: int(v) for k, v in sub_totals.items()},
+        "top5_drivers":        top5,
+        "confidence":          conf,
+        "component_count":     len(priced_df),
+        "type_split":          type_split,
+        "note": (
+            "SHOULD-COST model: raw material + machining + overhead + margin. "
+            f"Supplier adds ~{supplier_margin_pct}% on top of manufacturing cost. "
+            "Use this to negotiate. Ask supplier to justify his cost build-up."
+        ),
     }
 
 
