@@ -614,13 +614,58 @@ elif st.session_state.page == "pricing":
         with tab1:
             ca, cb = st.columns([3,2])
             with ca:
-                st.markdown('<div class="sec-hdr">Cost by Sub-Assembly</div>',
+                st.markdown('<div class="sec-hdr">Should-Cost Breakdown (Raw Manufacturing Only)</div>',
                             unsafe_allow_html=True)
-                sub_t = cs.get("sub_totals",{})
+
+                # Simple two-bar waterfall
+                total_rm   = cs.get("total_raw_material", 0)
+                total_mach = cs.get("total_machining", 0)
+                total_mfg  = cs.get("total_ex_gst", 1)
+
+                for label, val, clr in [
+                    ("Raw Material (live prices)", total_rm,   "#58a6ff"),
+                    ("Machining & Processing",     total_mach, "#3fb950"),
+                ]:
+                    if val <= 0:
+                        continue
+                    pct_t = val / max(total_mfg, 1) * 100
+                    bar_w = int(pct_t)
+                    st.markdown(
+                        f'<div style="margin:6px 0;">'
+                        f'<div style="display:flex;justify-content:space-between;">'
+                        f'<span style="color:#e6edf3;font-size:13px;font-weight:500;">{label}</span>'
+                        f'<span style="color:{clr};font-family:IBM Plex Mono;font-size:13px;">'
+                        f'₹{val:,.0f} ({pct_t:.1f}%)</span></div>'
+                        f'<div class="wt-bar" style="height:10px;margin-top:4px;">'
+                        f'<div class="wt-fill" style="background:{clr};width:{bar_w}%;height:10px;"></div>'
+                        f'</div></div>',
+                        unsafe_allow_html=True)
+
+                st.markdown(
+                    f'<div style="border-top:1px solid #30363d;margin:12px 0;padding-top:10px;">'
+                    f'<div style="display:flex;justify-content:space-between;">'
+                    f'<span style="color:#e6edf3;font-size:14px;font-weight:700;">Total Should-Cost</span>'
+                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:15px;font-weight:700;">'
+                    f'₹{total_mfg:,.0f}</span></div>'
+                    f'<span style="color:#8b949e;font-size:11px;">Raw material + machining only. '
+                    f'No overhead. No margin.</span></div>',
+                    unsafe_allow_html=True)
+
+                st.markdown(
+                    f'<div class="card-amber" style="margin-top:10px;">'
+                    f'<b style="color:#d29922;">Difference vs PO price = Supplier\'s overhead + profit</b><br>'
+                    f'<span style="color:#8b949e;font-size:12px;">{cs.get("note","")}</span>'
+                    f'</div>', unsafe_allow_html=True)
+
+                st.markdown('<div class="sec-hdr" style="margin-top:16px;">Cost by Sub-Assembly</div>',
+                            unsafe_allow_html=True)
+                sub_t = cs.get("sub_totals", {})
                 max_v = max(sub_t.values()) if sub_t else 1
                 for sub, val in sub_t.items():
+                    if val <= 0:
+                        continue
                     pct = int(val / max_v * 100)
-                    pct_t = val / max(cs["total_ex_gst"],1) * 100
+                    pct_t = val / max(total_mfg, 1) * 100
                     st.markdown(
                         f'<div style="margin:5px 0;">'
                         f'<div style="display:flex;justify-content:space-between;">'
@@ -654,11 +699,13 @@ elif st.session_state.page == "pricing":
                 f'</div>', unsafe_allow_html=True)
 
         with tab2:
-            show = [c for c in ["No","Component","Description","MOC","Qty",
-                                "Weight_kg","Unit_Price_INR","Total_Price_INR",
-                                "GST_18pct","Price_With_GST",
-                                "Price_Confidence","Price_Source"]
-                    if c in priced.columns]
+            show = [c for c in [
+                "No", "Component", "MOC", "Weight_kg", "Qty",
+                "Component_Type",
+                "Raw_Material_INR", "Machining_INR",
+                "Total_Manufacturing_INR",
+                "Price_Confidence", "Price_Source", "Price_Notes",
+            ] if c in priced.columns]
             disp = priced[show].copy()
             for pc in ["Unit_Price_INR","Total_Price_INR","GST_18pct","Price_With_GST"]:
                 if pc in disp.columns:
