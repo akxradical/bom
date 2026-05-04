@@ -291,7 +291,7 @@ def _call_claude(prompt, system="", max_tokens=4000):
     except ImportError:
         raise ValueError("pip install anthropic needed for Claude fallback")
     client = anthropic.Anthropic(api_key=key)
-    kwargs = {"model": "claude-sonnet-4-5", "max_tokens": max_tokens,
+    kwargs = {"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
               "messages": [{"role": "user", "content": prompt}]}
     if system:
         kwargs["system"] = system
@@ -549,59 +549,53 @@ rotating equipment (pumps, compressors, turbines) for EPC projects in India.
 Your job: Read pump datasheets, GA drawings, vendor technical documents, and 
 procurement specifications. Extract every technical parameter accurately.
 
-Critical rules:
-- If the document contains multiple pump types (e.g. Hydrant, Spray, Jockey), 
-  identify ALL of them and list each separately.
+CRITICAL — DOCUMENT VALIDATION:
+- If the uploaded document is NOT a pump datasheet (e.g. it is a motor-only spec, 
+  valve datasheet, civil drawing, etc.), you MUST still extract what you can BUT 
+  set "document_type" to the correct type and set "is_pump_document": false.
+- A pump document must contain pump performance data: flow rate AND head.
+- A motor-only datasheet has kW, voltage, poles but NO flow/head — this is NOT a 
+  pump datasheet. Extract motor specs but flag it clearly.
+
+Other rules:
+- If the document contains multiple pump types, identify ALL of them separately.
 - Convert all units to SI: flow in m³/h, head in metres, power in kW, temp in °C.
-- If head is in mWC, mlc, or kPa — convert to metres.
-- If flow is in LPM, LPS, USGPM, l/s — convert to m³/h.
-- If power is in HP/BHP — convert to kW (×0.7457).
-- Extract Material of Construction (MOC) for every component mentioned.
-- Identify the pump type: HSC, VTP, Slurry, Sump, Multistage, etc.
-- Note manufacturer, model, tag numbers, project details.
+- Extract MOC for every component mentioned.
 - If a field says "VTA" or "Bidder to furnish" → mark as null, don't guess.
-- Read EVERY row carefully: vendor response columns often contain the actual 
-  values (materials, dimensions, weights) even when the spec column says VTA.
-- Pay special attention to:
-  * Nozzle sizes and ratings from the nozzle schedule
-  * All MOC entries including casing bolts, bearing housing, base plate
-  * Weights section (total, heaviest part, transport)
-  * Seal type, seal plan, and seal accessories
-  * Drive type (direct/belt/gear) and coupling details
-  * Motor electrical data (voltage, frequency, poles)
-  * NPSHA/NPSHR values
-  * Vibration and noise limits"""
+- Read vendor response columns carefully — they contain actual values.
+- Pay attention to: nozzle sizes/ratings, all MOC, weights, seal type/plan,
+  drive type, motor electrical data, NPSHA/NPSHR, vibration/noise limits."""
 
 
 def claude_extract_specs(pdf_text):
-    """
-    Send PDF text to Claude. Returns structured specs dict.
-    Handles multi-pump documents automatically.
-    """
-    prompt = f"""Read this pump technical document and extract ALL pump specifications.
-Pay careful attention to the VENDOR RESPONSE column — it often contains the actual
-values when the specification column says "VTA" (Vendor to Advise).
+    """Extract specs from PDF text. Works for pump datasheets, GA drawings, specs."""
+    prompt = f"""Read this technical document and extract all specifications.
 
 DOCUMENT TEXT:
 {pdf_text[:15000]}
 
-Respond with ONLY a JSON object (no other text):
+IMPORTANT: First check if this is a PUMP datasheet (has flow rate + head) or something else
+(motor-only, valve, instrument, etc.). Set "is_pump_document" accordingly.
+
+Respond with ONLY this JSON (no other text):
 {{
-  "document_type": "vendor_datasheet | procurement_spec | ga_drawing | manual",
-  "project": "project name if mentioned",
+  "document_type": "pump_datasheet | motor_datasheet | valve_datasheet | ga_drawing | procurement_spec | other",
+  "is_pump_document": true or false,
+  "document_warning": "null if pump doc, else brief note e.g. 'Motor-only datasheet — no pump specs found'",
+  "project": "project name or null",
   "manufacturer": "manufacturer name or null",
   "multi_pump": true/false,
   
   "pumps": [
     {{
       "pump_label": "descriptive name e.g. Feed Liquor Booster Pump",
-      "model": "pump model or null",
+      "model": "model or null",
       "manufacturer": "name or null",
-      "type": "Horizontal Centrifugal | Horizontal Split Casing | Vertical Turbine | Slurry | Sump | Multistage | Other",
+      "type": "Horizontal Centrifugal | Vertical Turbine | Slurry | Sump | Multistage | Other",
       "tag_numbers": "tag nos or null",
       "standard": "API 610 | IS 5120 | ISO 9906 | etc or null",
-      "quantity": "total number of pump units or null",
-      "configuration": "1W+1S per stream etc or null",
+      "quantity": number or null,
+      "configuration": "1W+1S etc or null",
       
       "flow_m3h": number or null,
       "head_m": number or null,
@@ -611,7 +605,7 @@ Respond with ONLY a JSON object (no other text):
       "stages": number or null,
       "temp_c": number or null,
       "density_kgm3": number or null,
-      "fluid": "fluid name",
+      "fluid": "fluid name or null",
       "viscosity": "value with unit or null",
       "npsha_m": number or null,
       "npshr_m": number or null,
@@ -621,27 +615,27 @@ Respond with ONLY a JSON object (no other text):
       "impeller_dia_mm": number or null,
       
       "moc": {{
-        "casing": "exact material spec from vendor response, e.g. ASTM A532 Gr.IIIA",
-        "impeller": "exact material spec, e.g. 12% Chrome Steel ASTM A487",
-        "shaft": "exact material spec, e.g. EN-19 / SS410",
-        "shaft_sleeve": "exact material spec, e.g. SS316",
-        "wear_ring": "exact material spec or null",
-        "bearing": "type and make, e.g. Taper roller / TIMKEN",
-        "bearing_housing": "material spec, e.g. Grey Cast Iron",
-        "seal_type": "Single mechanical seal with SLD / gland packing / etc",
-        "seal_plan": "API Plan 62 / Plan 11 / Plan 53B / etc or null",
-        "baseplate": "material spec, e.g. MS (Mild Steel)",
-        "fasteners": "material spec, e.g. A197 2H & A193 B7",
+        "casing": "material spec or null",
+        "impeller": "material spec or null",
+        "shaft": "material spec or null",
+        "shaft_sleeve": "material spec or null",
+        "wear_ring": "material spec or null",
+        "bearing": "type and make or null",
+        "bearing_housing": "material spec or null",
+        "seal_type": "seal type or null",
+        "seal_plan": "API Plan / etc or null",
+        "baseplate": "material spec or null",
+        "fasteners": "material spec or null",
         "gland_plate": "material spec or null",
         "coupling_halves": "material spec or null"
       }},
       
       "nozzles": {{
-        "suction_size": "DN or inch size, e.g. DN200 or 8 inch",
-        "suction_rating": "Class 300 / PN16 / etc",
-        "discharge_size": "DN or inch size, e.g. DN150 or 6 inch",
-        "discharge_rating": "Class 300 / PN16 / etc",
-        "flange_standard": "ANSI B16.5 / IS 6392 / etc"
+        "suction_size": "DN size or null",
+        "suction_rating": "Class/PN or null",
+        "discharge_size": "DN size or null",
+        "discharge_rating": "Class/PN or null",
+        "flange_standard": "ANSI B16.5 / IS 6392 / etc or null"
       }},
 
       "weights": {{
@@ -654,26 +648,26 @@ Respond with ONLY a JSON object (no other text):
       }},
       
       "motor": {{
-        "type": "Squirrel cage / Slip ring / etc",
+        "type": "Squirrel cage / Slip ring / etc or null",
         "rating_kw": number or null,
-        "voltage_v": "690V / 415V / etc",
-        "frequency_hz": 50,
-        "poles": 4,
+        "voltage_v": "voltage or null",
+        "frequency_hz": number or null,
+        "poles": number or null,
         "speed_rpm": number or null,
-        "enclosure": "TEFC / etc or null",
-        "mounting": "by pump vendor / by contractor / etc"
+        "enclosure": "IP55/TEFC/etc or null",
+        "mounting": "B3/B5/etc or null"
       }},
       
       "drive": {{
-        "type": "direct coupled | belt driven | gear driven",
-        "coupling_type": "disc / tyre / gear / V-belt / etc",
+        "type": "direct coupled | belt driven | gear driven or null",
+        "coupling_type": "disc/tyre/gear/V-belt/etc or null",
         "belt_guard": true/false
       }},
       
-      "vibration_limit": "value with unit or null",
+      "vibration_limit": "value or null",
       "noise_limit_dba": number or null,
-      "performance_test_std": "ISO 9906:2012 / etc or null",
-      "surface_prep_spec": "spec reference or null",
+      "performance_test_std": "standard or null",
+      "surface_prep_spec": "spec or null",
       
       "scope": {{
         "pump": true/false,
@@ -687,16 +681,17 @@ Respond with ONLY a JSON object (no other text):
         "suction_strainer": true/false
       }},
       
-      "notes": "any critical notes including vendor remarks"
+      "notes": "critical notes or null"
     }}
   ]
 }}
 
-Be accurate. If data is missing, use null — never guess."""
+If this is NOT a pump document, still fill "pumps" array with whatever equipment data 
+is available, but set is_pump_document: false and document_warning with a clear message.
+Be accurate. Use null for missing fields — never guess."""
 
     raw, provider = _call_llm(prompt, system=SPEC_SYSTEM, max_tokens=6000)
 
-    # Save raw response so app.py can show it for debugging if parse fails
     try:
         import streamlit as st
         st.session_state["_last_raw_response"] = raw[:4000] if raw else ""
@@ -705,19 +700,26 @@ Be accurate. If data is missing, use null — never guess."""
 
     data = _parse_json(raw)
 
-    # If parse completely failed, build a minimal shell so the app doesn't
-    # silently freeze — user will see the debug output in app.py
     if not data or not isinstance(data, dict):
         return None
 
-    # Ensure pumps key always exists as a list
+    # Ensure pumps key exists as a list
     if "pumps" not in data or not isinstance(data.get("pumps"), list):
-        # Sometimes Gemini returns the pump object directly at root level
         if any(k in data for k in ["flow_m3h", "head_m", "motor_kw", "fluid", "type"]):
-            data = {"pumps": [data], "document_type": "vendor_datasheet",
-                    "multi_pump": False, "manufacturer": data.get("manufacturer")}
+            data = {"pumps": [data], "document_type": "pump_datasheet",
+                    "is_pump_document": True, "multi_pump": False,
+                    "manufacturer": data.get("manufacturer")}
         else:
             data["pumps"] = []
+
+    # Default is_pump_document if not set
+    if "is_pump_document" not in data:
+        pumps = data.get("pumps", [])
+        has_pump_data = any(
+            p.get("flow_m3h") or p.get("head_m")
+            for p in pumps if isinstance(p, dict)
+        )
+        data["is_pump_document"] = has_pump_data
 
     data["_llm_provider"] = provider
     return data
@@ -939,7 +941,7 @@ def _call_claude_with_search(prompt, system="", max_tokens=3000):
 
     client = anthropic.Anthropic(api_key=key)
     kwargs = {
-        "model":     "claude-sonnet-4-5",
+        "model":     "claude-sonnet-4-20250514",
         "max_tokens": max_tokens,
         "tools":     [{"type": "web_search_20250305", "name": "web_search"}],
         "messages":  [{"role": "user", "content": prompt}],
