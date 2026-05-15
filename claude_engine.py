@@ -359,14 +359,24 @@ def claude_generate_bom(pump_specs):
     prompt = f"""BOM for:
 {specs_str}
 
-JSON array ONLY:
-[{{"section":"A-L","sub_assembly":"group","component":"name",
+JSON array ONLY. Use EXACT section names below:
+[{{"section":"EXACT NAME FROM LIST","sub_assembly":"group","component":"name",
 "description":"max 40 chars","moc":"ASTM/IS spec","qty":"1",
 "weight_kg":0,"req_type":"M","notes":""}}]
 
-Sections: A.PUMP HYDRAULICS B.ROTATING ASSEMBLY C.BEARINGS D.SHAFT SEALING
-E.DRIVE/COUPLING F.MOTOR G.STRUCTURAL H.PIPING/NOZZLES I.FASTENERS J.INSTRUMENTATION
-K.ACOUSTIC L.COMPLETE ASSEMBLY
+EXACT section names (copy exactly, including spaces and dots):
+"A. PUMP HYDRAULICS"
+"B. ROTATING ASSEMBLY"
+"C. BEARINGS & LUBRICATION"
+"D. SHAFT SEALING"
+"E. DRIVE & COUPLING"
+"F. MOTOR / DRIVER"
+"G. STRUCTURAL"
+"H. PIPING & NOZZLES"
+"I. FASTENERS & GASKETS"
+"J. INSTRUMENTATION"
+"K. ACOUSTIC & SAFETY"
+"L. COMPLETE ASSEMBLY"
 
 MUST include ≥25 items: casing, impeller, wear_rings×2, shaft, sleeve, 
 bearings×2, brg_housing, seal, gland, coupling/drive, motor, baseplate,
@@ -411,7 +421,7 @@ def bom_to_dataframe(bom_list):
         if not isinstance(c, dict): continue
         rows.append({
             "No": i,
-            "Section": str(c.get("section", "")),
+            "Section": _normalize_section(c.get("section", "")),
             "Sub_Assembly": str(c.get("sub_assembly", "")),
             "Component": str(c.get("component", c.get("name", ""))),
             "Description": str(c.get("description", "")),
@@ -429,13 +439,26 @@ def bom_to_dataframe(bom_list):
 # Raw Material (live price) + Machining = True Cost. No overhead.
 # ═══════════════════════════════════════════════════════════════════
 
-COST_SYS = """You are a cost engineer at an Indian EPC company.
-Find RAW MANUFACTURING COST — NOT selling price.
-Use web_search for CURRENT 2025-26 Indian prices from SAIL/RINL/LME/IndiaMART.
+COST_SYS = """You are a cost engineer at an Indian EPC company doing should-cost analysis.
+Find ACTUAL CURRENT manufacturing cost — not selling price, not textbook price.
 
-For MANUFACTURED: raw material (₹/kg × gross weight) + machining cost
-For BOUGHT-OUT: OEM procurement price from IndiaMART/TradeIndia
-NO overhead. NO margin. Conservative estimates. All in INR."""
+Use web_search to find REAL 2025-26 Indian market prices. Search specifically:
+- SAIL/RINL price lists for steel grades
+- LME India for non-ferrous metals  
+- IndiaMART for castings, machined parts, bought-out items
+- TradeIndia for industrial components
+
+IMPORTANT: Do NOT under-estimate. Use REALISTIC prices:
+- Grey cast iron casting (finished+machined): ₹180-220/kg
+- IS 2062 fabricated steel: ₹130-160/kg
+- SS316 casting: ₹750-950/kg
+- High chrome iron A532: ₹900-1200/kg
+- EN-19/EN-24 shaft (bar+machined): ₹400-600/kg
+- CNC machining shop rate: ₹1200-1800/hr
+- Motor (LT 415V): ₹5000-8000/kW
+- Motor (HT 690V): ₹4000-5500/kW
+
+All amounts in INR. No overhead. No margin."""
 
 
 def _classify(comp, moc=""):
@@ -490,21 +513,26 @@ def claude_price_bom(bom_df, pump_specs, progress_callback=None):
         
         items_j = json.dumps([{"no":c["no"],"component":c["comp"],"moc":c["moc"],
                                "weight_kg":c["weight"],"qty":c["qty"]} for c in batch], default=str)
-        prompt = f"""Find RAW MANUFACTURING COST. Pump: {pump.get('type','')}, {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
+        prompt = f"""Should-cost for these components. Pump: {pump.get('type','')}, {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
 
 Components:
 {items_j}
 
-For each: web_search "[MOC] price per kg India 2025", calculate:
-- raw_material_cost = gross_weight (finished×1.35 castings, ×1.15 bar) × ₹/kg
-- machining_cost = hours × rate (CNC ₹1000-1500/hr, pattern+mould ₹18-22/kg)
-- total = raw + machining. NO overhead.
+For EACH component:
+1. web_search: "[exact MOC grade] price per kg India 2025" (e.g. "IS 210 FG200 grey iron casting price India 2025")
+2. Calculate gross weight: castings ×1.35, bar/forging ×1.15
+3. raw_material_cost = gross_weight × ₹/kg from search
+4. machining_cost: use realistic rates — CNC turning/boring ₹1200-1600/hr, pattern+mould ₹20-25/kg gross weight, fabrication welding ₹130-160/kg
+5. total = raw + machining
+
+Use ACTUAL market prices from search. Do not use textbook/theoretical values.
+If search fails, use these floor prices: grey CI ₹190/kg, SS316 ₹850/kg, CS/WCB ₹220/kg, alloy steel bar ₹480/kg, high chrome ₹1000/kg, MS fabricated ₹145/kg.
 
 Return JSON array ONLY:
 [{{"no":<n>,"raw_material_rate_per_kg":<int>,"gross_weight_kg":<num>,
 "raw_material_cost_inr":<int>,"machining_cost_inr":<int>,
-"total_cost_inr":<int>,"material_source":"source",
-"confidence":"high|medium|low","notes":"brief"}}]"""
+"total_cost_inr":<int>,"material_source":"site+query used",
+"confidence":"high|medium|low","notes":"brief calc basis"}}]"""
         
         try:
             raw_resp = _call_claude(prompt, COST_SYS, 2000, use_search=True)
@@ -544,15 +572,35 @@ Return JSON array ONLY:
         
         items_j = json.dumps([{"no":c["no"],"component":c["comp"],"moc":c["moc"],
                                "qty":c["qty"]} for c in batch], default=str)
-        prompt = f"""Find OEM MARKET PRICE. Pump: {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
+        prompt = f"""Find OEM MARKET PRICE for these items. This is what the pump vendor PAYS to procure them.
+Pump: {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
 
 Items:
 {items_j}
 
-web_search IndiaMART/TradeIndia for each. Return what vendor PAYS to OEM.
+For each item use the RIGHT search:
+- Motor: web_search "Kirloskar/ABB/Siemens {pump.get('motor_kw','')}kW {pump.get('motor',{}).get('voltage_v','415V')} motor price India 2025 IndiaMART"
+  Floor: LT 415V = ₹5000-7000/kW, HT 690V = ₹4000-5500/kW
+- Bearing: web_search "SKF/TIMKEN [type] bearing price India IndiaMART 2025"
+  Floor: taper roller medium = ₹6000-12000, large = ₹15000-25000
+- Mechanical seal: web_search "EagleBurgmann mechanical seal [shaft size]mm India price"
+  Floor: single cartridge = ₹45000-150000 depending on size
+- Gasket: web_search "spiral wound gasket [size] ASME B16.20 price India"
+  Floor: per gasket ₹500-2000
+- RTD/Thermowell: web_search "PT100 RTD thermowell SS316 India IndiaMART price"
+  Floor: ₹2500-6000 per unit with thermowell
+- Flanges: web_search "ANSI B16.5 [class] carbon steel flange [size] price India"
+  Floor: per set with gasket+bolts ₹2000-8000
+- Foundation bolts: web_search "anchor bolt M24/M30 price India per piece"
+  Floor: ₹200-500 per bolt
+- V-belts: web_search "industrial V-belt set [kW rating] price India"
+  Floor: ₹8000-25000 per set
+
+Search and find REAL current prices. Use floor prices only if search fails.
 
 Return JSON array ONLY:
-[{{"no":<n>,"market_price_inr":<int>,"source":"src","confidence":"high|medium|low","notes":"brief"}}]"""
+[{{"no":<n>,"market_price_inr":<int>,"search_query":"exact query used",
+"source":"IndiaMART/TradeIndia/etc","confidence":"high|medium|low","notes":"make/model/size referenced"}}]"""
         
         try:
             raw_resp = _call_claude(prompt, COST_SYS, 2000, use_search=True)
@@ -628,9 +676,80 @@ SECTION_ORDER = [
     "J. INSTRUMENTATION","K. ACOUSTIC & SAFETY","L. COMPLETE ASSEMBLY",
 ]
 
+def _normalize_section(s):
+    """Map any Claude section name variation to canonical SECTION_ORDER name."""
+    raw = str(s).strip()
+    upper = raw.upper()
+
+    # Already correct — fast path
+    canonical = [
+        "A. PUMP HYDRAULICS","B. ROTATING ASSEMBLY","C. BEARINGS & LUBRICATION",
+        "D. SHAFT SEALING","E. DRIVE & COUPLING","F. MOTOR / DRIVER",
+        "G. STRUCTURAL","H. PIPING & NOZZLES","I. FASTENERS & GASKETS",
+        "J. INSTRUMENTATION","K. ACOUSTIC & SAFETY","L. COMPLETE ASSEMBLY",
+    ]
+    if raw in canonical: return raw
+    if upper in [c.upper() for c in canonical]:
+        for c in canonical:
+            if c.upper() == upper: return c
+
+    # Single letter prefix
+    letter_map = {
+        "A":"A. PUMP HYDRAULICS",     "B":"B. ROTATING ASSEMBLY",
+        "C":"C. BEARINGS & LUBRICATION","D":"D. SHAFT SEALING",
+        "E":"E. DRIVE & COUPLING",     "F":"F. MOTOR / DRIVER",
+        "G":"G. STRUCTURAL",           "H":"H. PIPING & NOZZLES",
+        "I":"I. FASTENERS & GASKETS",  "J":"J. INSTRUMENTATION",
+        "K":"K. ACOUSTIC & SAFETY",    "L":"L. COMPLETE ASSEMBLY",
+    }
+    # Extract leading letter
+    if upper and upper[0] in letter_map:
+        # "A. XXX" or "A.XXX" or "A XXX" — first char is the section letter
+        if len(upper) == 1 or upper[1] in (". ", ".", " "):
+            return letter_map[upper[0]]
+
+    # Keyword match (order matters — more specific first)
+    keyword_map = [
+        ("PUMP HYDRAULICS",        "A. PUMP HYDRAULICS"),
+        ("ROTATING ASSEMBLY",      "B. ROTATING ASSEMBLY"),
+        ("BEARINGS & LUBRICATION", "C. BEARINGS & LUBRICATION"),
+        ("BEARINGS AND LUBRICATION","C. BEARINGS & LUBRICATION"),
+        ("BEARINGS",               "C. BEARINGS & LUBRICATION"),
+        ("SHAFT SEALING",          "D. SHAFT SEALING"),
+        ("DRIVE & COUPLING",       "E. DRIVE & COUPLING"),
+        ("DRIVE AND COUPLING",     "E. DRIVE & COUPLING"),
+        ("DRIVE/COUPLING",         "E. DRIVE & COUPLING"),
+        ("DRIVE",                  "E. DRIVE & COUPLING"),
+        ("MOTOR / DRIVER",         "F. MOTOR / DRIVER"),
+        ("MOTOR/DRIVER",           "F. MOTOR / DRIVER"),
+        ("MOTOR",                  "F. MOTOR / DRIVER"),
+        ("STRUCTURAL",             "G. STRUCTURAL"),
+        ("PIPING & NOZZLES",       "H. PIPING & NOZZLES"),
+        ("PIPING AND NOZZLES",     "H. PIPING & NOZZLES"),
+        ("PIPING/NOZZLES",         "H. PIPING & NOZZLES"),
+        ("PIPING",                 "H. PIPING & NOZZLES"),
+        ("NOZZLES",                "H. PIPING & NOZZLES"),
+        ("FASTENERS & GASKETS",    "I. FASTENERS & GASKETS"),
+        ("FASTENERS AND GASKETS",  "I. FASTENERS & GASKETS"),
+        ("FASTENERS",              "I. FASTENERS & GASKETS"),
+        ("INSTRUMENTATION",        "J. INSTRUMENTATION"),
+        ("ACOUSTIC & SAFETY",      "K. ACOUSTIC & SAFETY"),
+        ("ACOUSTIC",               "K. ACOUSTIC & SAFETY"),
+        ("COMPLETE ASSEMBLY",      "L. COMPLETE ASSEMBLY"),
+    ]
+    for keyword, canonical_name in keyword_map:
+        if keyword in upper:
+            return canonical_name
+
+    return raw  # return original if nothing matched
+
+
 def group_bom(bom_df):
     if bom_df is None or bom_df.empty: return []
     if "Section" not in bom_df.columns: return [("ALL","All",bom_df)]
+    # Normalize section names first
+    bom_df = bom_df.copy()
+    bom_df["Section"] = bom_df["Section"].apply(_normalize_section)
     sec_order = {s:i for i,s in enumerate(SECTION_ORDER)}
     df = bom_df.copy()
     df["_ord"] = df["Section"].apply(lambda s: sec_order.get(str(s).strip(), 99))
