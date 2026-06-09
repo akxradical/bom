@@ -1,806 +1,314 @@
 """
-Automated BOM Generation System v4.0
-Same UI — Claude-powered core
+AGENTIC BOM — Universal Should-Cost Engine (Streamlit UI)
+═══════════════════════════════════════════════════════════════════
+Drop any engineered-product datasheet. The agent identifies the product,
+builds a product-specific schema, populates the BOM, validates completeness,
+prices it from live market rates, and scores its confidence — live.
+
+Backend: claude_engine.run_agent()
+Deploy : Streamlit Cloud — pumpbom.streamlit.app  (github: akxradical/bom)
 """
 
-import streamlit as st
-import pandas as pd
 import time
+import pandas as pd
+import streamlit as st
 
 from claude_engine import (
-    extract_pdf_text, claude_extract_specs, claude_generate_bom,
-    bom_to_dataframe, claude_price_bom, build_cost_summary,
-    group_bom, export_excel, SECTION_ORDER,
+    extract_pdf_text, run_agent, bom_to_dataframe, export_excel,
 )
 
-# ─────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="BOM Generator", page_icon="⚙️",
-                   layout="wide", initial_sidebar_state="expanded")
+# ═══════════════════════════════════════════════════════════════════
+# PAGE CONFIG + THEME
+# ═══════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────
-# CSS (same dark theme)
-# ─────────────────────────────────────────────────────────────────
-st.markdown("""
+st.set_page_config(page_title="Agentic BOM", page_icon="◈", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# Palette
+BG      = "#0a0a0f"   # near-black
+PANEL   = "#12121a"
+ACCENT  = "#e8a020"   # amber/gold
+STEEL   = "#4a7a9b"   # steel blue
+MOSS    = "#3d6b4f"   # success green
+RED     = "#c0504d"
+MUTE    = "#8b8b9b"
+
+st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-html,body,[class*="css"]{ font-family:'IBM Plex Sans',sans-serif; }
-#MainMenu,footer,header{ visibility:hidden; }
-.stApp{ background:#0d1117; color:#e6edf3; }
-[data-testid="stSidebar"]{ background:#161b22; border-right:1px solid #30363d; }
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
-.card     { background:#161b22; border:1px solid #30363d;  border-radius:8px; padding:18px 22px; margin-bottom:14px; }
-.card-blue{ background:#0d1b2a; border:1px solid #1f6feb;  border-radius:8px; padding:18px 22px; margin-bottom:14px; }
-.card-green{background:#0d1f0d; border:1px solid #238636;  border-radius:8px; padding:18px 22px; margin-bottom:14px; }
-.card-amber{background:#1f1200; border:1px solid #d29922;  border-radius:8px; padding:18px 22px; margin-bottom:14px; }
-.card-purple{background:#130d1f;border:1px solid #8957e5;  border-radius:8px; padding:18px 22px; margin-bottom:14px; }
+.stApp {{ background: {BG}; color: #e6e6ee; }}
+#MainMenu, footer, header {{ visibility: hidden; }}
+.block-container {{ padding-top: 2rem; max-width: 1200px; }}
 
-.sec-hdr{ font-size:11px; font-weight:600; color:#8b949e; text-transform:uppercase; letter-spacing:1.2px; margin-bottom:10px; border-bottom:1px solid #21262d; padding-bottom:6px; }
-.kv-row { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #21262d; }
-.kv-lbl { color:#8b949e; font-size:12px; }
-.kv-val { color:#e6edf3; font-family:'IBM Plex Mono',monospace; font-size:12px; }
-.kv-blue{ color:#58a6ff; font-family:'IBM Plex Mono',monospace; font-size:12px; }
-.badge-t1{ display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; font-family:'IBM Plex Mono',monospace; background:#0d4429; color:#3fb950; border:1px solid #238636; }
-.badge-t2{ display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; font-family:'IBM Plex Mono',monospace; background:#0d1b2a; color:#79c0ff; border:1px solid #1f6feb; }
-.metric-tile{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:14px; text-align:center; }
-.metric-value{ font-family:'IBM Plex Mono',monospace; font-size:22px; font-weight:600; color:#58a6ff; }
-.metric-label{ font-size:10px; color:#8b949e; text-transform:uppercase; letter-spacing:.8px; margin-top:4px; }
-.bom-section{ padding:6px 14px; border-radius:5px; margin-top:12px; margin-bottom:3px; display:flex; justify-content:space-between; align-items:center; }
-.bom-sub    { background:#1c2d40; padding:4px 14px; border-radius:4px; margin-bottom:3px; }
-.spec-tag{ display:inline-block; background:#1f2937; border:1px solid #374151; border-radius:4px; padding:2px 8px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#60a5fa; margin:2px; }
-.wt-bar{ background:#21262d; border-radius:3px; height:8px; margin:2px 0; }
-.wt-fill{ border-radius:3px; height:8px; }
-.logo-text{ font-family:'IBM Plex Mono',monospace; font-size:19px; font-weight:700; color:#58a6ff; }
-.logo-sub { font-size:10px; color:#8b949e; letter-spacing:1.5px; text-transform:uppercase; }
-.stButton>button{ background:#238636; color:white; border:none; border-radius:6px; font-weight:500; width:100%%; }
-.stDownloadButton>button{ background:#1f6feb; color:white; border:none; border-radius:6px; font-weight:500; width:100%%; }
-[data-testid="stFileUploader"]{ background:#161b22; border:2px dashed #30363d; border-radius:8px; }
-.stTextInput input,.stNumberInput input,.stSelectbox select{
-    background:#161b22!important; border:1px solid #30363d!important;
-    color:#e6edf3!important; border-radius:6px!important;
-    font-family:'IBM Plex Mono',monospace!important; }
-.stTabs [data-baseweb="tab"]{ background:transparent; color:#8b949e; }
-.stTabs [aria-selected="true"]{ color:#58a6ff; border-bottom:2px solid #58a6ff; }
+h1, h2, h3, .wordmark {{ font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -0.5px; }}
+.mono, code, pre {{ font-family: 'IBM Plex Mono', monospace !important; }}
+
+.wordmark {{
+    font-size: 42px; font-weight: 700; color: #fff; line-height: 1;
+}}
+.wordmark .dot {{ color: {ACCENT}; }}
+.tagline {{ color: {MUTE}; font-family: 'IBM Plex Mono', monospace; font-size: 14px; margin-top: 6px; }}
+
+.panel {{
+    background: {PANEL}; border: 1px solid #23232f; border-radius: 10px;
+    padding: 18px 20px; margin: 12px 0;
+}}
+.sec-label {{
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 2px;
+    text-transform: uppercase; color: {ACCENT}; margin-bottom: 8px;
+}}
+
+/* Terminal log */
+.terminal {{
+    background: #06060a; border: 1px solid #1d1d28; border-radius: 8px;
+    padding: 16px 18px; font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+    line-height: 1.7; color: #c9d1d9; min-height: 90px; max-height: 360px;
+    overflow-y: auto; white-space: pre-wrap;
+}}
+.terminal .ok {{ color: {MOSS}; }}
+.terminal .run {{ color: {ACCENT}; }}
+
+/* KPI cards */
+.kpi {{
+    background: {PANEL}; border: 1px solid #23232f; border-radius: 10px;
+    padding: 16px 18px; text-align: center; height: 100%;
+}}
+.kpi .v {{ font-family: 'Space Grotesk', sans-serif; font-size: 26px; font-weight: 700; color: #fff; }}
+.kpi .l {{ font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: 1px;
+           text-transform: uppercase; color: {MUTE}; margin-top: 4px; }}
+.kpi .v.amber {{ color: {ACCENT}; }}
+.kpi .v.green {{ color: #5fbf7f; }}
+.kpi .v.red   {{ color: #e06b67; }}
+
+.stButton > button {{
+    background: {ACCENT}; color: #0a0a0f; border: none; border-radius: 8px;
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 15px;
+    padding: 10px 28px; letter-spacing: 0.5px;
+}}
+.stButton > button:hover {{ background: #ffb733; color: #000; }}
+.stDownloadButton > button {{
+    background: {MOSS}; color: #fff; border: none; border-radius: 8px;
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+}}
+
+.stTabs [data-baseweb="tab-list"] {{ gap: 4px; }}
+.stTabs [data-baseweb="tab"] {{
+    background: {PANEL}; border-radius: 8px 8px 0 0; color: {MUTE};
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+}}
+.stTabs [aria-selected="true"] {{ background: {STEEL}; color: #fff; }}
+
+div[data-testid="stFileUploader"] {{
+    background: {PANEL}; border: 1.5px dashed #34343f; border-radius: 10px; padding: 8px;
+}}
+.warn-box {{
+    background: rgba(192,80,77,0.12); border: 1px solid {RED}; border-radius: 8px;
+    padding: 12px 16px; color: #f0b8b6; font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+}}
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────────
-for k, v in {
-    "page": "upload", "raw_text": "", "pdf_name": "",
-    "extracted_specs": None, "selected_pump_idx": 0,
-    "bom_df": None, "bom_raw": None, "pump_specs": None,
-    "priced_df": None, "cost_summary": None,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# ═══════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ═══════════════════════════════════════════════════════════════════
 
-
-# ─── helpers ─────────────────────────────────────────────────────
-def _metric(label, value, color="#58a6ff"):
-    return (f'<div class="metric-tile"><div class="metric-value" '
-            f'style="color:{color}">{value}</div>'
-            f'<div class="metric-label">{label}</div></div>')
-
-def _kv(label, val, blue=False):
-    cls = "kv-blue" if blue else "kv-val"
-    st.markdown(
-        f'<div class="kv-row"><span class="kv-lbl">{label}</span>'
-        f'<span class="{cls}">{val}</span></div>',
-        unsafe_allow_html=True)
-
-SECTION_COLORS = {
-    "A. PUMP HYDRAULICS":"#1a3a5c","B. ROTATING ASSEMBLY":"#1a3a5c",
-    "C. BEARINGS & LUBRICATION":"#2e5984","D. SHAFT SEALING":"#2e5984",
-    "E. DRIVE & COUPLING":"#366092","F. MOTOR / DRIVER":"#17375e",
-    "G. STRUCTURAL":"#4f6228","H. PIPING & NOZZLES":"#4f6228",
-    "I. FASTENERS & GASKETS":"#595959","J. INSTRUMENTATION":"#595959",
-    "K. ACOUSTIC & SAFETY":"#7f7f7f","L. COMPLETE ASSEMBLY":"#1f4e79",
-}
-
-
-# ─────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown('<div class="logo-text">⚙ BOM GEN</div>', unsafe_allow_html=True)
-    st.markdown('<div class="logo-sub">v4.0 — Intelligent BOM Engine</div>',
-                unsafe_allow_html=True)
-    st.markdown("---")
-
-    pages = {
-        "upload":   "📄  Upload Datasheet",
-        "specs":    "🔍  Review Specs",
-        "bom":      "📋  BOM Output",
-        "pricing":  "💰  Cost Estimation",
-    }
-    for pid, lbl in pages.items():
-        if st.button(lbl, key=f"nav_{pid}", use_container_width=True,
-                     type="primary" if st.session_state.page == pid else "secondary"):
-            st.session_state.page = pid; st.rerun()
-
-    st.markdown("---")
-    st.markdown(
-        '<div style="font-size:9px;color:#484f58;text-align:center;line-height:1.8;">'
-        'Intelligent document reading<br>'
-        'Component-level BOM generation<br>'
-        'Live market price estimation<br>'
-        'Sub-assembly grouped output'
-        '</div>', unsafe_allow_html=True)
-
+if "result" not in st.session_state: st.session_state.result = None
+if "log_lines" not in st.session_state: st.session_state.log_lines = []
 
 # ═══════════════════════════════════════════════════════════════════
-# PAGE 1 — UPLOAD
+# HEADER
 # ═══════════════════════════════════════════════════════════════════
-if st.session_state.page == "upload":
-    st.markdown("## 📄 Upload Equipment Datasheet")
 
-    st.markdown(
-        '<div class="card">'
-        '<div class="sec-hdr">Upload a Pump Datasheet, GA Drawing, or Procurement Specification</div>'
-        '<p style="color:#8b949e;font-size:13px;">'
-        'Supports: vendor datasheets, GA drawings, procurement specs, BHEL/NTPC format specs. '
-        'Digital PDFs work best. Multiple pump types in one document are handled automatically.'
-        '</p></div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="wordmark">AGENTIC<span class="dot">·</span>BOM</div>'
+    '<div class="tagline">Drop any engineered product datasheet. '
+    'The agent reads it, builds the BOM, and prices it at floor cost.</div>',
+    unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("Drop PDF here", type=["pdf"])
+st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-    if uploaded:
-        st.session_state.pdf_name = uploaded.name
-        with st.spinner("Extracting text from PDF..."):
-            text, err = extract_pdf_text(uploaded.read())
+# ═══════════════════════════════════════════════════════════════════
+# UPLOAD + RUN
+# ═══════════════════════════════════════════════════════════════════
 
-        if err:
-            st.error(f"PDF error: {err}")
-        elif not text.strip():
-            st.warning("No text extracted — scanned PDF. Try a digital version.")
-        else:
-            st.session_state.raw_text = text
-            st.success(f"✅ {len(text.split())} words extracted from {uploaded.name}")
+st.markdown('<div class="sec-label">◈ Input</div>', unsafe_allow_html=True)
+uploaded = st.file_uploader(
+    "Datasheet PDF (pump, compressor, agitator, valve, fan, heat exchanger, crane, chiller, ...)",
+    type=["pdf"], label_visibility="collapsed")
 
-            # ── Step 1: Call API FIRST, then show progress ────────
-            prog = st.progress(0)
-            stat = st.empty()
+run = st.button("▶  RUN AGENT", use_container_width=False, disabled=(uploaded is None))
 
-            def _update(pct, msg):
-                prog.progress(pct)
-                stat.markdown(
-                    f'<p style="color:#8b949e;font-family:IBM Plex Mono;'
-                    f'font-size:12px;">◉ {msg}</p>',
+
+def _classify_line(line):
+    """Wrap terminal line with color span based on its marker."""
+    safe = (line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    if " ✓ " in safe: return f'<span class="ok">{safe}</span>'
+    if " ◈ " in safe: return f'<span class="run">{safe}</span>'
+    return safe
+
+
+if run and uploaded is not None:
+    # ── extract text ───────────────────────────────────────────────
+    pdf_bytes = uploaded.read()
+    pdf_text, err = extract_pdf_text(pdf_bytes)
+    if err or not pdf_text.strip():
+        st.markdown(f'<div class="warn-box">Could not read PDF text: {err or "empty document"}.</div>',
                     unsafe_allow_html=True)
-
-            _update(10, "Reading document structure...")
-            time.sleep(0.2)
-            _update(30, "Identifying specifications...")
-
-            try:
-                specs_data = claude_extract_specs(text)
-                st.session_state.extracted_specs = specs_data
-            except Exception as e:
-                import traceback
-                st.error(f"❌ Analysis error: {e}")
-                st.code(traceback.format_exc())
-                st.stop()
-
-            # Animate remaining steps after API returns
-            for pct, msg in [(55, "Extracting performance parameters..."),
-                             (75, "Analysing material of construction..."),
-                             (90, "Compiling extracted data..."),
-                             (100, "Document analysis complete ✓")]:
-                _update(pct, msg)
-                time.sleep(0.15)
-
-            specs = st.session_state.extracted_specs
-
-            # ── CASE 1: Parse failed completely ───────────────────
-            if not specs or not isinstance(specs, dict):
-                st.error("❌ Could not parse the LLM response as JSON.")
-                raw_debug = st.session_state.get("_last_raw_response", "")
-                if raw_debug:
-                    with st.expander("🔍 Raw LLM response"):
-                        st.code(raw_debug[:3000])
-                if st.button("🔄 Retry"):
-                    st.session_state.extracted_specs = None
-                    st.rerun()
-
-            # ── CASE 2: Wrong document type (motor, valve, etc.) ──
-            elif not specs.get("is_pump_document", True):
-                warning  = specs.get("document_warning", "")
-                doc_type = specs.get("document_type", "unknown")
-                st.warning(
-                    f"⚠️ **This does not look like a pump datasheet.**\n\n"
-                    f"Detected as: **{doc_type}**. {warning}\n\n"
-                    f"Please upload a pump datasheet with flow rate and head data."
-                )
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("← Upload correct file", use_container_width=True):
-                        st.session_state.extracted_specs = None
-                        st.rerun()
-                with c2:
-                    if st.button("Continue anyway →", use_container_width=True):
-                        st.session_state.page = "specs"
-                        st.rerun()
-
-            # ── CASE 3: Parsed but pumps list is empty ────────────
-            elif not specs.get("pumps"):
-                st.warning("⚠️ Document parsed but no pump specs found.")
-                with st.expander("🔍 What was extracted"):
-                    st.json(specs)
-                if st.button("← Try another file"):
-                    st.session_state.extracted_specs = None
-                    st.rerun()
-
-            # ── CASE 4: SUCCESS — navigate to specs page ──────────
-            else:
-                provider = specs.get("_llm_provider", "LLM")
-                st.success(f"✅ Specs extracted via {provider}. Loading review page...")
-                st.session_state.page = "specs"
-                st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 2 — REVIEW SPECS
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "specs":
-    data = st.session_state.extracted_specs
-    if not data:
-        st.warning("No specs extracted. Upload a datasheet first.")
-        if st.button("← Upload"): st.session_state.page = "upload"; st.rerun()
         st.stop()
 
-    st.markdown("## 🔍 Extracted Specifications")
+    st.markdown('<div class="sec-label">◈ Agent Log</div>', unsafe_allow_html=True)
+    log_box = st.empty()
+    st.session_state.log_lines = []
 
-    # Document type badge
-    doc_type = data.get("document_type", "unknown")
-    project  = data.get("project", "—")
-    mfr      = data.get("manufacturer", "—")
-    st.markdown(
-        f'<div class="card-blue">'
-        f'<b style="color:#79c0ff;">Document:</b> {doc_type} | '
-        f'<b style="color:#79c0ff;">Manufacturer:</b> {mfr} | '
-        f'<b style="color:#79c0ff;">Project:</b> {project}'
-        f'</div>', unsafe_allow_html=True)
+    def progress_cb(line, agent_log):
+        # engine sends the latest formatted terminal line
+        lines = st.session_state.log_lines
+        # replace a running (◈) line with its ✓ completion for same step prefix
+        lines.append(line)
+        body = "<br>".join(_classify_line(l) for l in lines[-40:])
+        log_box.markdown(f'<div class="terminal">{body}</div>', unsafe_allow_html=True)
 
-    pumps = data.get("pumps", [])
-    if not pumps:
-        st.error("No pump specifications found in this document.")
-        if st.button("← Try another file"): st.session_state.page = "upload"; st.rerun()
+    try:
+        result = run_agent(pdf_text, progress_callback=progress_cb)
+        st.session_state.result = result
+    except Exception as e:
+        import traceback
+        st.markdown(f'<div class="warn-box">Agent error: {e}</div>', unsafe_allow_html=True)
+        st.code(traceback.format_exc())
         st.stop()
 
-    # Multi-pump selector
-    if len(pumps) > 1:
+# ═══════════════════════════════════════════════════════════════════
+# RESULTS
+# ═══════════════════════════════════════════════════════════════════
+
+result = st.session_state.result
+if result:
+    bom = result.get("bom", [])
+    sc = result.get("should_cost", {})
+    conf = result.get("confidence", 0.0)
+    df = bom_to_dataframe(bom)
+
+    conf_pct = int(round(conf * 100))
+    if conf >= 0.85:   conf_cls, conf_word = "green", "HIGH"
+    elif conf >= 0.65: conf_cls, conf_word = "amber", "MEDIUM"
+    else:              conf_cls, conf_word = "red", "LOW"
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown('<div class="sec-label">◈ Results</div>', unsafe_allow_html=True)
+
+    # ── KPI ROW ────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5 = st.columns(5)
+    total_exgst = sc.get("total_ex_gst", 0)
+    kpis = [
+        (k1, result.get("equipment_type", "—")[:26], "Equipment", ""),
+        (k2, str(sc.get("component_count", len(bom))), "Components", ""),
+        (k3, str(len(result.get("schema", []))), "Sub-assemblies", ""),
+        (k4, f"₹{total_exgst:,}", "Should-Cost (ex-GST)", "amber"),
+        (k5, f"{conf_pct}%", f"Confidence · {conf_word}", conf_cls),
+    ]
+    for col, val, label, cls in kpis:
+        col.markdown(
+            f'<div class="kpi"><div class="v {cls}">{val}</div>'
+            f'<div class="l">{label}</div></div>', unsafe_allow_html=True)
+
+    if conf < 0.65:
         st.markdown(
-            f'<div class="card-amber">'
-            f'⚠️  <b style="color:#d29922;">{len(pumps)} pump specifications found</b>'
-            f'</div>', unsafe_allow_html=True)
-
-        labels = [f"{p.get('pump_label','Pump')} — {p.get('flow_m3h','?')} m³/h, "
-                  f"{p.get('head_m','?')} m" for p in pumps]
-        chosen = st.selectbox("Select pump to generate BOM for:", labels)
-        st.session_state.selected_pump_idx = labels.index(chosen)
-
-    pump_idx = st.session_state.selected_pump_idx
-    pump     = pumps[min(pump_idx, len(pumps)-1)]
-
-    # Display specs — 3 column layout
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">Performance</div>', unsafe_allow_html=True)
-        for k, lbl in [
-            ("pump_label",     "Pump"),
-            ("model",          "Model"),
-            ("manufacturer",   "Manufacturer"),
-            ("type",           "Type"),
-            ("tag_numbers",    "Tag Numbers"),
-            ("standard",       "Standard"),
-            ("quantity",       "Quantity"),
-            ("configuration",  "Configuration"),
-            ("flow_m3h",       "Flow (m³/h)"),
-            ("head_m",         "Head (m)"),
-            ("speed_rpm",      "Speed (RPM)"),
-            ("motor_kw",       "Motor (kW)"),
-            ("shaft_power_kw", "Shaft Power (kW)"),
-            ("stages",         "Stages"),
-            ("fluid",          "Fluid"),
-            ("temp_c",         "Temperature (°C)"),
-            ("density_kgm3",   "Density (kg/m³)"),
-            ("viscosity",      "Viscosity"),
-            ("npsha_m",        "NPSHA (m)"),
-            ("npshr_m",        "NPSHR (m)"),
-            ("min_flow_m3h",   "Min Flow (m³/h)"),
-            ("shutoff_head_m", "Shutoff Head (m)"),
-            ("efficiency_pct", "Efficiency (%)"),
-            ("impeller_dia_mm","Impeller Dia (mm)"),
-        ]:
-            val = pump.get(k)
-            if val is not None and str(val).strip() and str(val).lower() != "none":
-                _kv(lbl, str(val), blue=k in ("flow_m3h","head_m","motor_kw","shaft_power_kw"))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-hdr">Material of Construction</div>',
-                    unsafe_allow_html=True)
-        moc = pump.get("moc", {}) or {}
-        for k, lbl in [
-            ("casing",          "Casing"),
-            ("impeller",        "Impeller"),
-            ("shaft",           "Shaft"),
-            ("shaft_sleeve",    "Shaft Sleeve"),
-            ("wear_ring",       "Wear Ring"),
-            ("bearing",         "Bearing"),
-            ("bearing_housing", "Bearing Housing"),
-            ("seal_type",       "Seal Type"),
-            ("seal_plan",       "Seal Plan"),
-            ("baseplate",       "Baseplate"),
-            ("fasteners",       "Fasteners"),
-            ("gland_plate",     "Gland/Seal Plate"),
-            ("coupling_halves", "Coupling Halves"),
-        ]:
-            val = moc.get(k)
-            if val and str(val).lower() != "none" and str(val).lower() != "null":
-                _kv(lbl, str(val))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # Nozzles
-        noz = pump.get("nozzles", {}) or {}
-        if any(v for v in noz.values() if v and str(v).lower() != "none"):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Nozzles</div>', unsafe_allow_html=True)
-            for k, lbl in [
-                ("suction_size",    "Suction Size"),
-                ("suction_rating",  "Suction Rating"),
-                ("discharge_size",  "Discharge Size"),
-                ("discharge_rating","Discharge Rating"),
-                ("flange_standard", "Flange Standard"),
-            ]:
-                val = noz.get(k)
-                if val and str(val).lower() != "none":
-                    _kv(lbl, str(val))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with c3:
-        # Weights
-        wts = pump.get("weights", {}) or {}
-        if any(v for v in wts.values() if v and str(v) != "0"):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Weights</div>', unsafe_allow_html=True)
-            for k, lbl in [
-                ("pump_bare_kg",     "Pump (bare)"),
-                ("motor_kg",         "Motor"),
-                ("baseplate_kg",     "Baseplate"),
-                ("total_package_kg", "Total Package"),
-                ("heaviest_part_kg", "Heaviest Part"),
-                ("transport_kg",     "Transport"),
-            ]:
-                if wts.get(k):
-                    _kv(lbl, f"{wts[k]} kg", blue=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Motor
-        mot = pump.get("motor", {}) or {}
-        if any(v for v in mot.values() if v and str(v).lower() != "none"):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Motor / Electrical</div>', unsafe_allow_html=True)
-            for k, lbl in [
-                ("type",         "Motor Type"),
-                ("rating_kw",    "Rating (kW)"),
-                ("voltage_v",    "Voltage"),
-                ("frequency_hz", "Frequency (Hz)"),
-                ("poles",        "Poles"),
-                ("speed_rpm",    "Speed (RPM)"),
-                ("enclosure",    "Enclosure"),
-                ("mounting",     "Mounting"),
-            ]:
-                val = mot.get(k)
-                if val and str(val).lower() != "none":
-                    _kv(lbl, str(val))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Drive
-        drv = pump.get("drive", {}) or {}
-        if any(v for v in drv.values() if v and str(v).lower() != "none"):
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Drive</div>', unsafe_allow_html=True)
-            for k, lbl in [
-                ("type",          "Drive Type"),
-                ("coupling_type", "Coupling/Belt"),
-                ("belt_guard",    "Belt Guard"),
-            ]:
-                val = drv.get(k)
-                if val is not None and str(val).lower() != "none":
-                    _kv(lbl, str(val))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Misc specs
-        misc_items = []
-        for k, lbl in [
-            ("vibration_limit",      "Vibration Limit"),
-            ("noise_limit_dba",      "Noise Limit (dBA)"),
-            ("performance_test_std", "Performance Test Std"),
-            ("surface_prep_spec",    "Surface Prep Spec"),
-        ]:
-            val = pump.get(k)
-            if val and str(val).lower() != "none":
-                misc_items.append((lbl, str(val)))
-        if misc_items:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Standards & Limits</div>', unsafe_allow_html=True)
-            for lbl, val in misc_items:
-                _kv(lbl, val)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Scope
-        scope = pump.get("scope", {}) or {}
-        scope_items = [(k.replace("_"," ").title(), v) for k, v in scope.items()
-                       if v is True or v is False]
-        if scope_items:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="sec-hdr">Scope of Supply</div>', unsafe_allow_html=True)
-            for lbl, val in scope_items:
-                icon = "✅" if val else "❌"
-                _kv(lbl, icon)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    ca, cb = st.columns(2)
-    with ca:
-        if st.button("← Re-upload", use_container_width=True):
-            st.session_state.page = "upload"; st.rerun()
-    with cb:
-        if st.button("Generate BOM →", type="primary", use_container_width=True):
-            st.session_state.pump_specs = pump
-            st.session_state.bom_df = None
-            st.session_state.priced_df = None
-            st.session_state.cost_summary = None
-
-            # Generate BOM
-            with st.spinner(""):
-                prog = st.progress(0)
-                stat = st.empty()
-
-                gen_steps = [
-                    (10,  "Analysing pump type and duty conditions..."),
-                    (25,  "Selecting materials for fluid compatibility..."),
-                    (45,  "Building sub-assembly component structure..."),
-                    (65,  "Specifying wetted parts and MOC..."),
-                    (80,  "Adding instrumentation and accessories..."),
-                    (92,  "Compiling complete Bill of Materials..."),
-                    (100, "BOM generation complete ✓"),
-                ]
-                for pct, msg in gen_steps:
-                    prog.progress(pct)
-                    stat.markdown(
-                        f'<p style="color:#8b949e;font-family:IBM Plex Mono;'
-                        f'font-size:12px;">◉ {msg}</p>',
-                        unsafe_allow_html=True)
-                    if pct == 25:
-                        try:
-                            bom_raw = claude_generate_bom(pump)
-                            bom_df  = bom_to_dataframe(bom_raw)
-                            st.session_state.bom_raw = bom_raw
-                            st.session_state.bom_df  = bom_df
-                        except Exception as e:
-                            st.error(f"BOM generation error: {e}")
-                            import traceback; st.code(traceback.format_exc())
-                            st.stop()
-                    elif pct < 100:
-                        time.sleep(0.15)
-
-            st.session_state.page = "bom"
-            st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 3 — BOM OUTPUT
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "bom":
-    bom   = st.session_state.bom_df
-    pump  = st.session_state.pump_specs
-
-    if bom is None or bom.empty:
-        st.warning("No BOM generated yet.")
-        if st.button("← Upload"): st.session_state.page = "upload"; st.rerun()
-        st.stop()
-
-    st.markdown("## 📋 Bill of Materials — Sub-Assembly View")
-
-    pump_label = (pump or {}).get("pump_label", "Generated BOM")
-    pump_model = (pump or {}).get("model", "")
-    pump_type  = (pump or {}).get("type", "")
-    st.markdown(
-        f'<div class="card-green">'
-        f'<b style="color:#3fb950;font-size:14px;">{pump_label}</b>'
-        f'{" — " + pump_model if pump_model else ""}<br>'
-        f'<span style="color:#8b949e;font-size:12px;">'
-        f'Type: {pump_type} | '
-        f'Flow: {(pump or {}).get("flow_m3h","—")} m³/h | '
-        f'Head: {(pump or {}).get("head_m","—")} m | '
-        f'Motor: {(pump or {}).get("motor_kw","—")} kW'
-        f'</span></div>', unsafe_allow_html=True)
-
-    # Metrics
-    groups = group_bom(bom)
-    cols = st.columns(4)
-    for col, (lbl, val, clr) in zip(cols, [
-        ("Components",     len(bom),    "#58a6ff"),
-        ("Sub-Assemblies", len(groups), "#79c0ff"),
-        ("Fluid",          (pump or {}).get("fluid","—"), "#ffa657"),
-        ("Motor",          f"{(pump or {}).get('motor_kw','—')} kW", "#3fb950"),
-    ]):
-        col.markdown(_metric(lbl, val, clr), unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    tab1, tab2 = st.tabs(["🔩 Sub-Assembly Groups", "📋 Full Table"])
-
-    with tab1:
-        current_sec = None
-        for sec, sub, gdf in groups:
-            if sec != current_sec:
-                current_sec = sec
-                color = SECTION_COLORS.get(sec, "#444444")
-                cnt   = sum(len(g) for s2,sb,g in groups if s2 == sec)
-                st.markdown(
-                    f'<div class="bom-section" style="background:{color};">'
-                    f'<span style="color:#fff;font-weight:700;font-size:11px;'
-                    f'letter-spacing:1px;">{sec}</span>'
-                    f'<span style="color:#ffffffaa;font-size:11px;">{cnt} items</span></div>',
-                    unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="bom-sub">'
-                f'<span style="color:#8b949e;font-size:11px;">▶ {sub}</span></div>',
-                unsafe_allow_html=True)
-            show = [c for c in ["No","Component","Description","MOC","Qty",
-                                "Weight_kg","Req_Type","Notes"]
-                    if c in gdf.columns]
-            st.dataframe(gdf[show], use_container_width=True,
-                         hide_index=True, height=min(35*len(gdf)+40, 280))
-        st.caption(f"{len(bom)} components across {len(groups)} sub-assemblies")
-
-    with tab2:
-        st.dataframe(bom, use_container_width=True, height=500, hide_index=True)
-
-    st.markdown("---")
-
-    ec1, ec2, ec3, ec4 = st.columns([2, 2, 1, 1])
-    with ec1:
-        try:
-            buf = export_excel(bom, st.session_state.extracted_specs or {})
-            fn  = f"BOM_{pump_model or 'generated'}_{pd.Timestamp.now().strftime('%d%b%Y')}.xlsx"
-            st.download_button("⬇ Excel", buf, fn,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
-        except Exception as e:
-            st.error(f"Export: {e}")
-    with ec2:
-        st.download_button("⬇ CSV", bom.to_csv(index=False),
-            f"BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.csv",
-            "text/csv", use_container_width=True)
-    with ec3:
-        if st.button("💰 Price It", use_container_width=True):
-            st.session_state.page = "pricing"; st.rerun()
-    with ec4:
-        if st.button("🔄 New", use_container_width=True):
-            for k in ["raw_text","extracted_specs","bom_df","bom_raw",
-                      "pump_specs","priced_df","cost_summary"]:
-                st.session_state[k] = None
-            st.session_state.page = "upload"; st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# PAGE 4 — PRICING
-# ═══════════════════════════════════════════════════════════════════
-elif st.session_state.page == "pricing":
-    bom  = st.session_state.bom_df
-    pump = st.session_state.pump_specs
-
-    if bom is None or bom.empty:
-        st.warning("Generate a BOM first.")
-        if st.button("← Upload"): st.session_state.page = "upload"; st.rerun()
-        st.stop()
-
-    st.markdown("## 💰 BOM Cost Estimation")
-    st.markdown(
-        '<p style="color:#8b949e;">'
-        'Live market price intelligence — components priced using current Indian market data.'
-        '</p>', unsafe_allow_html=True)
-
-    # ── Already priced? show results ──────────────────────────────
-    if st.session_state.priced_df is not None and st.session_state.cost_summary:
-        priced = st.session_state.priced_df
-        cs     = st.session_state.cost_summary
-
-        c1,c2,c3 = st.columns(3)
-        for col,(lbl,val,clr) in zip([c1,c2,c3],[
-            ("Total (Ex-GST)",  f"₹{cs['total_ex_gst']:,.0f}",   "#58a6ff"),
-            ("GST (18%)",       f"₹{cs['total_gst']:,.0f}",      "#ffa657"),
-            ("Total (Incl GST)",f"₹{cs['total_incl_gst']:,.0f}", "#3fb950"),
-        ]):
-            col.markdown(_metric(lbl,val,clr), unsafe_allow_html=True)
-
-        st.markdown("---")
-        tab1, tab2, tab3 = st.tabs(["📊 Breakdown", "📋 Line Items", "⬇ Export"])
-
-        with tab1:
-            ca, cb = st.columns([3,2])
-            with ca:
-                st.markdown('<div class="sec-hdr">Should-Cost Breakdown (Raw Manufacturing Only)</div>',
-                            unsafe_allow_html=True)
-
-                # Simple two-bar waterfall
-                total_rm   = cs.get("total_raw_material", 0)
-                total_mach = cs.get("total_machining", 0)
-                total_mfg  = cs.get("total_ex_gst", 1)
-
-                for label, val, clr in [
-                    ("Raw Material (live prices)", total_rm,   "#58a6ff"),
-                    ("Machining & Processing",     total_mach, "#3fb950"),
-                ]:
-                    if val <= 0:
-                        continue
-                    pct_t = val / max(total_mfg, 1) * 100
-                    bar_w = int(pct_t)
-                    st.markdown(
-                        f'<div style="margin:6px 0;">'
-                        f'<div style="display:flex;justify-content:space-between;">'
-                        f'<span style="color:#e6edf3;font-size:13px;font-weight:500;">{label}</span>'
-                        f'<span style="color:{clr};font-family:IBM Plex Mono;font-size:13px;">'
-                        f'₹{val:,.0f} ({pct_t:.1f}%)</span></div>'
-                        f'<div class="wt-bar" style="height:10px;margin-top:4px;">'
-                        f'<div class="wt-fill" style="background:{clr};width:{bar_w}%;height:10px;"></div>'
-                        f'</div></div>',
-                        unsafe_allow_html=True)
-
-                st.markdown(
-                    f'<div style="border-top:1px solid #30363d;margin:12px 0;padding-top:10px;">'
-                    f'<div style="display:flex;justify-content:space-between;">'
-                    f'<span style="color:#e6edf3;font-size:14px;font-weight:700;">Total Should-Cost</span>'
-                    f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:15px;font-weight:700;">'
-                    f'₹{total_mfg:,.0f}</span></div>'
-                    f'<span style="color:#8b949e;font-size:11px;">Raw material + machining only. '
-                    f'No overhead. No margin.</span></div>',
-                    unsafe_allow_html=True)
-
-                st.markdown(
-                    f'<div class="card-amber" style="margin-top:10px;">'
-                    f'<b style="color:#d29922;">Difference vs PO price = Supplier\'s overhead + profit</b><br>'
-                    f'<span style="color:#8b949e;font-size:12px;">{cs.get("note","")}</span>'
-                    f'</div>', unsafe_allow_html=True)
-
-                st.markdown('<div class="sec-hdr" style="margin-top:16px;">Cost by Sub-Assembly</div>',
-                            unsafe_allow_html=True)
-                sub_t = cs.get("sub_totals", {})
-                max_v = max(sub_t.values()) if sub_t else 1
-                for sub, val in sub_t.items():
-                    if val <= 0:
-                        continue
-                    pct = int(val / max_v * 100)
-                    pct_t = val / max(total_mfg, 1) * 100
-                    st.markdown(
-                        f'<div style="margin:5px 0;">'
-                        f'<div style="display:flex;justify-content:space-between;">'
-                        f'<span style="color:#8b949e;font-size:12px;">{sub[:35]}</span>'
-                        f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
-                        f'₹{val:,.0f} ({pct_t:.1f}%)</span></div>'
-                        f'<div class="wt-bar"><div class="wt-fill" '
-                        f'style="background:#1f6feb;width:{pct}%;"></div></div></div>',
-                        unsafe_allow_html=True)
-
-            with cb:
-                st.markdown('<div class="sec-hdr">Top Cost Drivers</div>',
-                            unsafe_allow_html=True)
-                for item in cs.get("top5_drivers",[]):
-                    name = str(item.get("Component",""))[:35]
-                    val2 = item.get("Total_Price_INR",0)
-                    conf = item.get("Price_Confidence","—")
-                    clr2 = "#3fb950" if conf=="high" else "#ffa657" if conf=="medium" else "#8b949e"
-                    st.markdown(
-                        f'<div style="padding:6px 0;border-bottom:1px solid #21262d;">'
-                        f'<span style="color:#e6edf3;font-size:12px;">{name}</span><br>'
-                        f'<span style="color:#58a6ff;font-family:IBM Plex Mono;font-size:12px;">'
-                        f'₹{val2:,.0f}</span> '
-                        f'<span style="color:{clr2};font-size:10px;">{conf}</span></div>',
-                        unsafe_allow_html=True)
-
-            st.markdown(
-                f'<div class="card-amber" style="margin-top:16px;">'
-                f'⚠️ <b style="color:#d29922;">Indicative Estimate</b><br>'
-                f'<span style="color:#8b949e;font-size:12px;">{cs.get("note","")}</span>'
-                f'</div>', unsafe_allow_html=True)
-
-        with tab2:
-            show = [c for c in [
-                "No", "Component", "MOC", "Weight_kg", "Qty",
-                "Component_Type",
-                "Raw_Material_INR", "Machining_INR",
-                "Total_Manufacturing_INR",
-                "Price_Confidence", "Price_Source", "Price_Notes",
-            ] if c in priced.columns]
-            disp = priced[show].copy()
-            for pc in ["Unit_Price_INR","Total_Price_INR","GST_18pct","Price_With_GST"]:
-                if pc in disp.columns:
-                    disp[pc] = disp[pc].apply(
-                        lambda x: f"₹{int(x):,}" if pd.notna(x) and x else "—")
-            st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
-            st.caption(
-                f"Total: ₹{cs['total_ex_gst']:,} + GST ₹{cs['total_gst']:,} "
-                f"= ₹{cs['total_incl_gst']:,}")
-
-        with tab3:
-            st.download_button("⬇ Priced BOM (CSV)",
-                priced.to_csv(index=False),
-                f"Priced_BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.csv",
-                "text/csv", use_container_width=False)
-            try:
-                buf = export_excel(priced, st.session_state.extracted_specs or {}, priced=True)
-                st.download_button("⬇ Priced BOM (Excel)", buf,
-                    f"Priced_BOM_{pd.Timestamp.now().strftime('%d%b%Y')}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=False)
-            except Exception as e:
-                st.error(f"Export: {e}")
-
-        st.markdown("---")
-        c_r1, c_r2 = st.columns(2)
-        with c_r1:
-            if st.button("🔄 Re-run Pricing", use_container_width=True):
-                st.session_state.priced_df = None
-                st.session_state.cost_summary = None; st.rerun()
-        with c_r2:
-            if st.button("← Back to BOM", use_container_width=True):
-                st.session_state.page = "bom"; st.rerun()
-
-    else:
-        # ── Run pricing ──────────────────────────────────────────
-        st.markdown(
-            f'<div class="card">'
-            f'<div class="sec-hdr">Market Price Accumulation</div>'
-            f'<p style="color:#8b949e;font-size:13px;">'
-            f'{len(bom)} components will be priced using current market intelligence. '
-            f'High-value items (pump, motor, seal) use live market search. '
-            f'Standard items use published rate indices.</p></div>',
+            '<div class="warn-box" style="margin-top:12px">⚠ Low confidence — '
+            'engineer review strongly recommended before this BOM/cost is used.</div>',
             unsafe_allow_html=True)
 
-        if st.button("▶  Run Cost Estimation", type="primary", use_container_width=False):
-            # Pricing REQUIRES Claude (web search). Check key first.
-            if not st.secrets.get("ANTHROPIC_API_KEY", ""):
-                st.error(
-                    "❌ Should-cost pricing requires Claude API with web search.\n\n"
-                    "Add `ANTHROPIC_API_KEY = \"sk-ant-...\"` to your Streamlit secrets.\n"
-                    "Get a key at https://console.anthropic.com — the cost is ~₹2-3 per BOM."
-                )
-                st.stop()
-            prog = st.progress(0)
-            stat = st.empty()
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-            def _prog(pct, msg):
-                prog.progress(pct)
-                stat.markdown(
-                    f'<p style="color:#8b949e;font-family:IBM Plex Mono;'
-                    f'font-size:12px;">◉ {msg}</p>',
-                    unsafe_allow_html=True)
+    # ── TABS ───────────────────────────────────────────────────────
+    t_bom, t_cost, t_log, t_export = st.tabs(
+        ["📋 BOM Table", "💰 Should-Cost", "🧠 Agent Log", "⬇ Export"])
 
-            _prog(5, "Initialising market data pipeline...")
-            try:
-                priced = claude_price_bom(bom, pump, _prog)
-                cs     = build_cost_summary(priced)
-                st.session_state.priced_df   = priced
-                st.session_state.cost_summary = cs
-                prog.progress(100)
-                stat.markdown(
-                    '<p style="color:#3fb950;font-family:IBM Plex Mono;font-size:12px;">'
-                    '✓ Market data compilation complete</p>',
-                    unsafe_allow_html=True)
-                time.sleep(0.4); st.rerun()
-            except Exception as e:
-                import traceback
-                st.error(f"Pricing error: {e}")
-                st.code(traceback.format_exc())
+    # --- BOM Table ---
+    with t_bom:
+        if df.empty:
+            st.info("No components generated.")
+        else:
+            subs = ["All"] + sorted(df["Sub_Assembly"].dropna().unique().tolist())
+            pick = st.selectbox("Filter by sub-assembly", subs, index=0)
+            view = df if pick == "All" else df[df["Sub_Assembly"] == pick]
+            st.dataframe(view, use_container_width=True, hide_index=True, height=460)
+            st.caption(f"{len(view)} of {len(df)} components shown")
 
-        st.markdown("---")
-        if st.button("← Back to BOM"):
-            st.session_state.page = "bom"; st.rerun()
+    # --- Should-Cost ---
+    with t_cost:
+        sub_totals = sc.get("sub_totals", {})
+        if sub_totals:
+            chart_df = pd.DataFrame(
+                {"Sub-assembly": list(sub_totals.keys()),
+                 "Cost (₹)": list(sub_totals.values())}).set_index("Sub-assembly")
+            st.bar_chart(chart_df, color=ACCENT, height=300)
+
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f'<div class="kpi"><div class="v">₹{sc.get("total_raw_material",0):,}</div>'
+                    f'<div class="l">Raw Material</div></div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="kpi"><div class="v">₹{sc.get("total_machining",0):,}</div>'
+                    f'<div class="l">Machining</div></div>', unsafe_allow_html=True)
+        c3.markdown(f'<div class="kpi"><div class="v amber">₹{sc.get("total_incl_gst",0):,}</div>'
+                    f'<div class="l">Total incl-GST</div></div>', unsafe_allow_html=True)
+
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        if sub_totals:
+            bt = pd.DataFrame({"Sub-assembly": list(sub_totals.keys()),
+                               "Cost ₹ (ex-GST)": [f"₹{int(v):,}" for v in sub_totals.values()]})
+            st.dataframe(bt, use_container_width=True, hide_index=True)
+
+        top5 = sc.get("top5_drivers", [])
+        if top5:
+            st.markdown('<div class="sec-label">Top cost drivers</div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(top5), use_container_width=True, hide_index=True)
+
+        st.caption(sc.get("note", ""))
+
+    # --- Agent Log ---
+    with t_log:
+        log = result.get("agent_log", [])
+        if log:
+            lines = []
+            for e in log:
+                mark = "✓" if e.get("result") else "◈"
+                lines.append(f"{e.get('t','')} {mark} {e.get('step',''):<10} "
+                             f"{e.get('result') or e.get('action','')}")
+            body = "<br>".join(_classify_line(l) for l in lines)
+            st.markdown(f'<div class="terminal" style="max-height:480px">{body}</div>',
+                        unsafe_allow_html=True)
+        meta = []
+        if result.get("manufacturer"): meta.append(f"Manufacturer: {result['manufacturer']}")
+        if result.get("model"): meta.append(f"Model: {result['model']}")
+        meta.append(f"Iterations: {result.get('iterations',0)}")
+        meta.append(f"Gaps flagged: {len(result.get('gaps',[]))}")
+        st.caption(" · ".join(meta))
+        if result.get("gaps"):
+            for g in result["gaps"]:
+                st.markdown(f'<div class="warn-box" style="margin-top:6px">• {g}</div>',
+                            unsafe_allow_html=True)
+
+    # --- Export ---
+    with t_export:
+        st.markdown('<div class="sec-label">Download</div>', unsafe_allow_html=True)
+        st.write("Full workbook: Agent Summary · BOM (by sub-assembly) · Should-Cost · Agent Log.")
+        try:
+            xls = export_excel(result)
+            fname = (result.get("equipment_type", "BOM").split("(")[0].strip()
+                     .replace(" ", "_").replace("/", "-") or "BOM")
+            st.download_button(
+                "⬇  Download Excel (.xlsx)", data=xls.getvalue(),
+                file_name=f"{fname}_should_cost.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=False)
+        except Exception as e:
+            st.markdown(f'<div class="warn-box">Export error: {e}</div>', unsafe_allow_html=True)
+
+else:
+    st.markdown(
+        f'<div class="panel" style="color:{MUTE};font-family:IBM Plex Mono,monospace;font-size:13px">'
+        'Upload a datasheet and press <b style="color:#e8a020">RUN AGENT</b>. '
+        'The agent identifies the product, builds a product-specific sub-assembly '
+        'schema, populates and validates the BOM, then prices it at floor cost '
+        '(raw material + machining, no overhead, no margin) with a confidence score.'
+        '</div>', unsafe_allow_html=True)
