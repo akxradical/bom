@@ -299,15 +299,79 @@ def _recover_truncated(text):
 # ═══════════════════════════════════════════════════════════════════
 
 def extract_pdf_text(file_bytes):
+    """Extract a CLEAN, LLM-friendly representation of the datasheet.
+
+    Instead of dumping flattened text (which mangles spec tables), this does a
+    deterministic Python pre-pass that pulls out:
+      - key:value spec pairs (lines like 'Flow : 250 m3/h', 'Battery: Li-ion')
+      - tables (rendered as pipe rows)
+      - the raw running text
+    and packs them into one structured block. Generic — no product assumptions.
+    The LLM then reads pre-digested structure, which makes IDENTIFY / SCHEMA /
+    BOM far more consistent than parsing raw garble.
+    """
     try:
         import pdfplumber
-        pages = []
+    except Exception as e:
+        return "", str(e)
+    pages, tables, kv = [], [], {}
+    try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             for p in pdf.pages:
                 t = p.extract_text()
                 if t: pages.append(t)
-        return "\n".join(pages), None
-    except Exception as e: return "", str(e)
+                try:
+                    for tbl in (p.extract_tables() or []):
+                        rows = [[("" if c is None else str(c).strip()) for c in row]
+                                for row in tbl if any(c not in (None, "") for c in row)]
+                        if len(rows) >= 1 and any(len(r) >= 2 for r in rows):
+                            tables.append(rows)
+                except Exception:
+                    pass
+    except Exception as e:
+        return "", str(e)
+
+    raw_text = "\n".join(pages)
+    if not raw_text.strip() and not tables:
+        return "", "no extractable text"
+
+    kv = _extract_key_values(raw_text)
+    structured = _render_structured(kv, tables, raw_text)
+    return structured, None
+
+
+def _extract_key_values(text):
+    """Pull 'Label : value' style spec pairs from datasheet text. Generic."""
+    kv = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or len(line) > 120:
+            continue
+        # split on first colon (datasheet specs) — keep short, value-bearing pairs
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if 1 <= len(k) <= 45 and 1 <= len(v) <= 70 and not k.endswith((".", "?")) \
+               and any(ch.isalnum() for ch in v) and k.lower() not in kv:
+                kv[k.lower()] = f"{k}: {v}"
+    # cap to avoid bloating the prompt
+    return dict(list(kv.items())[:60])
+
+
+def _render_structured(kv, tables, raw_text):
+    parts = []
+    if kv:
+        parts.append("=== KEY SPECIFICATIONS (auto-extracted) ===")
+        parts.extend(kv.values())
+    if tables:
+        parts.append("\n=== TABLES (auto-extracted) ===")
+        for i, rows in enumerate(tables[:12], 1):
+            parts.append(f"-- Table {i} --")
+            for r in rows[:30]:
+                parts.append(" | ".join(r))
+    parts.append("\n=== FULL DOCUMENT TEXT ===")
+    parts.append(raw_text[:16000])
+    return "\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -346,27 +410,46 @@ in key_specs. Return strict JSON only."""
 def _identify(pdf_text, agent_log, cb):
     _log(agent_log, cb, "IDENTIFY", "Reading document structure...", running=True)
     prompt = f"""Identify the engineered product described in this document.
+Read carefully — the SAME word can mean different products (e.g. "pump" may be a
+large centrifugal process pump OR a tiny diaphragm sampling pump inside a handheld
+gas detector). Judge from the WHOLE document (size, weight, power source, sensors,
+display, wireless, housing) what the product really is.
 
 DOCUMENT TEXT:
 {pdf_text[:14000]}
 
 Return ONLY this JSON object:
 {{
-  "equipment_type": "specific product class, include API/IS/standard class if present (e.g. 'Centrifugal Pump (API 610 OH2)', 'Screw Air Compressor (API 619)', 'Shell & Tube Heat Exchanger (TEMA AES)')",
+  "equipment_type": "specific product class incl. standard/class if present (e.g. 'Centrifugal Pump (API 610 OH2)', 'Portable Multi-Gas Detector', 'Shell & Tube Heat Exchanger (TEMA AES)', 'Distribution Transformer')",
   "manufacturer": "name or null",
   "model": "model/tag or null",
   "is_engineered_product": true,
-  "key_specs": {{ "any": "important rating/size/duty parameters you find as key:value" }}
+  "key_specs": {{ "any": "important rating/size/duty/feature parameters you find as key:value" }}
 }}"""
+    raw, prov = "", "none"
     try:
         raw, prov = _cheap_call(prompt, IDENTIFY_SYS, 1500)
-    except Exception as e:
-        raw, prov = "", "none"
+    except Exception:
+        pass
     data = _parse_json(raw) or {}
     if not isinstance(data, dict): data = {}
-    et = (data.get("equipment_type") or "Engineered Product").strip()
+    et = (data.get("equipment_type") or "").strip()
+    # Retry with a stronger model if identification failed or was generic.
+    if not et or et.lower() in ("engineered product", "unknown", "n/a", "product"):
+        try:
+            raw2, prov = _smart_call(prompt, IDENTIFY_SYS, 1500)
+            d2 = _parse_json(raw2)
+            if isinstance(d2, dict) and (d2.get("equipment_type") or "").strip():
+                data = d2
+                et = data["equipment_type"].strip()
+        except Exception:
+            pass
+    if not et:
+        et = "Engineered Product"
     data["equipment_type"] = et
     data["_provider"] = prov
+    if not isinstance(data.get("key_specs"), dict):
+        data["key_specs"] = {}
     _log(agent_log, cb, "IDENTIFY", "done", f'equipment_type = "{et}"')
     return data
 
@@ -397,14 +480,18 @@ Hard rules:
 Return strict JSON array only."""
 
 
-def _build_schema(equipment_type, key_specs, agent_log, cb):
+def _build_schema(equipment_type, key_specs, agent_log, cb, doc=""):
     _log(agent_log, cb, "SCHEMA", "Building sub-assembly schema...", running=True)
     prompt = f"""Product: {equipment_type}
 Known specs: {json.dumps(key_specs or {}, default=str)[:1500]}
 
-Step 1 (think): what kind of engineered product is this, and which engineering
-disciplines does it involve? (mechanical? electronic? hydraulic? optical?
-chemical/process? structural? a mix?)
+ACTUAL DATASHEET TEXT (decompose THIS specific product, not a generic category):
+{doc[:6000]}
+
+Step 1 (think): based on the datasheet above, what kind of engineered product is
+this, and which engineering disciplines does it involve? (mechanical? electronic?
+hydraulic? optical? chemical/process? structural? a mix?) Beware: the same word
+(e.g. "pump") can mean very different things depending on the product.
 
 Step 2: list ALL sub-assemblies (functional groups) THIS specific product
 contains, derived from what the product actually is — not from a fixed template.
@@ -480,17 +567,22 @@ material — castings, fabrications, machined parts, bare PCBs) or "bought_out"
 modules, connectors, fasteners). Return strict JSON array only, no prose."""
 
 
-def _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, total, idx):
+def _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, total, idx, doc=""):
     _log(agent_log, cb, "BOM",
          f"Populating: {sub['id']}. {sub['name']} ({idx}/{total})...", running=True)
     prompt = f"""Product: {equipment_type}
 Specs: {json.dumps(key_specs or {}, default=str)[:1200]}
 
+ACTUAL DATASHEET TEXT (components must fit THIS product, at THIS size/scale):
+{doc[:4500]}
+
 Sub-assembly to populate:
 id={sub['id']} | name={sub['name']} | scope={sub.get('description','')}
 
-List every real component in THIS sub-assembly. Use exact MOC grades and
-realistic kg weights for this product's size/duty.
+List every real component in THIS sub-assembly, consistent with the datasheet
+above. Use exact MOC grades / part classes and realistic kg weights for this
+product's actual size/duty (a handheld device has gram-scale parts; a process
+skid has kg/tonne-scale parts — match the real product).
 
 Return ONLY a JSON array:
 [{{"description":"component name (<=45 chars)","material":"ASTM/IS/EN grade or 'bought-out item'",
@@ -533,11 +625,11 @@ Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
     return norm
 
 
-def _generate_bom(equipment_type, key_specs, schema, agent_log, cb):
+def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
     bom = []
     n = len(schema)
     for i, sub in enumerate(schema, 1):
-        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, i)
+        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, i, doc)
         bom.extend(comps)
     # assign ids
     for j, c in enumerate(bom, 1):
@@ -580,7 +672,7 @@ def _validate_bom(bom, equipment_type, schema):
             "populated_subs": populated, "total_components": total}
 
 
-def _fill_gaps(equipment_type, key_specs, schema, bom, gaps, agent_log, cb):
+def _fill_gaps(equipment_type, key_specs, schema, bom, gaps, agent_log, cb, doc=""):
     """Re-populate sub-assemblies flagged as empty/low."""
     gap_ids = set()
     for g in gaps:
@@ -592,7 +684,7 @@ def _fill_gaps(equipment_type, key_specs, schema, bom, gaps, agent_log, cb):
     for k, gid in enumerate(sorted(gap_ids), 1):
         sub = sub_by_id.get(gid)
         if not sub: continue
-        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, k)
+        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, k, doc)
         # remove any existing items for this sub then re-add
         bom = [c for c in bom if c.get("sub_assembly_id") != gid]
         bom.extend(comps)
@@ -848,17 +940,18 @@ def run_agent(pdf_text, progress_callback=None):
     """
     _T0[0] = time.time()
     agent_log, cb = [], progress_callback
+    doc = pdf_text or ""
 
     # 1 — IDENTIFY
     ident = _identify(pdf_text, agent_log, cb)
     equipment_type = ident.get("equipment_type", "Engineered Product")
     key_specs = ident.get("key_specs", {}) or {}
 
-    # 2 — SCHEMA
-    schema = _build_schema(equipment_type, key_specs, agent_log, cb)
+    # 2 — SCHEMA (grounded in the actual datasheet text)
+    schema = _build_schema(equipment_type, key_specs, agent_log, cb, doc)
 
-    # 3 — BOM
-    bom = _generate_bom(equipment_type, key_specs, schema, agent_log, cb)
+    # 3 — BOM (grounded in the actual datasheet text)
+    bom = _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc)
 
     # 4 — VALIDATION LOOP (max 2 iterations)
     iterations = 0
@@ -869,7 +962,7 @@ def run_agent(pdf_text, progress_callback=None):
              f"completeness {int(validation['completeness']*100)}% → looping (iter {iterations})",
              f"{int(validation['completeness']*100)}% — filling {len(validation['gaps'])} gaps")
         bom = _fill_gaps(equipment_type, key_specs, schema, bom,
-                         validation["gaps"] + validation["warnings"], agent_log, cb)
+                         validation["gaps"] + validation["warnings"], agent_log, cb, doc)
         validation = _validate_bom(bom, equipment_type, schema)
     _log(agent_log, cb, "VALIDATE", "done",
          f"completeness {int(validation['completeness']*100)}% after {iterations} iteration(s)")
