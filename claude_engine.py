@@ -375,11 +375,26 @@ Return ONLY this JSON object:
 # STEP 2 — SCHEMA (dynamic, product-specific)
 # ═══════════════════════════════════════════════════════════════════
 
-SCHEMA_SYS = """You are a senior mechanical design engineer. For a given engineered
-product you enumerate its real sub-assemblies (functional groups) the way they
-appear on an actual fabrication/procurement BOM. The schema MUST be specific to
-THIS product — a compressor's sub-assemblies differ from a heat exchanger's.
-Never use a generic template. Return strict JSON array only."""
+SCHEMA_SYS = """You are a polymath design engineer who can decompose ANY engineered
+product in the world into its real sub-assemblies — regardless of industry or
+discipline. You are equally fluent in mechanical, rotating, static, electrical,
+electronic/PCB, embedded firmware, power/battery, communications, instrumentation,
+optical, hydraulic, pneumatic, chemical/process, structural/civil, marine,
+aerospace, automotive, medical-device and consumer-product engineering.
+
+For the given product you FIRST reason about what kind of product it actually is
+and which engineering disciplines it involves, THEN enumerate the sub-assemblies
+exactly as they would appear on that product's real manufacturing/procurement BOM.
+
+Hard rules:
+- The schema MUST be specific to THIS product. A pump, a transformer, a telescope,
+  a hydraulic press, a gas monitor, an EOT crane and a packaging machine have
+  COMPLETELY different sub-assemblies.
+- Do NOT default to mechanical/rotating groups out of habit. Derive the groups
+  from the actual product.
+- Include every discipline this product genuinely needs, and none that it doesn't.
+- Never output a generic catch-all template.
+Return strict JSON array only."""
 
 
 def _build_schema(equipment_type, key_specs, agent_log, cb):
@@ -387,11 +402,22 @@ def _build_schema(equipment_type, key_specs, agent_log, cb):
     prompt = f"""Product: {equipment_type}
 Known specs: {json.dumps(key_specs or {}, default=str)[:1500]}
 
-List ALL sub-assemblies (functional groups) this specific product contains.
-Be product-specific and exhaustive — cover the pressure-containing parts,
-rotating/moving parts, drive, sealing, bearings/supports, structural,
-piping/connections, instrumentation & controls, safety, and final assembly
-as they actually apply to THIS product.
+Step 1 (think): what kind of engineered product is this, and which engineering
+disciplines does it involve? (mechanical? electronic? hydraulic? optical?
+chemical/process? structural? a mix?)
+
+Step 2: list ALL sub-assemblies (functional groups) THIS specific product
+contains, derived from what the product actually is — not from a fixed template.
+Be exhaustive for this product and include every discipline it needs.
+
+For reference, different products decompose very differently, e.g.:
+- a centrifugal pump → hydraulics, rotating assembly, bearings, sealing, drive, structural
+- a portable gas monitor → sensors, main PCB, power/battery, display, wireless, enclosure
+- a power transformer → core, windings, tank, bushings, cooling, OLTC, protection
+- a shell & tube heat exchanger → shell, tube bundle, channels, tubesheets, baffles, nozzles
+- a hydraulic press → frame, cylinder, power pack, valves, controls, tooling
+- a telescope/optical instrument → optics, opto-mechanics, mount/drive, electronics, housing
+Use the pattern that fits THIS product; invent the right groups for it.
 
 Return ONLY a JSON array:
 [
@@ -402,6 +428,15 @@ Return ONLY a JSON array:
 Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
     raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500)
     data = _parse_json(raw)
+    # Free LLMs often wrap the array in an object — unwrap it.
+    if isinstance(data, dict):
+        for k in ("sub_assemblies", "subassemblies", "schema", "groups", "data", "items"):
+            if isinstance(data.get(k), list):
+                data = data[k]; break
+        else:
+            # any list value, else single dict -> one-item list
+            lists = [v for v in data.values() if isinstance(v, list)]
+            data = lists[0] if lists else ([data] if data.get("name") else [])
     schema = []
     if isinstance(data, list):
         for i, s in enumerate(data):
@@ -414,14 +449,16 @@ Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
                 "typical_components_count": int(s.get("typical_components_count", 4) or 4),
             })
     if not schema:
-        # Minimal generic fallback so the loop can still proceed
+        # Discipline-neutral fallback (NOT mechanical-biased) so the loop can
+        # still proceed even if schema generation failed to parse.
         schema = [
-            {"id": "A", "name": "Primary Assembly", "description": "core functional parts", "typical_components_count": 6},
-            {"id": "B", "name": "Drive / Actuation", "description": "drive & power transmission", "typical_components_count": 4},
-            {"id": "C", "name": "Structural & Supports", "description": "frame, base, supports", "typical_components_count": 4},
-            {"id": "D", "name": "Connections & Piping", "description": "nozzles, flanges, piping", "typical_components_count": 4},
-            {"id": "E", "name": "Instrumentation & Safety", "description": "instruments, guards", "typical_components_count": 3},
-            {"id": "F", "name": "Final Assembly", "description": "fasteners, gaskets, paint, assembly", "typical_components_count": 5},
+            {"id": "A", "name": "Primary Functional Assembly", "description": "core parts that deliver the product's main function", "typical_components_count": 6},
+            {"id": "B", "name": "Electronics & Control", "description": "PCBs, microcontroller, signal/power electronics", "typical_components_count": 5},
+            {"id": "C", "name": "Power System", "description": "battery, power supply, charging", "typical_components_count": 3},
+            {"id": "D", "name": "Sensing / Drive Subsystem", "description": "sensors or moving/driven parts as applicable", "typical_components_count": 4},
+            {"id": "E", "name": "User Interface & Communication", "description": "display, keypad, indicators, wireless/ports", "typical_components_count": 4},
+            {"id": "F", "name": "Enclosure & Structural", "description": "housing, frame, supports, sealing", "typical_components_count": 4},
+            {"id": "G", "name": "Final Assembly", "description": "fasteners, gaskets, labels, finishing, assembly", "typical_components_count": 4},
         ]
     _log(agent_log, cb, "SCHEMA", "done", f"{len(schema)} sub-assemblies generated")
     return schema
@@ -431,13 +468,16 @@ Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
 # STEP 3 — BOM GENERATION (per sub-assembly)
 # ═══════════════════════════════════════════════════════════════════
 
-BOM_SYS = """You are an expert rotating/static equipment engineer in India producing a
-detailed procurement BOM. For each sub-assembly you list real components with
-exact materials of construction (ASTM/IS/EN/ASME grades), realistic weights in
-kg, quantity, and applicable standards. type is "manufactured" (made from raw
-material — castings, fabrications, machined parts) or "bought_out" (procured
-complete — motors, bearings, seals, instruments, fasteners). Return strict JSON
-array only, no prose."""
+BOM_SYS = """You are an expert product engineer in India producing a detailed
+manufacturing/procurement BOM for ANY engineered product — mechanical, electrical,
+electronic, or instrument. For each sub-assembly you list its real components.
+For each component give: a specific name; its material/spec (for electronics use
+the part class, e.g. 'FR4 PCB', 'Li-ion 3.7V cell', 'ARM Cortex MCU', 'graphic
+LCD module'); realistic weight in kg (electronic parts are light — grams);
+quantity; and applicable standards if any. type is "manufactured" (made from raw
+material — castings, fabrications, machined parts, bare PCBs) or "bought_out"
+(procured complete — motors, bearings, seals, sensors, MCUs, displays, batteries,
+modules, connectors, fasteners). Return strict JSON array only, no prose."""
 
 
 def _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, total, idx):
