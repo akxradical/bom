@@ -1,15 +1,23 @@
 """
-BOM Engine v5.0 — Should-Cost Model for Engineered Products
-════════════════════════════════════════════════════════════
-Flow: PDF → Extract Specs → Generate BOM → Should-Cost Pricing
+Agentic BOM + Should-Cost Engine
+════════════════════════════════════════════════════════════════════
+Universal engineered-product procurement engine.
 
-1. EXTRACT: Claude/LLM reads datasheet PDF, outputs structured JSON specs
-2. BOM:     Claude/LLM generates 25-35 component BOM from specs  
-3. PRICE:   Claude + web_search finds live rates for each MOC,
-            adds machining/labor → gives RAW manufacturing cost
-            (no supplier overhead, no margin — just true cost)
+Drop ANY engineered-product datasheet (pump, compressor, agitator, motor,
+valve, fan/blower, heat exchanger, gearbox, conveyor, crane/MHE, HVAC
+chiller, pressure vessel, turbine, ...). The agent:
 
-Author: Ayush Kamle | Zetwerk CPT Category 2
+  1. IDENTIFY   — figures out what the product is
+  2. SCHEMA     — builds a product-specific sub-assembly schema from scratch
+  3. BOM        — populates components for every sub-assembly
+  4. VALIDATE   — checks completeness, loops to fill gaps (agentic)
+  5. PRICE      — should-cost from live market rates (RM + machining, floor)
+  6. CONFIDENCE — scores the run
+
+No pump-specific hardcoding. No fixed A–L sections. The agent decides the
+schema dynamically, every time, for every product.
+
+Author: Ayush Kamle
 """
 
 import json, re, time
@@ -21,8 +29,14 @@ from io import BytesIO
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_key(name):
-    import streamlit as st
-    return st.secrets.get(name, "")
+    try:
+        import streamlit as st
+        v = st.secrets.get(name, "")
+        if v: return v
+    except Exception:
+        pass
+    import os
+    return os.environ.get(name, "")
 
 
 def _http_post(url, headers, body, timeout=90, retries=2):
@@ -63,6 +77,23 @@ def _gemini(p, s="", mt=8000):
     d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={k}",
                    {"Content-Type": "application/json"}, b)
     return d["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def _gemini_grounded(p, s="", mt=4000):
+    """Gemini with Google Search grounding — the free equivalent of Claude
+    web_search. The model reads live Google results and answers from them,
+    so prices come from real pages, not hallucination."""
+    k = _get_key("GEMINI_API_KEY")
+    if not k: raise ValueError("GEMINI_API_KEY not set")
+    b = {"contents": [{"parts": [{"text": p}]}],
+         "tools": [{"google_search": {}}],
+         "generationConfig": {"maxOutputTokens": mt, "temperature": 0.1}}
+    if s: b["systemInstruction"] = {"parts": [{"text": s}]}
+    d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={k}",
+                   {"Content-Type": "application/json"}, b, timeout=120)
+    cand = (d.get("candidates") or [{}])[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    return " ".join(part.get("text", "") for part in parts if "text" in part).strip()
 
 
 def _groq(p, s="", mt=4000):
@@ -154,6 +185,35 @@ def _smart_call(prompt, system="", max_tokens=4000):
     return _call_llm(prompt, system, max_tokens)
 
 
+def _cheap_call(prompt, system="", max_tokens=4000):
+    """Cheapest path first (free LLMs), Claude only as last resort.
+    Used for low-stakes steps like initial identification."""
+    try:
+        return _call_llm(prompt, system, max_tokens)
+    except Exception:
+        if _get_key("ANTHROPIC_API_KEY"):
+            return _call_claude(prompt, system, max_tokens), "Claude"
+        raise
+
+
+def _grounded_call(prompt, system="", max_tokens=2000):
+    """Search-grounded call for live pricing. Preference chain:
+    Claude web_search → Gemini Google-Search grounding → free LLM
+    knowledge (floor-price guided). Returns (text, provider)."""
+    if _get_key("ANTHROPIC_API_KEY"):
+        try:
+            r = _call_claude(prompt, system, max_tokens, use_search=True)
+            if r and len(r) > 10: return r, "Claude+search"
+        except: pass
+    if _get_key("GEMINI_API_KEY"):
+        try:
+            r = _gemini_grounded(prompt, system, max_tokens)
+            if r and len(r) > 10: return r, "Gemini+grounding"
+        except: pass
+    # Last resort: free LLM from knowledge (floor prices in prompt anchor it)
+    return _call_llm(prompt, system, max_tokens)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # JSON PARSER — handles fences, preamble, truncated arrays
 # ═══════════════════════════════════════════════════════════════════
@@ -170,11 +230,11 @@ def _parse_json(text):
     # 1. Direct parse
     try: return json.loads(c)
     except: pass
-    # 2. Try complete {...} dict first (spec extraction returns dicts)
+    # 2. Try complete {...} dict
     r = _bracket_extract(c, '{', '}')
-    if r is not None and isinstance(r, dict) and ("pumps" in r or "document_type" in r):
+    if r is not None and isinstance(r, dict) and len(r) >= 1:
         return r
-    # 3. Try complete [...] array (BOM generation returns arrays)
+    # 3. Try complete [...] array
     r = _bracket_extract(c, '[', ']')
     if r is not None: return r
     # 4. TRUNCATED ARRAY — extract every complete {...} from broken [
@@ -235,7 +295,7 @@ def _recover_truncated(text):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STEP 1 — EXTRACT SPECS FROM PDF
+# PDF TEXT EXTRACTION
 # ═══════════════════════════════════════════════════════════════════
 
 def extract_pdf_text(file_bytes):
@@ -250,595 +310,751 @@ def extract_pdf_text(file_bytes):
     except Exception as e: return "", str(e)
 
 
-SPEC_SYS = """You are a senior procurement engineer for Indian EPC projects.
-Read any technical document (pump datasheet, motor spec, valve spec, GA drawing).
-Extract every parameter accurately. Use null for missing. Never guess.
-If no flow_m3h and head_m data → set is_pump_document: false."""
+# ═══════════════════════════════════════════════════════════════════
+# AGENT LOGGING
+# ═══════════════════════════════════════════════════════════════════
+
+_T0 = [0.0]
+
+def _stamp():
+    el = int(time.time() - _T0[0])
+    return f"[{el//60:02d}:{el%60:02d}]"
 
 
-def claude_extract_specs(pdf_text):
-    prompt = f"""Read this document and extract ALL specs as structured JSON.
+def _log(agent_log, cb, step, action, result="", running=False):
+    """Append a structured entry and push a terminal-style line to UI."""
+    entry = {"step": step, "action": action, "result": result, "t": _stamp()}
+    agent_log.append(entry)
+    mark = "◈" if running else "✓"
+    line = f"{entry['t']} {mark} {step:<10} {result or action}"
+    if cb:
+        try: cb(line, agent_log)
+        except: pass
+    return entry
 
-TEXT:
-{pdf_text[:15000]}
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1 — IDENTIFY
+# ═══════════════════════════════════════════════════════════════════
+
+IDENTIFY_SYS = """You are a senior mechanical / procurement engineer for Indian EPC projects.
+You read any engineered-product technical document (datasheet, GA drawing,
+spec sheet) and identify the product. Never guess wildly — if unsure, say so
+in key_specs. Return strict JSON only."""
+
+
+def _identify(pdf_text, agent_log, cb):
+    _log(agent_log, cb, "IDENTIFY", "Reading document structure...", running=True)
+    prompt = f"""Identify the engineered product described in this document.
+
+DOCUMENT TEXT:
+{pdf_text[:14000]}
 
 Return ONLY this JSON object:
 {{
-  "document_type": "pump_datasheet | motor_datasheet | valve_datasheet | other",
-  "is_pump_document": true or false,
-  "document_warning": "null if pump, else 'Motor-only datasheet' etc",
+  "equipment_type": "specific product class, include API/IS/standard class if present (e.g. 'Centrifugal Pump (API 610 OH2)', 'Screw Air Compressor (API 619)', 'Shell & Tube Heat Exchanger (TEMA AES)')",
   "manufacturer": "name or null",
-  "project": "name or null",
-  "multi_pump": false,
-  "pumps": [
-    {{
-      "pump_label": "descriptive name",
-      "model": "model or null",
-      "manufacturer": "name or null",
-      "type": "type or null",
-      "tag_numbers": "tags or null",
-      "standard": "standard or null",
-      "quantity": 1,
-      "flow_m3h": null,
-      "head_m": null,
-      "speed_rpm": null,
-      "motor_kw": null,
-      "stages": null,
-      "temp_c": null,
-      "density_kgm3": null,
-      "fluid": "fluid or null",
-      "efficiency_pct": null,
-      "impeller_dia_mm": null,
-      "moc": {{
-        "casing": "mat or null", "impeller": "mat or null",
-        "shaft": "mat or null", "shaft_sleeve": "mat or null",
-        "wear_ring": "mat or null", "bearing": "type or null",
-        "bearing_housing": "mat or null", "seal_type": "type or null",
-        "seal_plan": "plan or null", "baseplate": "mat or null",
-        "fasteners": "mat or null"
-      }},
-      "nozzles": {{
-        "suction_size": "size or null", "discharge_size": "size or null",
-        "flange_standard": "std or null"
-      }},
-      "weights": {{
-        "total_package_kg": null, "motor_kg": null, "pump_bare_kg": null
-      }},
-      "motor": {{
-        "type": "type or null", "rating_kw": null, "voltage_v": "v or null",
-        "frequency_hz": null, "poles": null, "speed_rpm": null,
-        "enclosure": "ip or null", "mounting": "mount or null"
-      }},
-      "drive": {{
-        "type": "direct coupled | belt driven | null",
-        "coupling_type": "type or null"
-      }},
-      "vibration_limit": "value or null",
-      "noise_limit_dba": null,
-      "performance_test_std": "std or null",
-      "notes": "critical notes or null"
-    }}
-  ]
+  "model": "model/tag or null",
+  "is_engineered_product": true,
+  "key_specs": {{ "any": "important rating/size/duty parameters you find as key:value" }}
 }}"""
-
-    raw, provider = _smart_call(prompt, SPEC_SYS, 4000)
     try:
-        import streamlit as st
-        st.session_state["_last_raw_response"] = (raw or "")[:4000]
-    except: pass
-    
-    data = _parse_json(raw)
-    if not data or not isinstance(data, dict): return None
-    
-    if "pumps" not in data or not isinstance(data.get("pumps"), list):
-        if any(k in data for k in ["flow_m3h", "head_m", "motor_kw"]):
-            data = {"pumps": [data], "document_type": "pump_datasheet",
-                    "is_pump_document": True, "manufacturer": data.get("manufacturer")}
-        else: data["pumps"] = []
-    
-    if "is_pump_document" not in data:
-        data["is_pump_document"] = any(
-            p.get("flow_m3h") or p.get("head_m")
-            for p in data.get("pumps", []) if isinstance(p, dict))
-    
-    data["_llm_provider"] = provider
+        raw, prov = _cheap_call(prompt, IDENTIFY_SYS, 1500)
+    except Exception as e:
+        raw, prov = "", "none"
+    data = _parse_json(raw) or {}
+    if not isinstance(data, dict): data = {}
+    et = (data.get("equipment_type") or "Engineered Product").strip()
+    data["equipment_type"] = et
+    data["_provider"] = prov
+    _log(agent_log, cb, "IDENTIFY", "done", f'equipment_type = "{et}"')
     return data
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STEP 2 — GENERATE BOM (25-35 components)
+# STEP 2 — SCHEMA (dynamic, product-specific)
 # ═══════════════════════════════════════════════════════════════════
 
-BOM_SYS = """Expert rotating equipment engineer, India. Generate 25-35 component BOMs.
-Include ALL sub-assemblies. Exact MOC (ASTM/IS/EN). Realistic weights.
-Descriptions MAX 40 chars. Return ONLY JSON array. No text before/after."""
+SCHEMA_SYS = """You are a senior mechanical design engineer. For a given engineered
+product you enumerate its real sub-assemblies (functional groups) the way they
+appear on an actual fabrication/procurement BOM. The schema MUST be specific to
+THIS product — a compressor's sub-assemblies differ from a heat exchanger's.
+Never use a generic template. Return strict JSON array only."""
 
 
-def claude_generate_bom(pump_specs):
-    specs_str = json.dumps(pump_specs, indent=1, default=str)
-    prompt = f"""BOM for:
-{specs_str}
+def _build_schema(equipment_type, key_specs, agent_log, cb):
+    _log(agent_log, cb, "SCHEMA", "Building sub-assembly schema...", running=True)
+    prompt = f"""Product: {equipment_type}
+Known specs: {json.dumps(key_specs or {}, default=str)[:1500]}
 
-JSON array ONLY. Use EXACT section names below:
-[{{"section":"EXACT NAME FROM LIST","sub_assembly":"group","component":"name",
-"description":"max 40 chars","moc":"ASTM/IS spec","qty":"1",
-"weight_kg":0,"req_type":"M","notes":""}}]
+List ALL sub-assemblies (functional groups) this specific product contains.
+Be product-specific and exhaustive — cover the pressure-containing parts,
+rotating/moving parts, drive, sealing, bearings/supports, structural,
+piping/connections, instrumentation & controls, safety, and final assembly
+as they actually apply to THIS product.
 
-EXACT section names (copy exactly, including spaces and dots):
-"A. PUMP HYDRAULICS"
-"B. ROTATING ASSEMBLY"
-"C. BEARINGS & LUBRICATION"
-"D. SHAFT SEALING"
-"E. DRIVE & COUPLING"
-"F. MOTOR / DRIVER"
-"G. STRUCTURAL"
-"H. PIPING & NOZZLES"
-"I. FASTENERS & GASKETS"
-"J. INSTRUMENTATION"
-"K. ACOUSTIC & SAFETY"
-"L. COMPLETE ASSEMBLY"
-
-MUST include ≥25 items: casing, impeller, wear_rings×2, shaft, sleeve, 
-bearings×2, brg_housing, seal, gland, coupling/drive, motor, baseplate,
-fdn_bolts, counter_flanges×2, gaskets×2, casing_bolts, RTD, painting.
-JSON array ONLY. No explanation."""
-
-    raw, provider = _smart_call(prompt, BOM_SYS, 4096)
+Return ONLY a JSON array:
+[
+  {{"id": "A", "name": "specific sub-assembly name",
+    "description": "what it contains",
+    "typical_components_count": 5}}
+]
+Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
+    raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500)
     data = _parse_json(raw)
-    
-    # Normalize to list of dicts
+    schema = []
+    if isinstance(data, list):
+        for i, s in enumerate(data):
+            if not isinstance(s, dict): continue
+            sid = str(s.get("id") or chr(65 + i)).strip() or chr(65 + i)
+            name = str(s.get("name") or s.get("sub_assembly") or f"Group {sid}").strip()
+            schema.append({
+                "id": sid, "name": name,
+                "description": str(s.get("description", "")).strip(),
+                "typical_components_count": int(s.get("typical_components_count", 4) or 4),
+            })
+    if not schema:
+        # Minimal generic fallback so the loop can still proceed
+        schema = [
+            {"id": "A", "name": "Primary Assembly", "description": "core functional parts", "typical_components_count": 6},
+            {"id": "B", "name": "Drive / Actuation", "description": "drive & power transmission", "typical_components_count": 4},
+            {"id": "C", "name": "Structural & Supports", "description": "frame, base, supports", "typical_components_count": 4},
+            {"id": "D", "name": "Connections & Piping", "description": "nozzles, flanges, piping", "typical_components_count": 4},
+            {"id": "E", "name": "Instrumentation & Safety", "description": "instruments, guards", "typical_components_count": 3},
+            {"id": "F", "name": "Final Assembly", "description": "fasteners, gaskets, paint, assembly", "typical_components_count": 5},
+        ]
+    _log(agent_log, cb, "SCHEMA", "done", f"{len(schema)} sub-assemblies generated")
+    return schema
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3 — BOM GENERATION (per sub-assembly)
+# ═══════════════════════════════════════════════════════════════════
+
+BOM_SYS = """You are an expert rotating/static equipment engineer in India producing a
+detailed procurement BOM. For each sub-assembly you list real components with
+exact materials of construction (ASTM/IS/EN/ASME grades), realistic weights in
+kg, quantity, and applicable standards. type is "manufactured" (made from raw
+material — castings, fabrications, machined parts) or "bought_out" (procured
+complete — motors, bearings, seals, instruments, fasteners). Return strict JSON
+array only, no prose."""
+
+
+def _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, total, idx):
+    _log(agent_log, cb, "BOM",
+         f"Populating: {sub['id']}. {sub['name']} ({idx}/{total})...", running=True)
+    prompt = f"""Product: {equipment_type}
+Specs: {json.dumps(key_specs or {}, default=str)[:1200]}
+
+Sub-assembly to populate:
+id={sub['id']} | name={sub['name']} | scope={sub.get('description','')}
+
+List every real component in THIS sub-assembly. Use exact MOC grades and
+realistic kg weights for this product's size/duty.
+
+Return ONLY a JSON array:
+[{{"description":"component name (<=45 chars)","material":"ASTM/IS/EN grade or 'bought-out item'",
+"qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,
+"standards_applicable":"std or empty"}}]
+Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
+    try:
+        raw, prov = _smart_call(prompt, BOM_SYS, 2500)
+    except Exception:
+        return []
+    data = _parse_json(raw)
+    items = []
     if isinstance(data, list):
         items = [x for x in data if isinstance(x, dict)]
     elif isinstance(data, dict):
-        for k in ["components", "bom", "items", "BOM", "data"]:
-            if k in data and isinstance(data[k], list):
+        for k in ["components", "bom", "items", "data"]:
+            if isinstance(data.get(k), list):
                 items = [x for x in data[k] if isinstance(x, dict)]; break
         else:
-            items = [data] if "component" in data else []
-    else:
-        items = []
-    
-    # If too few items, try harder with truncated recovery
-    if len(items) < 5 and raw:
-        cleaned = raw.replace("```json", "").replace("```", "")
-        # Try bracket extract for complete array
-        r = _bracket_extract(cleaned, "[", "]")
-        if isinstance(r, list) and len(r) > len(items):
-            items = [x for x in r if isinstance(x, dict)]
-        # Try recovering individual objects from truncated array
-        if len(items) < 5:
-            recovered = _recover_truncated(cleaned)
-            if len(recovered) > len(items):
-                items = recovered
-    
-    return items
-
-
-def bom_to_dataframe(bom_list):
-    if not bom_list: return pd.DataFrame()
-    rows = []
-    for i, c in enumerate(bom_list, 1):
-        if not isinstance(c, dict): continue
-        rows.append({
-            "No": i,
-            "Section": _normalize_section(c.get("section", "")),
-            "Sub_Assembly": str(c.get("sub_assembly", "")),
-            "Component": str(c.get("component", c.get("name", ""))),
-            "Description": str(c.get("description", "")),
-            "MOC": str(c.get("moc", c.get("material", ""))),
-            "Qty": str(c.get("qty", "1")),
-            "Weight_kg": c.get("weight_kg", c.get("weight", None)),
-            "Req_Type": str(c.get("req_type", "M")),
-            "Notes": str(c.get("notes", "")),
+            if "description" in data: items = [data]
+    # Recover from truncation if too few
+    if len(items) < 1 and raw:
+        items = _recover_truncated(raw.replace("```json", "").replace("```", ""))
+    norm = []
+    for c in items:
+        ctype = str(c.get("type", "")).lower()
+        if ctype not in ("manufactured", "bought_out"):
+            ctype = _classify(c.get("description", ""))
+        norm.append({
+            "description": str(c.get("description", c.get("component", c.get("name", "")))).strip()[:60],
+            "material": str(c.get("material", c.get("moc", ""))).strip(),
+            "qty": str(c.get("qty", c.get("quantity", "1"))).strip() or "1",
+            "unit": str(c.get("unit", "no")).strip() or "no",
+            "type": ctype,
+            "weight_kg": _num(c.get("weight_kg", c.get("weight"))),
+            "standards_applicable": str(c.get("standards_applicable", c.get("standards", ""))).strip(),
+            "sub_assembly_id": sub["id"],
+            "sub_assembly_name": sub["name"],
         })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    return norm
+
+
+def _generate_bom(equipment_type, key_specs, schema, agent_log, cb):
+    bom = []
+    n = len(schema)
+    for i, sub in enumerate(schema, 1):
+        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, i)
+        bom.extend(comps)
+    # assign ids
+    for j, c in enumerate(bom, 1):
+        c["id"] = j
+    _log(agent_log, cb, "BOM", "done", f"{len(bom)} components across {n} sub-assemblies")
+    return bom
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STEP 3 — SHOULD-COST PRICING (Claude + Web Search)
-# Raw Material (live price) + Machining = True Cost. No overhead.
+# STEP 4 — VALIDATION LOOP (agentic)
 # ═══════════════════════════════════════════════════════════════════
 
-COST_SYS = """You are a cost engineer at an Indian EPC company doing should-cost analysis.
-Find ACTUAL CURRENT manufacturing cost — not selling price, not textbook price.
+def _validate_bom(bom, equipment_type, schema):
+    """Returns {completeness, gaps, warnings}."""
+    gaps, warnings = [], []
+    by_sub = {}
+    for c in bom:
+        by_sub.setdefault(c.get("sub_assembly_id"), []).append(c)
 
-Use web_search to find REAL 2025-26 Indian market prices. Search specifically:
+    populated = 0
+    for sub in schema:
+        cnt = len(by_sub.get(sub["id"], []))
+        if cnt == 0:
+            gaps.append(f"{sub['id']}. {sub['name']} — no components")
+        else:
+            populated += 1
+            if cnt < max(2, int(sub.get("typical_components_count", 4) * 0.5)):
+                warnings.append(f"{sub['id']}. {sub['name']} — only {cnt} components (low)")
+
+    schema_cov = populated / max(len(schema), 1)
+
+    # Reasonableness of total count
+    total = len(bom)
+    if total < 10:
+        warnings.append(f"Total components ({total}) low for {equipment_type}")
+    size_ok = 1.0 if total >= 15 else (total / 15.0)
+
+    completeness = round(0.7 * schema_cov + 0.3 * size_ok, 3)
+    return {"completeness": completeness, "gaps": gaps, "warnings": warnings,
+            "populated_subs": populated, "total_components": total}
+
+
+def _fill_gaps(equipment_type, key_specs, schema, bom, gaps, agent_log, cb):
+    """Re-populate sub-assemblies flagged as empty/low."""
+    gap_ids = set()
+    for g in gaps:
+        gid = g.split(".")[0].strip()
+        if gid: gap_ids.add(gid)
+    n = len(gap_ids)
+    if not n: return bom
+    sub_by_id = {s["id"]: s for s in schema}
+    for k, gid in enumerate(sorted(gap_ids), 1):
+        sub = sub_by_id.get(gid)
+        if not sub: continue
+        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, k)
+        # remove any existing items for this sub then re-add
+        bom = [c for c in bom if c.get("sub_assembly_id") != gid]
+        bom.extend(comps)
+    for j, c in enumerate(bom, 1):
+        c["id"] = j
+    return bom
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 5 — SHOULD-COST PRICING
+# RM (gross weight × live ₹/kg) + machining. No overhead, no margin.
+# ═══════════════════════════════════════════════════════════════════
+
+COST_SYS = """You are a cost engineer at an Indian EPC company doing should-cost analysis
+for ANY engineered-product component. Find ACTUAL CURRENT manufacturing cost —
+not selling price, not textbook price.
+
+Use live market data where possible. Search:
 - SAIL/RINL price lists for steel grades
-- LME India for non-ferrous metals  
-- IndiaMART for castings, machined parts, bought-out items
-- TradeIndia for industrial components
+- LME India for non-ferrous metals
+- IndiaMART / TradeIndia for castings, machined parts, bought-out items
 
-IMPORTANT: Do NOT under-estimate. Use REALISTIC prices:
-- Grey cast iron casting (finished+machined): ₹180-220/kg
-- IS 2062 fabricated steel: ₹130-160/kg
-- SS316 casting: ₹750-950/kg
-- High chrome iron A532: ₹900-1200/kg
-- EN-19/EN-24 shaft (bar+machined): ₹400-600/kg
-- CNC machining shop rate: ₹1200-1800/hr
-- Motor (LT 415V): ₹5000-8000/kW
-- Motor (HT 690V): ₹4000-5500/kW
+Use REALISTIC 2025-26 Indian prices. Reference bands (₹/kg, finished):
+- Grey cast iron casting: 180-220
+- IS 2062 fabricated steel: 130-160
+- SS316 / CF8M casting: 750-950
+- High chrome iron A532: 900-1200
+- Alloy steel bar (EN19/EN24, machined): 400-600
+- CNC machining shop rate: 1200-1800/hr
+- LT 415V motor: 5000-8000/kW ; HT motor: 4000-5500/kW
 
-All amounts in INR. No overhead. No margin."""
+All amounts INR. No overhead. No margin. Floor manufacturing cost only."""
 
 
 def _classify(comp, moc=""):
     c = (comp or "").upper()
     if "MOTOR" in c and not any(x in c for x in ["BOLT","PULLEY","SIDE","BRACKET","HOUSING","MOUNT"]): return "bought_out"
     if "BEARING" in c and "HOUSING" not in c: return "bought_out"
-    if any(x in c for x in ["MECHANICAL SEAL","MECH SEAL"]): return "bought_out"
+    if any(x in c for x in ["MECHANICAL SEAL","MECH SEAL","SEAL KIT"]): return "bought_out"
     if any(x in c for x in ["V-BELT","V BELT","VBELT"]): return "bought_out"
     if "COMPANION FLANGE" in c or "COUNTER FLANGE" in c: return "bought_out"
-    if "GASKET" in c: return "bought_out"
+    if "GASKET" in c or "O-RING" in c or "O RING" in c: return "bought_out"
     if "FOUNDATION" in c and "BOLT" in c: return "bought_out"
-    if any(x in c for x in ["RTD","THERMOMETER","PRESSURE GAUGE","VIBRATION SWITCH"]): return "bought_out"
-    if any(x in c for x in ["FIRST FILL","GREASE","LUBRICANT"]): return "bought_out"
+    if any(x in c for x in ["RTD","THERMOMETER","PRESSURE GAUGE","TRANSMITTER","SWITCH","SENSOR","PT100","GAUGE"]): return "bought_out"
+    if any(x in c for x in ["FIRST FILL","GREASE","LUBRICANT","OIL FILL"]): return "bought_out"
     if "GUARD" in c: return "bought_out"
-    if "SLD" in c: return "bought_out"
-    if any(x in c for x in ["COMPLETE ASSEMBLY","NOISE LEVEL","VIBRATION LIMIT","PERFORMANCE TEST","SURFACE PREP"]): return "compliance"
+    if any(x in c for x in ["NUT","BOLT","STUD","WASHER","FASTENER"]): return "bought_out"
     return "manufactured"
 
 
-def claude_price_bom(bom_df, pump_specs, progress_callback=None):
-    if bom_df is None or bom_df.empty: return bom_df
-    pump = pump_specs if isinstance(pump_specs, dict) else {}
-    
-    if not _get_key("ANTHROPIC_API_KEY"):
-        raise Exception("ANTHROPIC_API_KEY required for should-cost pricing (web search).")
-    
-    if progress_callback: progress_callback(8, "Classifying components...")
-    
+def _num(v):
+    try:
+        if v in (None, "", "null", "None"): return 0.0
+        return float(re.findall(r"-?\d+\.?\d*", str(v))[0])
+    except: return 0.0
+
+
+def _price_bom(equipment_type, key_specs, bom, agent_log, cb):
+    """Add should-cost columns to each component dict in place. Returns bom."""
+    if not bom: return bom
+    _log(agent_log, cb, "PRICE", "Starting should-cost...", running=True)
+
     items = []
-    for _, row in bom_df.iterrows():
-        comp = str(row.get("Component", ""))
-        items.append({"row": row.to_dict(), "no": row.get("No", 0),
-                      "comp": comp, "moc": str(row.get("MOC", "")),
-                      "weight": row.get("Weight_kg"), "qty": str(row.get("Qty", "1")),
-                      "cat": _classify(comp, str(row.get("MOC", "")))})
-    
+    for c in bom:
+        ctype = c.get("type") or _classify(c.get("description", ""))
+        items.append({"c": c, "cat": ctype})
+
     mfg = [x for x in items if x["cat"] == "manufactured"]
     bo = [x for x in items if x["cat"] == "bought_out"]
-    cmp = [x for x in items if x["cat"] == "compliance"]
-    
-    if progress_callback:
-        progress_callback(12, f"{len(mfg)} manufactured, {len(bo)} bought-out...")
-    
-    result = []
-    
-    # Price manufactured (batch 3, 35s between to stay under 30k TPM)
+
+    spec_str = json.dumps(key_specs or {}, default=str)[:600]
+
+    # ---- Manufactured: RM (gross weight × ₹/kg) + machining ----
     for i in range(0, len(mfg), 3):
         batch = mfg[i:i+3]
-        pct = 15 + int((i / max(len(mfg), 1)) * 50)
-        if progress_callback:
-            progress_callback(pct, f"Searching: {', '.join(c['comp'][:18] for c in batch)}...")
-        
-        items_j = json.dumps([{"no":c["no"],"component":c["comp"],"moc":c["moc"],
-                               "weight_kg":c["weight"],"qty":c["qty"]} for c in batch], default=str)
-        prompt = f"""Should-cost for these components. Pump: {pump.get('type','')}, {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
+        _log(agent_log, cb, "PRICE",
+             "fetching market rates: " + ", ".join(x["c"]["description"][:18] for x in batch),
+             running=True)
+        items_j = json.dumps([{"id": x["c"]["id"], "description": x["c"]["description"],
+                               "material": x["c"]["material"], "weight_kg": x["c"]["weight_kg"],
+                               "qty": x["c"]["qty"]} for x in batch], default=str)
+        prompt = f"""Should-cost for these {equipment_type} components. Specs: {spec_str}
 
 Components:
 {items_j}
 
 For EACH component:
-1. web_search: "[exact MOC grade] price per kg India 2025" (e.g. "IS 210 FG200 grey iron casting price India 2025")
-2. Calculate gross weight: castings ×1.35, bar/forging ×1.15
-3. raw_material_cost = gross_weight × ₹/kg from search
-4. machining_cost: use realistic rates — CNC turning/boring ₹1200-1600/hr, pattern+mould ₹20-25/kg gross weight, fabrication welding ₹130-160/kg
-5. total = raw + machining
+1. Find live ₹/kg for its exact material grade (India 2025-26).
+2. Gross weight = net weight × 1.35 for castings, × 1.15 for forgings/bar/plate.
+3. raw_material_cost = gross_weight × ₹/kg.
+4. machining_cost: realistic — CNC turning/boring ₹1200-1600/hr, pattern+mould ₹20-25/kg gross, fabrication welding ₹130-160/kg.
+5. total = raw + machining. No overhead, no margin.
 
-Use ACTUAL market prices from search. Do not use textbook/theoretical values.
-If search fails, use these floor prices: grey CI ₹190/kg, SS316 ₹850/kg, CS/WCB ₹220/kg, alloy steel bar ₹480/kg, high chrome ₹1000/kg, MS fabricated ₹145/kg.
+Floor prices if a rate is unavailable: grey CI ₹190/kg, SS316 ₹850/kg, CS/WCB ₹220/kg, alloy steel bar ₹480/kg, high chrome ₹1000/kg, MS fabricated ₹145/kg.
 
 Return JSON array ONLY:
-[{{"no":<n>,"raw_material_rate_per_kg":<int>,"gross_weight_kg":<num>,
-"raw_material_cost_inr":<int>,"machining_cost_inr":<int>,
-"total_cost_inr":<int>,"material_source":"site+query used",
-"confidence":"high|medium|low","notes":"brief calc basis"}}]"""
-        
+[{{"id":<n>,"raw_material_rate_per_kg":<int>,"gross_weight_kg":<num>,
+"raw_material_cost_inr":<int>,"machining_cost_inr":<int>,"total_cost_inr":<int>,
+"material_source":"site/basis","confidence":"high|medium|low","notes":"calc basis"}}]"""
         try:
-            raw_resp = _call_claude(prompt, COST_SYS, 2000, use_search=True)
-            parsed = _parse_json(raw_resp)
+            raw, prov = _grounded_call(prompt, COST_SYS, 2000)
+            parsed = _parse_json(raw)
             if not isinstance(parsed, list): parsed = [parsed] if isinstance(parsed, dict) else []
-            pm = {p["no"]: p for p in parsed if isinstance(p, dict) and "no" in p}
-            for c in batch:
-                rd = c["row"].copy()
-                p = pm.get(c["no"], {})
-                raw_c = int(p.get("raw_material_cost_inr", 0))
-                mach = int(p.get("machining_cost_inr", 0))
-                total = int(p.get("total_cost_inr", raw_c + mach))
-                rd.update({"Raw_Material_INR": raw_c, "Machining_INR": mach,
-                          "Total_Price_INR": total, "Unit_Price_INR": total,
-                          "GST_18pct": int(total*0.18), "Price_With_GST": int(total*1.18),
-                          "Price_Confidence": p.get("confidence","medium"),
-                          "Price_Source": p.get("material_source",""),
-                          "Price_Notes": f"₹{p.get('raw_material_rate_per_kg',0)}/kg × {p.get('gross_weight_kg',0)}kg | {p.get('notes','')}",
-                          "Component_Type": "manufactured"})
-                result.append(rd)
+            pm = {p["id"]: p for p in parsed if isinstance(p, dict) and "id" in p}
+            for x in batch:
+                p = pm.get(x["c"]["id"], {})
+                raw_c = int(_num(p.get("raw_material_cost_inr")))
+                mach = int(_num(p.get("machining_cost_inr")))
+                total = int(_num(p.get("total_cost_inr")) or (raw_c + mach))
+                _apply_price(x["c"], raw_c, mach, total, "manufactured",
+                             p.get("confidence", "medium"), p.get("material_source", prov),
+                             f"₹{p.get('raw_material_rate_per_kg',0)}/kg × {p.get('gross_weight_kg',0)}kg | {p.get('notes','')}")
         except Exception as e:
-            for c in batch:
-                rd = c["row"].copy()
-                rd.update({"Raw_Material_INR":0,"Machining_INR":0,"Total_Price_INR":0,
-                          "Unit_Price_INR":0,"GST_18pct":0,"Price_With_GST":0,
-                          "Price_Confidence":"error","Price_Source":str(e)[:80],
-                          "Price_Notes":"","Component_Type":"manufactured"})
-                result.append(rd)
-        if i + 3 < len(mfg): time.sleep(35)
-    
-    # Price bought-out (batch 4, 35s between)
+            for x in batch:
+                _apply_price(x["c"], 0, 0, 0, "manufactured", "error", str(e)[:80], "")
+        if i + 3 < len(mfg): time.sleep(_pricing_delay())
+
+    # ---- Bought-out: market procurement price ----
     for i in range(0, len(bo), 4):
         batch = bo[i:i+4]
-        pct = 67 + int((i / max(len(bo), 1)) * 22)
-        if progress_callback:
-            progress_callback(pct, f"Market pricing: {', '.join(c['comp'][:18] for c in batch)}...")
-        
-        items_j = json.dumps([{"no":c["no"],"component":c["comp"],"moc":c["moc"],
-                               "qty":c["qty"]} for c in batch], default=str)
-        prompt = f"""Find OEM MARKET PRICE for these items. This is what the pump vendor PAYS to procure them.
-Pump: {pump.get('motor_kw','')}kW, fluid: {pump.get('fluid','')}
+        _log(agent_log, cb, "PRICE",
+             "market pricing: " + ", ".join(x["c"]["description"][:18] for x in batch),
+             running=True)
+        items_j = json.dumps([{"id": x["c"]["id"], "description": x["c"]["description"],
+                               "material": x["c"]["material"], "qty": x["c"]["qty"]}
+                              for x in batch], default=str)
+        prompt = f"""Find OEM MARKET PROCUREMENT PRICE (what the fabricator pays) for these
+bought-out items of a {equipment_type}. Specs: {spec_str}
 
 Items:
 {items_j}
 
-For each item use the RIGHT search:
-- Motor: web_search "Kirloskar/ABB/Siemens {pump.get('motor_kw','')}kW {pump.get('motor',{}).get('voltage_v','415V')} motor price India 2025 IndiaMART"
-  Floor: LT 415V = ₹5000-7000/kW, HT 690V = ₹4000-5500/kW
-- Bearing: web_search "SKF/TIMKEN [type] bearing price India IndiaMART 2025"
-  Floor: taper roller medium = ₹6000-12000, large = ₹15000-25000
-- Mechanical seal: web_search "EagleBurgmann mechanical seal [shaft size]mm India price"
-  Floor: single cartridge = ₹45000-150000 depending on size
-- Gasket: web_search "spiral wound gasket [size] ASME B16.20 price India"
-  Floor: per gasket ₹500-2000
-- RTD/Thermowell: web_search "PT100 RTD thermowell SS316 India IndiaMART price"
-  Floor: ₹2500-6000 per unit with thermowell
-- Flanges: web_search "ANSI B16.5 [class] carbon steel flange [size] price India"
-  Floor: per set with gasket+bolts ₹2000-8000
-- Foundation bolts: web_search "anchor bolt M24/M30 price India per piece"
-  Floor: ₹200-500 per bolt
-- V-belts: web_search "industrial V-belt set [kW rating] price India"
-  Floor: ₹8000-25000 per set
-
-Search and find REAL current prices. Use floor prices only if search fails.
+Use the right search per item (motor, bearing, seal, gasket, instrument, fastener,
+flange, gearbox, coupling, etc.). Give realistic current Indian price each.
 
 Return JSON array ONLY:
-[{{"no":<n>,"market_price_inr":<int>,"search_query":"exact query used",
-"source":"IndiaMART/TradeIndia/etc","confidence":"high|medium|low","notes":"make/model/size referenced"}}]"""
-        
+[{{"id":<n>,"market_price_inr":<int>,"source":"IndiaMART/TradeIndia/OEM","confidence":"high|medium|low","notes":"make/size referenced"}}]"""
         try:
-            raw_resp = _call_claude(prompt, COST_SYS, 2000, use_search=True)
-            parsed = _parse_json(raw_resp)
+            raw, prov = _grounded_call(prompt, COST_SYS, 2000)
+            parsed = _parse_json(raw)
             if not isinstance(parsed, list): parsed = [parsed] if isinstance(parsed, dict) else []
-            pm = {p["no"]: p for p in parsed if isinstance(p, dict) and "no" in p}
-            for c in batch:
-                rd = c["row"].copy()
-                p = pm.get(c["no"], {})
-                price = int(p.get("market_price_inr", 0))
-                rd.update({"Raw_Material_INR": price, "Machining_INR": 0,
-                          "Total_Price_INR": price, "Unit_Price_INR": price,
-                          "GST_18pct": int(price*0.18), "Price_With_GST": int(price*1.18),
-                          "Price_Confidence": p.get("confidence","medium"),
-                          "Price_Source": p.get("source",""),
-                          "Price_Notes": p.get("notes",""),
-                          "Component_Type": "bought_out"})
-                result.append(rd)
+            pm = {p["id"]: p for p in parsed if isinstance(p, dict) and "id" in p}
+            for x in batch:
+                p = pm.get(x["c"]["id"], {})
+                price = int(_num(p.get("market_price_inr")))
+                _apply_price(x["c"], price, 0, price, "bought_out",
+                             p.get("confidence", "medium"), p.get("source", prov),
+                             p.get("notes", ""))
         except Exception as e:
-            for c in batch:
-                rd = c["row"].copy()
-                rd.update({"Raw_Material_INR":0,"Machining_INR":0,"Total_Price_INR":0,
-                          "Unit_Price_INR":0,"GST_18pct":0,"Price_With_GST":0,
-                          "Price_Confidence":"error","Price_Source":str(e)[:80],
-                          "Price_Notes":"","Component_Type":"bought_out"})
-                result.append(rd)
-        if i + 4 < len(bo): time.sleep(35)
-    
-    # Compliance (zero cost)
-    for c in cmp:
-        rd = c["row"].copy()
-        rd.update({"Raw_Material_INR":0,"Machining_INR":0,"Total_Price_INR":0,
-                  "Unit_Price_INR":0,"GST_18pct":0,"Price_With_GST":0,
-                  "Price_Confidence":"high","Price_Source":"No separate cost",
-                  "Price_Notes":"Assembly item","Component_Type":"compliance"})
-        result.append(rd)
-    
-    if progress_callback: progress_callback(92, "Building report...")
-    return pd.DataFrame(result)
+            for x in batch:
+                _apply_price(x["c"], 0, 0, 0, "bought_out", "error", str(e)[:80], "")
+        if i + 4 < len(bo): time.sleep(_pricing_delay())
+
+    _log(agent_log, cb, "PRICE", "done", "should-cost complete")
+    return bom
 
 
-def build_cost_summary(priced_df):
-    if priced_df is None or priced_df.empty: return {}
-    def _s(c): return int(priced_df[c].sum()) if c in priced_df.columns else 0
-    sub_col = "Sub_Assembly" if "Sub_Assembly" in priced_df.columns else "Section"
-    sub_totals = (priced_df.groupby(sub_col)["Total_Price_INR"]
-                  .sum().sort_values(ascending=False).to_dict()
-                  if "Total_Price_INR" in priced_df.columns else {})
-    top5 = (priced_df.nlargest(5, "Total_Price_INR")
-            [["Component","Total_Price_INR","Raw_Material_INR","Machining_INR","Price_Confidence","Price_Source"]]
-            .to_dict("records")) if "Total_Price_INR" in priced_df.columns else []
+def _pricing_delay():
+    # Claude TPM limits need long gaps; free grounding can go faster.
+    if _get_key("ANTHROPIC_API_KEY"): return 35
+    if _get_key("GEMINI_API_KEY"): return 8
+    return 2
+
+
+def _apply_price(c, raw_c, mach, total, ctype, conf, source, notes):
+    qty = max(_num(c.get("qty")) or 1, 1)
+    line_total = int(total * qty)
+    c.update({
+        "raw_material_inr": raw_c,
+        "machining_inr": mach,
+        "unit_cost_inr": total,
+        "total_cost_inr": line_total,
+        "gst_18pct": int(line_total * 0.18),
+        "price_with_gst": int(line_total * 1.18),
+        "price_confidence": conf,
+        "price_source": str(source)[:120],
+        "price_notes": str(notes)[:200],
+        "component_type": ctype,
+    })
+
+
+def _build_should_cost(bom):
+    if not bom: return {}
+    def s(k): return int(sum(_num(c.get(k)) for c in bom))
+    sub_totals = {}
+    for c in bom:
+        key = f"{c.get('sub_assembly_id','?')}. {c.get('sub_assembly_name','')}"
+        sub_totals[key] = sub_totals.get(key, 0) + int(_num(c.get("total_cost_inr")))
+    sub_totals = dict(sorted(sub_totals.items(), key=lambda kv: kv[1], reverse=True))
+    top = sorted(bom, key=lambda c: _num(c.get("total_cost_inr")), reverse=True)[:5]
+    top5 = [{"description": c.get("description"), "total_cost_inr": int(_num(c.get("total_cost_inr"))),
+             "sub_assembly": c.get("sub_assembly_name"), "confidence": c.get("price_confidence")}
+            for c in top]
+    conf = {}
+    for c in bom:
+        k = c.get("price_confidence", "n/a"); conf[k] = conf.get(k, 0) + 1
+    types = {}
+    for c in bom:
+        k = c.get("component_type", "n/a"); types[k] = types.get(k, 0) + 1
     return {
-        "total_raw_material": _s("Raw_Material_INR"), "total_machining": _s("Machining_INR"),
-        "total_ex_gst": _s("Total_Price_INR"), "total_gst": _s("GST_18pct"),
-        "total_incl_gst": _s("Price_With_GST"),
+        "total_raw_material": s("raw_material_inr"),
+        "total_machining": s("machining_inr"),
+        "total_ex_gst": s("total_cost_inr"),
+        "total_gst": s("gst_18pct"),
+        "total_incl_gst": s("price_with_gst"),
         "sub_totals": {k: int(v) for k, v in sub_totals.items()},
         "top5_drivers": top5,
-        "confidence": priced_df["Price_Confidence"].value_counts().to_dict() if "Price_Confidence" in priced_df.columns else {},
-        "component_count": len(priced_df),
-        "type_split": priced_df["Component_Type"].value_counts().to_dict() if "Component_Type" in priced_df.columns else {},
-        "note": "Should-Cost = Raw Material (live web prices) + Machining. NO overhead, NO margin. Difference vs PO = supplier's profit.",
+        "confidence": conf,
+        "type_split": types,
+        "component_count": len(bom),
+        "note": "Should-Cost = Raw Material (live rates) + Machining. NO overhead, NO margin. PO − should-cost = supplier profit.",
     }
 
 
 # ═══════════════════════════════════════════════════════════════════
-# GROUPING & EXCEL EXPORT
+# STEP 6 — CONFIDENCE
 # ═══════════════════════════════════════════════════════════════════
 
-SECTION_ORDER = [
-    "A. PUMP HYDRAULICS","B. ROTATING ASSEMBLY","C. BEARINGS & LUBRICATION",
-    "D. SHAFT SEALING","E. DRIVE & COUPLING","F. MOTOR / DRIVER",
-    "G. STRUCTURAL","H. PIPING & NOZZLES","I. FASTENERS & GASKETS",
-    "J. INSTRUMENTATION","K. ACOUSTIC & SAFETY","L. COMPLETE ASSEMBLY",
-]
+def _confidence(bom, schema, validation):
+    if not bom: return 0.0
+    schema_completeness = validation.get("completeness", 0.0)
+    priced = [c for c in bom if _num(c.get("total_cost_inr")) > 0]
+    pricing_coverage = len(priced) / max(len(bom), 1)
+    def has_mat(c):
+        m = (c.get("material") or "").strip().lower()
+        return bool(m) and m not in ("null", "none", "n/a", "bought-out item", "-")
+    material_spec_quality = sum(1 for c in bom if has_mat(c)) / max(len(bom), 1)
+    standards_coverage = sum(1 for c in bom if (c.get("standards_applicable") or "").strip()) / max(len(bom), 1)
+    score = (0.40 * schema_completeness + 0.30 * pricing_coverage +
+             0.20 * material_spec_quality + 0.10 * standards_coverage)
+    return round(score, 3)
 
-def _normalize_section(s):
-    """Map any Claude section name variation to canonical SECTION_ORDER name."""
-    raw = str(s).strip()
-    upper = raw.upper()
 
-    # Already correct — fast path
-    canonical = [
-        "A. PUMP HYDRAULICS","B. ROTATING ASSEMBLY","C. BEARINGS & LUBRICATION",
-        "D. SHAFT SEALING","E. DRIVE & COUPLING","F. MOTOR / DRIVER",
-        "G. STRUCTURAL","H. PIPING & NOZZLES","I. FASTENERS & GASKETS",
-        "J. INSTRUMENTATION","K. ACOUSTIC & SAFETY","L. COMPLETE ASSEMBLY",
-    ]
-    if raw in canonical: return raw
-    if upper in [c.upper() for c in canonical]:
-        for c in canonical:
-            if c.upper() == upper: return c
+# ═══════════════════════════════════════════════════════════════════
+# AGENT LOOP — orchestrates all steps
+# ═══════════════════════════════════════════════════════════════════
 
-    # Single letter prefix
-    letter_map = {
-        "A":"A. PUMP HYDRAULICS",     "B":"B. ROTATING ASSEMBLY",
-        "C":"C. BEARINGS & LUBRICATION","D":"D. SHAFT SEALING",
-        "E":"E. DRIVE & COUPLING",     "F":"F. MOTOR / DRIVER",
-        "G":"G. STRUCTURAL",           "H":"H. PIPING & NOZZLES",
-        "I":"I. FASTENERS & GASKETS",  "J":"J. INSTRUMENTATION",
-        "K":"K. ACOUSTIC & SAFETY",    "L":"L. COMPLETE ASSEMBLY",
+def run_agent(pdf_text, progress_callback=None):
+    """
+    Full agentic loop. Claude/free LLMs decide schema and components; the
+    engine validates and loops to fill gaps, then prices and scores.
+
+    Returns: {
+        "equipment_type": str, "manufacturer": str, "model": str,
+        "schema": [{"id","name","description","typical_components_count"}],
+        "bom": [component dicts with pricing],
+        "should_cost": {...},
+        "confidence": float,
+        "agent_log": [{"step","action","result","t"}],
+        "gaps": [...], "warnings": [...],
+        "iterations": int,
     }
-    # Extract leading letter
-    if upper and upper[0] in letter_map:
-        # "A. XXX" or "A.XXX" or "A XXX" — first char is the section letter
-        if len(upper) == 1 or upper[1] in (". ", ".", " "):
-            return letter_map[upper[0]]
+    """
+    _T0[0] = time.time()
+    agent_log, cb = [], progress_callback
 
-    # Keyword match (order matters — more specific first)
-    keyword_map = [
-        ("PUMP HYDRAULICS",        "A. PUMP HYDRAULICS"),
-        ("ROTATING ASSEMBLY",      "B. ROTATING ASSEMBLY"),
-        ("BEARINGS & LUBRICATION", "C. BEARINGS & LUBRICATION"),
-        ("BEARINGS AND LUBRICATION","C. BEARINGS & LUBRICATION"),
-        ("BEARINGS",               "C. BEARINGS & LUBRICATION"),
-        ("SHAFT SEALING",          "D. SHAFT SEALING"),
-        ("DRIVE & COUPLING",       "E. DRIVE & COUPLING"),
-        ("DRIVE AND COUPLING",     "E. DRIVE & COUPLING"),
-        ("DRIVE/COUPLING",         "E. DRIVE & COUPLING"),
-        ("DRIVE",                  "E. DRIVE & COUPLING"),
-        ("MOTOR / DRIVER",         "F. MOTOR / DRIVER"),
-        ("MOTOR/DRIVER",           "F. MOTOR / DRIVER"),
-        ("MOTOR",                  "F. MOTOR / DRIVER"),
-        ("STRUCTURAL",             "G. STRUCTURAL"),
-        ("PIPING & NOZZLES",       "H. PIPING & NOZZLES"),
-        ("PIPING AND NOZZLES",     "H. PIPING & NOZZLES"),
-        ("PIPING/NOZZLES",         "H. PIPING & NOZZLES"),
-        ("PIPING",                 "H. PIPING & NOZZLES"),
-        ("NOZZLES",                "H. PIPING & NOZZLES"),
-        ("FASTENERS & GASKETS",    "I. FASTENERS & GASKETS"),
-        ("FASTENERS AND GASKETS",  "I. FASTENERS & GASKETS"),
-        ("FASTENERS",              "I. FASTENERS & GASKETS"),
-        ("INSTRUMENTATION",        "J. INSTRUMENTATION"),
-        ("ACOUSTIC & SAFETY",      "K. ACOUSTIC & SAFETY"),
-        ("ACOUSTIC",               "K. ACOUSTIC & SAFETY"),
-        ("COMPLETE ASSEMBLY",      "L. COMPLETE ASSEMBLY"),
-    ]
-    for keyword, canonical_name in keyword_map:
-        if keyword in upper:
-            return canonical_name
+    # 1 — IDENTIFY
+    ident = _identify(pdf_text, agent_log, cb)
+    equipment_type = ident.get("equipment_type", "Engineered Product")
+    key_specs = ident.get("key_specs", {}) or {}
 
-    return raw  # return original if nothing matched
+    # 2 — SCHEMA
+    schema = _build_schema(equipment_type, key_specs, agent_log, cb)
 
+    # 3 — BOM
+    bom = _generate_bom(equipment_type, key_specs, schema, agent_log, cb)
 
-def group_bom(bom_df):
-    if bom_df is None or bom_df.empty: return []
-    if "Section" not in bom_df.columns: return [("ALL","All",bom_df)]
-    # Normalize section names first
-    bom_df = bom_df.copy()
-    bom_df["Section"] = bom_df["Section"].apply(_normalize_section)
-    sec_order = {s:i for i,s in enumerate(SECTION_ORDER)}
-    df = bom_df.copy()
-    df["_ord"] = df["Section"].apply(lambda s: sec_order.get(str(s).strip(), 99))
-    df = df.sort_values("_ord").reset_index(drop=True)
-    df["No"] = range(1, len(df)+1)
-    result = []
-    sub_col = "Sub_Assembly" if "Sub_Assembly" in df.columns else None
-    for sec in SECTION_ORDER:
-        rows = df[df["Section"].str.strip() == sec]
-        if rows.empty: continue
-        if sub_col:
-            for sub in rows[sub_col].unique():
-                result.append((sec, str(sub), rows[rows[sub_col]==sub].drop(columns=["_ord"], errors="ignore")))
-        else:
-            result.append((sec, sec, rows.drop(columns=["_ord"], errors="ignore")))
-    other = df[~df["Section"].str.strip().isin(SECTION_ORDER)]
-    if not other.empty:
-        result.append(("Z. OTHER","Other",other.drop(columns=["_ord"], errors="ignore")))
-    return result
+    # 4 — VALIDATION LOOP (max 2 iterations)
+    iterations = 0
+    validation = _validate_bom(bom, equipment_type, schema)
+    while validation["completeness"] < 0.80 and iterations < 2:
+        iterations += 1
+        _log(agent_log, cb, "VALIDATE",
+             f"completeness {int(validation['completeness']*100)}% → looping (iter {iterations})",
+             f"{int(validation['completeness']*100)}% — filling {len(validation['gaps'])} gaps")
+        bom = _fill_gaps(equipment_type, key_specs, schema, bom,
+                         validation["gaps"] + validation["warnings"], agent_log, cb)
+        validation = _validate_bom(bom, equipment_type, schema)
+    _log(agent_log, cb, "VALIDATE", "done",
+         f"completeness {int(validation['completeness']*100)}% after {iterations} iteration(s)")
+
+    # 5 — PRICE
+    try:
+        bom = _price_bom(equipment_type, key_specs, bom, agent_log, cb)
+    except Exception as e:
+        _log(agent_log, cb, "PRICE", "error", str(e)[:120])
+        for c in bom:
+            if "total_cost_inr" not in c:
+                _apply_price(c, 0, 0, 0, c.get("type", "manufactured"), "error", "pricing failed", "")
+    should_cost = _build_should_cost(bom)
+
+    # 6 — CONFIDENCE
+    confidence = _confidence(bom, schema, validation)
+    _log(agent_log, cb, "DONE", "done",
+         f"confidence {int(confidence*100)}% | {len(bom)} components | ₹{should_cost.get('total_ex_gst',0):,}")
+
+    return {
+        "equipment_type": equipment_type,
+        "manufacturer": ident.get("manufacturer"),
+        "model": ident.get("model"),
+        "key_specs": key_specs,
+        "schema": schema,
+        "bom": bom,
+        "should_cost": should_cost,
+        "confidence": confidence,
+        "agent_log": agent_log,
+        "gaps": validation["gaps"],
+        "warnings": validation["warnings"],
+        "iterations": iterations,
+    }
 
 
-def export_excel(bom_df, pump_specs, priced=False):
+# ═══════════════════════════════════════════════════════════════════
+# DATAFRAME HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def bom_to_dataframe(bom, priced=None):
+    """Convert agent bom list to a display DataFrame. Auto-detects pricing."""
+    if not bom: return pd.DataFrame()
+    has_price = priced if priced is not None else any("total_cost_inr" in c for c in bom)
+    rows = []
+    for c in bom:
+        if not isinstance(c, dict): continue
+        row = {
+            "No": c.get("id", ""),
+            "Sub_Assembly": f"{c.get('sub_assembly_id','')}. {c.get('sub_assembly_name','')}".strip(". "),
+            "Component": c.get("description", ""),
+            "Material": c.get("material", ""),
+            "Qty": c.get("qty", "1"),
+            "Unit": c.get("unit", "no"),
+            "Weight_kg": c.get("weight_kg", 0),
+            "Type": c.get("type", c.get("component_type", "")),
+            "Standards": c.get("standards_applicable", ""),
+        }
+        if has_price:
+            row.update({
+                "Raw_Material_INR": int(_num(c.get("raw_material_inr"))),
+                "Machining_INR": int(_num(c.get("machining_inr"))),
+                "Total_Price_INR": int(_num(c.get("total_cost_inr"))),
+                "Price_Confidence": c.get("price_confidence", ""),
+                "Price_Source": c.get("price_source", ""),
+                "Price_Notes": c.get("price_notes", ""),
+            })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EXCEL EXPORT — dynamic sub-assemblies + Agent Summary sheet
+# ═══════════════════════════════════════════════════════════════════
+
+def export_excel(result):
+    """result = output of run_agent. Returns BytesIO xlsx."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
+    import datetime
+
+    bom = result.get("bom", [])
+    sc = result.get("should_cost", {})
+    df = bom_to_dataframe(bom)
+    priced = "Total_Price_INR" in df.columns
+
     wb = Workbook()
     thin = Side(style="thin", color="CCCCCC")
     bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
-    
-    # Cover
-    ws0 = wb.active; ws0.title = "Cover"
+
+    # ── Sheet 1: Agent Summary ──────────────────────────────────────
+    ws0 = wb.active; ws0.title = "Agent Summary"
     ws0.sheet_view.showGridLines = False
-    ws0.column_dimensions["A"].width = 30; ws0.column_dimensions["B"].width = 55
+    ws0.column_dimensions["A"].width = 30; ws0.column_dimensions["B"].width = 58
     ws0.merge_cells("A1:B1")
-    c = ws0["A1"]; c.value = "BILL OF MATERIALS"
-    c.font = Font(name="Arial", bold=True, size=18, color="FFFFFF")
-    c.fill = PatternFill("solid", fgColor="1F4E79")
+    c = ws0["A1"]; c.value = "AGENTIC BOM — SHOULD-COST SUMMARY"
+    c.font = Font(name="Arial", bold=True, size=16, color="FFFFFF")
+    c.fill = PatternFill("solid", fgColor="0a0a0f")
     c.alignment = Alignment(horizontal="center", vertical="center")
-    specs = pump_specs if isinstance(pump_specs, dict) else {}
-    info = []
-    if isinstance(specs.get("pumps"), list) and specs["pumps"]:
-        p = specs["pumps"][0]
-        for k, l in [("model","Model"),("manufacturer","Mfr"),("type","Type"),
-                     ("flow_m3h","Flow"),("head_m","Head"),("motor_kw","Motor kW"),
-                     ("fluid","Fluid"),("standard","Standard")]:
-            v = p.get(k)
-            if v: info.append((l, str(v)))
+    conf = result.get("confidence", 0)
+    summary = [
+        ("Equipment Type", result.get("equipment_type", "")),
+        ("Manufacturer", result.get("manufacturer") or "—"),
+        ("Model", result.get("model") or "—"),
+        ("Confidence Score", f"{int(conf*100)}%"),
+        ("Total Components", str(sc.get("component_count", len(bom)))),
+        ("Sub-assemblies", str(len(result.get("schema", [])))),
+        ("Agent Iterations", str(result.get("iterations", 0))),
+        ("Gaps Flagged", str(len(result.get("gaps", [])))),
+        ("Total Raw Material (₹)", f"{sc.get('total_raw_material',0):,}"),
+        ("Total Machining (₹)", f"{sc.get('total_machining',0):,}"),
+        ("Should-Cost ex-GST (₹)", f"{sc.get('total_ex_gst',0):,}"),
+        ("GST 18% (₹)", f"{sc.get('total_gst',0):,}"),
+        ("Should-Cost incl-GST (₹)", f"{sc.get('total_incl_gst',0):,}"),
+        ("Date", datetime.date.today().isoformat()),
+    ]
     r = 3
-    for lbl, val in info:
-        ws0.cell(r,1,lbl).font = Font(name="Arial",bold=True,size=10)
-        ws0.cell(r,1).fill = PatternFill("solid",fgColor="EEF2F7"); ws0.cell(r,1).border = bdr
-        ws0.cell(r,2,val).font = Font(name="Arial",size=10); ws0.cell(r,2).border = bdr
+    for lbl, val in summary:
+        ws0.cell(r, 1, lbl).font = Font(name="Arial", bold=True, size=10)
+        ws0.cell(r, 1).fill = PatternFill("solid", fgColor="EEF2F7"); ws0.cell(r, 1).border = bdr
+        ws0.cell(r, 2, val).font = Font(name="Arial", size=10); ws0.cell(r, 2).border = bdr
         r += 1
-    
-    # BOM
+    if result.get("gaps"):
+        r += 1
+        ws0.cell(r, 1, "Gaps / Warnings").font = Font(name="Arial", bold=True, size=10, color="C0392B")
+        r += 1
+        for g in result.get("gaps", []) + result.get("warnings", []):
+            ws0.cell(r, 1, "•").font = Font(name="Arial", size=9)
+            ws0.cell(r, 2, str(g)).font = Font(name="Arial", size=9); r += 1
+    ws0.cell(r + 1, 1, sc.get("note", "")).font = Font(name="Arial", italic=True, size=8, color="666666")
+
+    # ── Sheet 2: BOM (grouped by dynamic sub-assembly) ──────────────
     ws1 = wb.create_sheet("BOM"); ws1.sheet_view.showGridLines = False
-    if priced and "Total_Price_INR" in bom_df.columns:
-        cols = ["No","Section","Sub_Assembly","Component","MOC","Qty","Weight_kg",
-                "Raw_Material_INR","Machining_INR","Total_Price_INR","Price_Confidence","Price_Notes"]
+    if priced:
+        cols = ["No", "Sub_Assembly", "Component", "Material", "Qty", "Unit", "Weight_kg",
+                "Type", "Raw_Material_INR", "Machining_INR", "Total_Price_INR",
+                "Price_Confidence", "Price_Notes"]
     else:
-        cols = ["No","Section","Sub_Assembly","Component","Description","MOC","Qty","Weight_kg","Req_Type","Notes"]
-    cols = [c for c in cols if c in bom_df.columns]
-    widths = {"No":5,"Section":20,"Sub_Assembly":18,"Component":28,"Description":30,"MOC":22,
-              "Qty":6,"Weight_kg":10,"Req_Type":6,"Notes":25,"Raw_Material_INR":13,
-              "Machining_INR":13,"Total_Price_INR":13,"Price_Confidence":10,"Price_Notes":30}
-    
+        cols = ["No", "Sub_Assembly", "Component", "Material", "Qty", "Unit",
+                "Weight_kg", "Type", "Standards"]
+    cols = [x for x in cols if x in df.columns]
+    widths = {"No": 5, "Sub_Assembly": 26, "Component": 30, "Material": 22, "Qty": 6,
+              "Unit": 6, "Weight_kg": 10, "Type": 13, "Standards": 20, "Raw_Material_INR": 13,
+              "Machining_INR": 13, "Total_Price_INR": 14, "Price_Confidence": 11, "Price_Notes": 30}
+
     ws1.merge_cells(f"A1:{get_column_letter(len(cols))}1")
-    t = ws1["A1"]; t.value = "BILL OF MATERIALS"
-    t.font = Font(name="Arial",bold=True,size=12,color="FFFFFF")
-    t.fill = PatternFill("solid",fgColor="1F4E79")
-    r = 2
+    t = ws1["A1"]; t.value = f"BILL OF MATERIALS — {result.get('equipment_type','')}"
+    t.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    t.fill = PatternFill("solid", fgColor="0a0a0f")
+    rr = 2
     for j, col in enumerate(cols):
-        h = ws1.cell(r,j+1,col.replace("_"," "))
-        h.font = Font(name="Arial",bold=True,size=9,color="FFFFFF")
-        h.fill = PatternFill("solid",fgColor="2E75B6")
-        h.alignment = Alignment(horizontal="center",wrap_text=True); h.border = bdr
-        ws1.column_dimensions[get_column_letter(j+1)].width = widths.get(col,14)
-    r += 1
-    f1, f2 = PatternFill("solid",fgColor="EEF4FB"), PatternFill("solid",fgColor="FFFFFF")
-    for i, (_, row) in enumerate(bom_df.iterrows()):
+        h = ws1.cell(rr, j + 1, col.replace("_", " "))
+        h.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
+        h.fill = PatternFill("solid", fgColor="4a7a9b")
+        h.alignment = Alignment(horizontal="center", wrap_text=True); h.border = bdr
+        ws1.column_dimensions[get_column_letter(j + 1)].width = widths.get(col, 14)
+    rr += 1
+
+    # group rows by sub-assembly, in schema order
+    order = {f"{s['id']}. {s['name']}": i for i, s in enumerate(result.get("schema", []))}
+    df2 = df.copy()
+    df2["_ord"] = df2["Sub_Assembly"].map(lambda s: order.get(s, 99))
+    df2 = df2.sort_values(["_ord", "No"]).drop(columns=["_ord"])
+
+    f1, f2 = PatternFill("solid", fgColor="EEF4FB"), PatternFill("solid", fgColor="FFFFFF")
+    grp = PatternFill("solid", fgColor="DDE6EF")
+    last_sub = None
+    i = 0
+    for _, row in df2.iterrows():
+        sub = row.get("Sub_Assembly", "")
+        if sub != last_sub:
+            ws1.merge_cells(f"A{rr}:{get_column_letter(len(cols))}{rr}")
+            g = ws1.cell(rr, 1, sub)
+            g.font = Font(name="Arial", bold=True, size=9, color="1F2A36")
+            g.fill = grp; g.border = bdr
+            rr += 1; last_sub = sub
         for j, col in enumerate(cols):
             v = row.get(col, "")
             if pd.isna(v): v = ""
-            if col in ("Raw_Material_INR","Machining_INR","Total_Price_INR"):
-                try: v = f"₹{int(float(v)):,}" if v else ""
+            if col in ("Raw_Material_INR", "Machining_INR", "Total_Price_INR"):
+                try: v = f"₹{int(float(v)):,}" if v != "" else ""
                 except: pass
-            cell = ws1.cell(r,j+1,v)
-            cell.font = Font(name="Arial",size=8); cell.fill = f1 if i%2==0 else f2
-            cell.border = bdr; cell.alignment = Alignment(wrap_text=True,vertical="top")
-        r += 1
+            cell = ws1.cell(rr, j + 1, v)
+            cell.font = Font(name="Arial", size=8); cell.fill = f1 if i % 2 == 0 else f2
+            cell.border = bdr; cell.alignment = Alignment(wrap_text=True, vertical="top")
+        rr += 1; i += 1
     ws1.freeze_panes = "A3"
+
+    # ── Sheet 3: Should-Cost ────────────────────────────────────────
+    ws2 = wb.create_sheet("Should-Cost"); ws2.sheet_view.showGridLines = False
+    ws2.column_dimensions["A"].width = 40; ws2.column_dimensions["B"].width = 20
+    ws2.merge_cells("A1:B1")
+    t2 = ws2["A1"]; t2.value = "SHOULD-COST BREAKDOWN"
+    t2.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+    t2.fill = PatternFill("solid", fgColor="3d6b4f")
+    rr = 3
+    ws2.cell(rr, 1, "Sub-assembly").font = Font(bold=True, size=10)
+    ws2.cell(rr, 2, "Cost (₹ ex-GST)").font = Font(bold=True, size=10)
+    rr += 1
+    for k, v in sc.get("sub_totals", {}).items():
+        ws2.cell(rr, 1, k).font = Font(size=9); ws2.cell(rr, 1).border = bdr
+        ws2.cell(rr, 2, f"₹{int(v):,}").font = Font(size=9); ws2.cell(rr, 2).border = bdr
+        rr += 1
+    rr += 1
+    for lbl, key in [("Total Raw Material", "total_raw_material"),
+                     ("Total Machining", "total_machining"),
+                     ("Total ex-GST", "total_ex_gst"),
+                     ("GST 18%", "total_gst"),
+                     ("Total incl-GST", "total_incl_gst")]:
+        ws2.cell(rr, 1, lbl).font = Font(bold=True, size=10)
+        ws2.cell(rr, 2, f"₹{int(sc.get(key,0)):,}").font = Font(bold=True, size=10)
+        rr += 1
+
+    # ── Sheet 4: Agent Log ──────────────────────────────────────────
+    ws3 = wb.create_sheet("Agent Log"); ws3.sheet_view.showGridLines = False
+    ws3.column_dimensions["A"].width = 10; ws3.column_dimensions["B"].width = 12
+    ws3.column_dimensions["C"].width = 70
+    for j, h in enumerate(["Time", "Step", "Detail"], 1):
+        cell = ws3.cell(1, j, h); cell.font = Font(bold=True, size=10, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="e8a020")
+    rr = 2
+    for e in result.get("agent_log", []):
+        ws3.cell(rr, 1, e.get("t", "")).font = Font(name="Consolas", size=9)
+        ws3.cell(rr, 2, e.get("step", "")).font = Font(name="Consolas", size=9)
+        ws3.cell(rr, 3, e.get("result") or e.get("action", "")).font = Font(name="Consolas", size=9)
+        rr += 1
+
     buf = BytesIO(); wb.save(buf); buf.seek(0); return buf
