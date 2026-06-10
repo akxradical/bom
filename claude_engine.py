@@ -144,13 +144,26 @@ _PROVIDERS = [
 ]
 
 def _call_llm(prompt, system="", max_tokens=4000):
-    """Try free providers in order. Returns (text, name)."""
+    """Try free providers in order. Returns (text, name). On total failure,
+    raises with a per-provider reason so the user can see what to fix."""
+    errors = []
     for name, fn in _PROVIDERS:
         try:
             r = fn(prompt, system, max_tokens)
-            if r and len(r.strip()) > 10: return r, name
-        except: continue
-    raise Exception("All free LLM providers failed. Add API keys to secrets.toml.")
+            if r and len(r.strip()) > 10:
+                return r, name
+            errors.append(f"{name}: empty response")
+        except Exception as e:
+            msg = str(e)
+            if "no key" in msg.lower():
+                errors.append(f"{name}: no key set")
+            else:
+                errors.append(f"{name}: {msg[:80]}")
+    detail = " | ".join(errors) if errors else "no providers configured"
+    raise Exception(
+        "All free LLM providers failed. Set/refresh an API key in Streamlit "
+        "Secrets (a free GEMINI_API_KEY from aistudio.google.com is most reliable). "
+        f"Details — {detail}")
 
 
 def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
@@ -513,7 +526,12 @@ Return ONLY a JSON array:
     "typical_components_count": 5}}
 ]
 Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
-    raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500)
+    try:
+        raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500)
+    except Exception as e:
+        # LLM totally unavailable — degrade to neutral schema, do not crash.
+        _log(agent_log, cb, "SCHEMA", "llm unavailable", f"using fallback schema ({str(e)[:60]})")
+        raw = ""
     data = _parse_json(raw)
     # Free LLMs often wrap the array in an object — unwrap it.
     if isinstance(data, dict):
