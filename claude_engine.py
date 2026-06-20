@@ -68,15 +68,36 @@ def _oai(url, key, model, prompt, system="", mt=4000):
     return d["choices"][0]["message"]["content"].strip()
 
 
+def _gemini_parse(d):
+    """Defensively pull text from a Gemini response. Raises an informative
+    error instead of KeyError when the model returns no text (e.g. the 2.5
+    thinking model spends its whole budget on thoughts, or content is blocked)."""
+    cands = d.get("candidates") or []
+    if not cands:
+        fb = d.get("promptFeedback", {})
+        raise Exception(f"no candidates (blocked? {fb})")
+    cand = cands[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = " ".join(p.get("text", "") for p in parts if "text" in p).strip()
+    if not text:
+        raise Exception(f"empty text (finishReason={cand.get('finishReason')})")
+    return text
+
+
+# gemini-2.0-flash is GA, free-tier, fast, and (unlike 2.5-flash) does NOT burn
+# the output budget on hidden 'thinking' tokens — so it reliably returns text.
+_GEMINI_MODEL = "gemini-2.0-flash"
+
+
 def _gemini(p, s="", mt=8000):
     k = _get_key("GEMINI_API_KEY")
     if not k: raise ValueError("no key")
     b = {"contents": [{"parts": [{"text": p}]}],
          "generationConfig": {"maxOutputTokens": mt, "temperature": 0.1}}
     if s: b["systemInstruction"] = {"parts": [{"text": s}]}
-    d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={k}",
+    d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={k}",
                    {"Content-Type": "application/json"}, b)
-    return d["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return _gemini_parse(d)
 
 
 def _gemini_grounded(p, s="", mt=4000):
@@ -89,20 +110,19 @@ def _gemini_grounded(p, s="", mt=4000):
          "tools": [{"google_search": {}}],
          "generationConfig": {"maxOutputTokens": mt, "temperature": 0.1}}
     if s: b["systemInstruction"] = {"parts": [{"text": s}]}
-    d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={k}",
+    d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={k}",
                    {"Content-Type": "application/json"}, b, timeout=120)
-    cand = (d.get("candidates") or [{}])[0]
-    parts = (cand.get("content") or {}).get("parts") or []
-    return " ".join(part.get("text", "") for part in parts if "text" in part).strip()
+    return _gemini_parse(d)
 
 
 def _groq(p, s="", mt=4000):
     k = _get_key("GROQ_API_KEY")
     if not k: raise ValueError("no key")
+    last = "unknown"
     for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
         try: return _oai("https://api.groq.com/openai/v1/chat/completions", k, m, p, s, mt)
-        except: continue
-    raise Exception("Groq failed")
+        except Exception as e: last = str(e)
+    raise Exception(f"Groq failed: {last[:100]}")
 
 
 def _mistral(p, s="", mt=4000):
@@ -114,6 +134,7 @@ def _mistral(p, s="", mt=4000):
 def _openrouter(p, s="", mt=4000):
     k = _get_key("OPENROUTER_API_KEY")
     if not k: raise ValueError("no key")
+    last = "unknown"
     for m in ["meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat-v3-0324:free"]:
         try:
             msgs = []
@@ -125,17 +146,19 @@ def _openrouter(p, s="", mt=4000):
                 {"model": m, "messages": msgs, "max_tokens": mt, "temperature": 0.1})
             r = d["choices"][0]["message"]["content"].strip()
             if r and len(r) > 10: return r
-        except: continue
-    raise Exception("OpenRouter failed")
+            last = "empty response"
+        except Exception as e: last = str(e)
+    raise Exception(f"OpenRouter failed: {last[:100]}")
 
 
 def _cerebras(p, s="", mt=4000):
     k = _get_key("CEREBRAS_API_KEY")
     if not k: raise ValueError("no key")
+    last = "unknown"
     for m in ["gpt-oss-120b", "llama3.1-8b"]:
         try: return _oai("https://api.cerebras.ai/v1/chat/completions", k, m, p, s, min(mt, 8000))
-        except: continue
-    raise Exception("Cerebras failed")
+        except Exception as e: last = str(e)
+    raise Exception(f"Cerebras failed: {last[:100]}")
 
 
 _PROVIDERS = [
@@ -657,6 +680,98 @@ def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# STEP 3.5 — COMPLETENESS CRITIC (agentic self-review)
+# A second pass: re-read the datasheet + the BOM we built, and ask what
+# STANDARD/mandatory components are missing for THIS product. Generalist —
+# no per-product hardcoding; the model applies the relevant standard itself.
+# ═══════════════════════════════════════════════════════════════════
+
+VERIFY_SYS = """You are a strict QA / checking engineer reviewing a Bill of Materials
+for completeness against applicable engineering standards and normal build practice
+for the specific product. You know the mandatory components every well-formed BOM of
+that product type must contain (e.g. API 610 pump → casing, impeller, wear rings,
+shaft, sleeve, bearings, seal, coupling, baseplate; a portable electronic instrument
+→ main PCB, MCU, battery, display, sensors, enclosure, etc.). You ONLY report what is
+genuinely MISSING — do not duplicate components already present. Return strict JSON."""
+
+
+def _verify_completeness(equipment_type, key_specs, schema, bom, agent_log, cb, doc=""):
+    """Critic pass: find standard/mandatory components missing from the BOM and add
+    them. Returns (bom, n_added)."""
+    _log(agent_log, cb, "VERIFY", "Reviewing BOM against standards...", running=True)
+    present = sorted({str(c.get("description", "")).strip() for c in bom if c.get("description")})
+    sub_list = [{"id": s["id"], "name": s["name"]} for s in schema]
+    prompt = f"""Product: {equipment_type}
+Specs: {json.dumps(key_specs or {}, default=str)[:800]}
+
+DATASHEET (ground truth):
+{doc[:4000]}
+
+Sub-assemblies (use these ids for placement):
+{json.dumps(sub_list, default=str)}
+
+The CURRENT BOM already contains these components:
+{json.dumps(present, default=str)[:3500]}
+
+Task: per applicable standards and normal build practice for THIS product, list ONLY
+the MANDATORY components that are MISSING from the list above. Do not repeat anything
+already present. If nothing is missing, return [].
+
+Return ONLY a JSON array:
+[{{"description":"component (<=45 chars)","material":"grade or 'bought-out item'",
+"qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,
+"standards_applicable":"std or empty","sub_assembly_id":"best-fit id from list"}}]"""
+    try:
+        raw, prov = _smart_call(prompt, VERIFY_SYS, 2500)
+    except Exception as e:
+        _log(agent_log, cb, "VERIFY", "skipped", f"critic unavailable ({str(e)[:50]})")
+        return bom, 0
+    data = _parse_json(raw)
+    if isinstance(data, dict):
+        for k in ("missing", "components", "items", "data"):
+            if isinstance(data.get(k), list):
+                data = data[k]; break
+        else:
+            data = [data] if data.get("description") else []
+    if not isinstance(data, list):
+        data = []
+
+    present_lc = {p.lower() for p in present}
+    sub_by_id = {s["id"]: s for s in schema}
+    added = 0
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        desc = str(c.get("description", "")).strip()[:60]
+        if not desc or desc.lower() in present_lc:
+            continue
+        sid = str(c.get("sub_assembly_id", "")).strip()
+        sub = sub_by_id.get(sid) or (schema[-1] if schema else {"id": "Z", "name": "Additional Items"})
+        ctype = str(c.get("type", "")).lower()
+        if ctype not in ("manufactured", "bought_out"):
+            ctype = _classify(desc)
+        bom.append({
+            "description": desc,
+            "material": str(c.get("material", c.get("moc", ""))).strip(),
+            "qty": str(c.get("qty", "1")).strip() or "1",
+            "unit": str(c.get("unit", "no")).strip() or "no",
+            "type": ctype,
+            "weight_kg": _num(c.get("weight_kg", c.get("weight"))),
+            "standards_applicable": str(c.get("standards_applicable", c.get("standards", ""))).strip(),
+            "sub_assembly_id": sub["id"],
+            "sub_assembly_name": sub["name"],
+            "added_by": "completeness_critic",
+        })
+        present_lc.add(desc.lower())
+        added += 1
+    for j, c in enumerate(bom, 1):
+        c["id"] = j
+    _log(agent_log, cb, "VERIFY", "done",
+         f"{added} missing component(s) added" if added else "no gaps found")
+    return bom, added
+
+
+# ═══════════════════════════════════════════════════════════════════
 # STEP 4 — VALIDATION LOOP (agentic)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -971,6 +1086,12 @@ def run_agent(pdf_text, progress_callback=None):
     # 3 — BOM (grounded in the actual datasheet text)
     bom = _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc)
 
+    # 3.5 — COMPLETENESS CRITIC (self-review against standards)
+    try:
+        bom, _added = _verify_completeness(equipment_type, key_specs, schema, bom, agent_log, cb, doc)
+    except Exception as e:
+        _log(agent_log, cb, "VERIFY", "skipped", str(e)[:60])
+
     # 4 — VALIDATION LOOP (max 2 iterations)
     iterations = 0
     validation = _validate_bom(bom, equipment_type, schema)
@@ -1126,48 +1247,58 @@ def export_excel(result):
               "Unit": 6, "Weight_kg": 10, "Type": 13, "Standards": 20, "Raw_Material_INR": 13,
               "Machining_INR": 13, "Total_Price_INR": 14, "Price_Confidence": 11, "Price_Notes": 30}
 
-    ws1.merge_cells(f"A1:{get_column_letter(len(cols))}1")
+    ncols = max(len(cols), 1)   # guard: openpyxl columns are 1-indexed (0 is invalid)
+    ws1.merge_cells(f"A1:{get_column_letter(ncols)}1")
     t = ws1["A1"]; t.value = f"BILL OF MATERIALS — {result.get('equipment_type','')}"
     t.font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
     t.fill = PatternFill("solid", fgColor="0a0a0f")
-    rr = 2
-    for j, col in enumerate(cols):
-        h = ws1.cell(rr, j + 1, col.replace("_", " "))
-        h.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
-        h.fill = PatternFill("solid", fgColor="4a7a9b")
-        h.alignment = Alignment(horizontal="center", wrap_text=True); h.border = bdr
-        ws1.column_dimensions[get_column_letter(j + 1)].width = widths.get(col, 14)
-    rr += 1
 
-    # group rows by sub-assembly, in schema order
-    order = {f"{s['id']}. {s['name']}": i for i, s in enumerate(result.get("schema", []))}
-    df2 = df.copy()
-    df2["_ord"] = df2["Sub_Assembly"].map(lambda s: order.get(s, 99))
-    df2 = df2.sort_values(["_ord", "No"]).drop(columns=["_ord"])
-
-    f1, f2 = PatternFill("solid", fgColor="EEF4FB"), PatternFill("solid", fgColor="FFFFFF")
-    grp = PatternFill("solid", fgColor="DDE6EF")
-    last_sub = None
-    i = 0
-    for _, row in df2.iterrows():
-        sub = row.get("Sub_Assembly", "")
-        if sub != last_sub:
-            ws1.merge_cells(f"A{rr}:{get_column_letter(len(cols))}{rr}")
-            g = ws1.cell(rr, 1, sub)
-            g.font = Font(name="Arial", bold=True, size=9, color="1F2A36")
-            g.fill = grp; g.border = bdr
-            rr += 1; last_sub = sub
+    if df.empty or not cols:
+        # No components generated — write a clear note instead of crashing.
+        ws1.cell(3, 1, "No components were generated for this run "
+                       "(BOM empty — check the Agent Log sheet for why).").font = \
+            Font(name="Arial", italic=True, size=10, color="C0392B")
+        ws1.column_dimensions["A"].width = 70
+    else:
+        rr = 2
         for j, col in enumerate(cols):
-            v = row.get(col, "")
-            if pd.isna(v): v = ""
-            if col in ("Raw_Material_INR", "Machining_INR", "Total_Price_INR"):
-                try: v = f"₹{int(float(v)):,}" if v != "" else ""
-                except: pass
-            cell = ws1.cell(rr, j + 1, v)
-            cell.font = Font(name="Arial", size=8); cell.fill = f1 if i % 2 == 0 else f2
-            cell.border = bdr; cell.alignment = Alignment(wrap_text=True, vertical="top")
-        rr += 1; i += 1
-    ws1.freeze_panes = "A3"
+            h = ws1.cell(rr, j + 1, col.replace("_", " "))
+            h.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
+            h.fill = PatternFill("solid", fgColor="4a7a9b")
+            h.alignment = Alignment(horizontal="center", wrap_text=True); h.border = bdr
+            ws1.column_dimensions[get_column_letter(j + 1)].width = widths.get(col, 14)
+        rr += 1
+
+        # group rows by sub-assembly, in schema order
+        order = {f"{s['id']}. {s['name']}": i for i, s in enumerate(result.get("schema", []))}
+        df2 = df.copy()
+        df2["_ord"] = df2["Sub_Assembly"].map(lambda s: order.get(s, 99))
+        df2 = df2.sort_values(["_ord", "No"]).drop(columns=["_ord"])
+
+        f1, f2 = PatternFill("solid", fgColor="EEF4FB"), PatternFill("solid", fgColor="FFFFFF")
+        grp = PatternFill("solid", fgColor="DDE6EF")
+        last_sub = None
+        i = 0
+        for _, row in df2.iterrows():
+            sub = row.get("Sub_Assembly", "")
+            if sub != last_sub:
+                ws1.merge_cells(f"A{rr}:{get_column_letter(ncols)}{rr}")
+                g = ws1.cell(rr, 1, sub)
+                g.font = Font(name="Arial", bold=True, size=9, color="1F2A36")
+                g.fill = grp; g.border = bdr
+                rr += 1; last_sub = sub
+            for j, col in enumerate(cols):
+                v = row.get(col, "")
+                if pd.isna(v): v = ""
+                if col in ("Raw_Material_INR", "Machining_INR", "Total_Price_INR"):
+                    try: v = f"₹{int(float(v)):,}" if v != "" else ""
+                    except: pass
+                cell = ws1.cell(rr, j + 1, v)
+                cell.font = Font(name="Arial", size=8); cell.fill = f1 if i % 2 == 0 else f2
+                cell.border = bdr; cell.alignment = Alignment(wrap_text=True, vertical="top")
+            rr += 1; i += 1
+        ws1.freeze_panes = "A3"
+
 
     # ── Sheet 3: Should-Cost ────────────────────────────────────────
     ws2 = wb.create_sheet("Should-Cost"); ws2.sheet_view.showGridLines = False
