@@ -201,16 +201,18 @@ def _call_llm(prompt, system="", max_tokens=4000, want_json=False, extra_errors=
 
 def _claude_models():
     """Models to try, in order. A CLAUDE_MODEL secret (if set) takes priority.
-    Falls back across widely-available IDs so a 404 on one model doesn't kill
-    the run — different accounts have access to different models."""
+    Current (2026) models are listed first — older dated IDs are retired and
+    404 on new accounts, so they're only kept as last-resort fallbacks."""
     override = _get_key("CLAUDE_MODEL")
     base = [
-        "claude-sonnet-4-20250514",
+        "claude-sonnet-4-6",            # current Sonnet (best value)
+        "claude-haiku-4-5-20251001",    # current Haiku (cheapest)
+        "claude-opus-4-8",              # current Opus (premium)
+        "claude-sonnet-4-5",
         "claude-3-7-sonnet-latest",
         "claude-3-5-sonnet-latest",
-        "claude-3-5-sonnet-20241022",
+        "claude-sonnet-4-20250514",     # older fallbacks (may be retired)
         "claude-3-5-haiku-20241022",
-        "claude-3-haiku-20240307",
     ]
     return ([override] + base) if override else base
 
