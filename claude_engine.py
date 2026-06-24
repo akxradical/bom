@@ -199,26 +199,49 @@ def _call_llm(prompt, system="", max_tokens=4000, want_json=False, extra_errors=
         f"Details — {detail}")
 
 
+def _claude_models():
+    """Models to try, in order. A CLAUDE_MODEL secret (if set) takes priority.
+    Falls back across widely-available IDs so a 404 on one model doesn't kill
+    the run — different accounts have access to different models."""
+    override = _get_key("CLAUDE_MODEL")
+    base = [
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-latest",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307",
+    ]
+    return ([override] + base) if override else base
+
+
 def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
-    """Claude API with optional web search."""
+    """Claude API with optional web search. Tries multiple model IDs so an
+    account that lacks one model still works on another."""
     k = _get_key("ANTHROPIC_API_KEY")
     if not k: raise ValueError("ANTHROPIC_API_KEY not set")
     try: import anthropic
     except ImportError: raise ValueError("pip install anthropic")
     client = anthropic.Anthropic(api_key=k)
-    kw = {"model": "claude-sonnet-4-20250514", "max_tokens": min(max_tokens, 4096),
-          "messages": [{"role": "user", "content": prompt}]}
-    if system: kw["system"] = system
-    if use_search: kw["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-    for attempt in range(3):
-        try:
-            resp = client.messages.create(**kw)
-            return "\n".join(b.text for b in resp.content if hasattr(b, "text")).strip()
-        except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
-                time.sleep(25 * (attempt + 1)); continue
-            raise
-    raise Exception("Claude rate limit after 3 retries")
+    last_err = "no model tried"
+    for model in _claude_models():
+        kw = {"model": model, "max_tokens": min(max_tokens, 4096),
+              "messages": [{"role": "user", "content": prompt}]}
+        if system: kw["system"] = system
+        if use_search: kw["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        for attempt in range(3):
+            try:
+                resp = client.messages.create(**kw)
+                return "\n".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+            except Exception as e:
+                es = str(e)
+                if "not_found" in es or "404" in es or "does not support" in es:
+                    last_err = f"{model}: {es[:80]}"
+                    break  # model unavailable on this account → try the next one
+                if "429" in es or "rate_limit" in es.lower():
+                    time.sleep(25 * (attempt + 1)); continue
+                raise
+    raise Exception(f"No available Claude model (set CLAUDE_MODEL secret). Last: {last_err}")
 
 
 def _smart_call(prompt, system="", max_tokens=4000, want_json=False):
