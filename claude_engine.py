@@ -161,21 +161,30 @@ def _cerebras(p, s="", mt=4000):
     raise Exception(f"Cerebras failed: {last[:100]}")
 
 
+# Order matters: most reliable free JSON producers first. Groq + Cerebras
+# (large open models) tend to return clean JSON; Gemini is capable but flakier
+# on the free tier. The chain also SKIPS any provider whose output can't be
+# parsed (when want_json=True), so junk from one provider no longer blocks the
+# next one (this is why "only Gemini, never Cerebras" happened before).
 _PROVIDERS = [
-    ("Gemini", _gemini), ("Groq", _groq), ("Mistral", _mistral),
-    ("OpenRouter", _openrouter), ("Cerebras", _cerebras),
+    ("Groq", _groq), ("Cerebras", _cerebras), ("Gemini", _gemini),
+    ("OpenRouter", _openrouter), ("Mistral", _mistral),
 ]
 
-def _call_llm(prompt, system="", max_tokens=4000):
-    """Try free providers in order. Returns (text, name). On total failure,
-    raises with a per-provider reason so the user can see what to fix."""
+def _call_llm(prompt, system="", max_tokens=4000, want_json=False):
+    """Try free providers in order. Returns (text, name). If want_json, a
+    provider's response is only accepted when it parses as JSON — otherwise the
+    chain moves to the next provider. On total failure, raises with a
+    per-provider reason so the user can see what to fix."""
     errors = []
     for name, fn in _PROVIDERS:
         try:
             r = fn(prompt, system, max_tokens)
-            if r and len(r.strip()) > 10:
-                return r, name
-            errors.append(f"{name}: empty response")
+            if not (r and len(r.strip()) > 10):
+                errors.append(f"{name}: empty response"); continue
+            if want_json and _parse_json(r) is None:
+                errors.append(f"{name}: unparseable (not JSON)"); continue
+            return r, name
         except Exception as e:
             msg = str(e)
             if "no key" in msg.lower():
@@ -184,8 +193,8 @@ def _call_llm(prompt, system="", max_tokens=4000):
                 errors.append(f"{name}: {msg[:80]}")
     detail = " | ".join(errors) if errors else "no providers configured"
     raise Exception(
-        "All free LLM providers failed. Set/refresh an API key in Streamlit "
-        "Secrets (a free GEMINI_API_KEY from aistudio.google.com is most reliable). "
+        "All free LLM providers failed/returned junk. Set/refresh an API key in "
+        "Streamlit Secrets. "
         f"Details — {detail}")
 
 
@@ -211,24 +220,28 @@ def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
     raise Exception("Claude rate limit after 3 retries")
 
 
-def _smart_call(prompt, system="", max_tokens=4000):
-    """Claude first (if key set), else free LLMs. Returns (text, provider)."""
+def _smart_call(prompt, system="", max_tokens=4000, want_json=False):
+    """Claude first (if key set), else free LLMs. Returns (text, provider).
+    If want_json, Claude output is only accepted when it parses as JSON."""
     if _get_key("ANTHROPIC_API_KEY"):
         try:
             r = _call_claude(prompt, system, max_tokens)
-            if r and len(r) > 10: return r, "Claude"
+            if r and len(r) > 10 and (not want_json or _parse_json(r) is not None):
+                return r, "Claude"
         except: pass
-    return _call_llm(prompt, system, max_tokens)
+    return _call_llm(prompt, system, max_tokens, want_json)
 
 
-def _cheap_call(prompt, system="", max_tokens=4000):
+def _cheap_call(prompt, system="", max_tokens=4000, want_json=False):
     """Cheapest path first (free LLMs), Claude only as last resort.
     Used for low-stakes steps like initial identification."""
     try:
-        return _call_llm(prompt, system, max_tokens)
+        return _call_llm(prompt, system, max_tokens, want_json)
     except Exception:
         if _get_key("ANTHROPIC_API_KEY"):
-            return _call_claude(prompt, system, max_tokens), "Claude"
+            r = _call_claude(prompt, system, max_tokens)
+            if r and len(r) > 10:
+                return r, "Claude"
         raise
 
 
@@ -464,22 +477,24 @@ Return ONLY this JSON object:
 }}"""
     raw, prov = "", "none"
     try:
-        raw, prov = _cheap_call(prompt, IDENTIFY_SYS, 1500)
-    except Exception:
-        pass
+        raw, prov = _cheap_call(prompt, IDENTIFY_SYS, 1500, want_json=True)
+    except Exception as e:
+        _log(agent_log, cb, "IDENTIFY", "llm error", str(e)[:140])
     data = _parse_json(raw) or {}
     if not isinstance(data, dict): data = {}
     et = (data.get("equipment_type") or "").strip()
     # Retry with a stronger model if identification failed or was generic.
     if not et or et.lower() in ("engineered product", "unknown", "n/a", "product"):
+        if raw and not et:
+            _log(agent_log, cb, "IDENTIFY", "unparseable", f"got {len(raw)} chars, no equipment_type")
         try:
-            raw2, prov = _smart_call(prompt, IDENTIFY_SYS, 1500)
+            raw2, prov = _smart_call(prompt, IDENTIFY_SYS, 1500, want_json=True)
             d2 = _parse_json(raw2)
             if isinstance(d2, dict) and (d2.get("equipment_type") or "").strip():
                 data = d2
                 et = data["equipment_type"].strip()
-        except Exception:
-            pass
+        except Exception as e:
+            _log(agent_log, cb, "IDENTIFY", "retry failed", str(e)[:140])
     if not et:
         et = "Engineered Product"
     data["equipment_type"] = et
@@ -550,7 +565,7 @@ Return ONLY a JSON array:
 ]
 Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
     try:
-        raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500)
+        raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500, want_json=True)
     except Exception as e:
         # LLM totally unavailable — degrade to neutral schema, do not crash.
         _log(agent_log, cb, "SCHEMA", "llm unavailable", f"using fallback schema ({str(e)[:60]})")
@@ -631,10 +646,17 @@ Return ONLY a JSON array:
 "standards_applicable":"std or empty"}}]
 Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
     try:
-        raw, prov = _smart_call(prompt, BOM_SYS, 2500)
-    except Exception:
+        raw, prov = _smart_call(prompt, BOM_SYS, 2500, want_json=True)
+    except Exception as e:
+        # Surface WHY — do not fail silently (this is what made "no components"
+        # impossible to diagnose). Record the reason for the run summary.
+        _populate_subassembly.last_error = str(e)
+        _log(agent_log, cb, "BOM", "populate failed", f"{sub['id']}: {str(e)[:90]}")
         return []
     data = _parse_json(raw)
+    if not data:
+        _populate_subassembly.last_error = f"unparseable response (got {len(raw or '')} chars)"
+        _log(agent_log, cb, "BOM", "populate empty", f"{sub['id']}: response not JSON")
     items = []
     if isinstance(data, list):
         items = [x for x in data if isinstance(x, dict)]
@@ -667,6 +689,7 @@ Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
 
 
 def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
+    _populate_subassembly.last_error = ""
     bom = []
     n = len(schema)
     for i, sub in enumerate(schema, 1):
@@ -675,7 +698,11 @@ def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
     # assign ids
     for j, c in enumerate(bom, 1):
         c["id"] = j
-    _log(agent_log, cb, "BOM", "done", f"{len(bom)} components across {n} sub-assemblies")
+    if not bom:
+        reason = getattr(_populate_subassembly, "last_error", "") or "LLM returned no usable components"
+        _log(agent_log, cb, "BOM", "NO COMPONENTS", f"reason: {reason[:110]}")
+    else:
+        _log(agent_log, cb, "BOM", "done", f"{len(bom)} components across {n} sub-assemblies")
     return bom
 
 
@@ -722,7 +749,7 @@ Return ONLY a JSON array:
 "qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,
 "standards_applicable":"std or empty","sub_assembly_id":"best-fit id from list"}}]"""
     try:
-        raw, prov = _smart_call(prompt, VERIFY_SYS, 2500)
+        raw, prov = _smart_call(prompt, VERIFY_SYS, 2500, want_json=True)
     except Exception as e:
         _log(agent_log, cb, "VERIFY", "skipped", f"critic unavailable ({str(e)[:50]})")
         return bom, 0
@@ -999,6 +1026,63 @@ def _apply_price(c, raw_c, mach, total, ctype, conf, source, notes):
     })
 
 
+# ═══════════════════════════════════════════════════════════════════
+# MANUAL / USER-DRIVEN PRICING (no LLM, no web search)
+# Buyer enters raw-material ₹/kg per component; labour via slider;
+# supplier (Indian/International) scales the cost. Deterministic.
+# ═══════════════════════════════════════════════════════════════════
+
+SUPPLIER_FACTORS = {"Indian": 1.0, "International": 1.4}
+
+
+def _gross_factor(c):
+    """Net→gross weight multiplier inferred from the part's nature."""
+    blob = (str(c.get("description", "")) + " " + str(c.get("material", ""))).lower()
+    if any(k in blob for k in ["cast", "casing", "volute", "impeller", "housing"]):
+        return 1.35
+    if any(k in blob for k in ["forg", " bar", "shaft", "machined", "sleeve", "gear"]):
+        return 1.15
+    return 1.10
+
+
+def price_manual(bom, rate_map, labour_rate_per_kg=60.0, supplier="Indian", gst=0.18):
+    """Deterministic costing from buyer inputs.
+
+    rate_map: {component_id: raw_material_₹_per_kg}
+    labour_rate_per_kg: slider value (₹/kg of gross weight)
+    supplier: 'Indian' or 'International' (applies SUPPLIER_FACTORS)
+
+    cost = (raw_material + labour) × supplier_factor, per unit × qty.
+    Returns (bom, should_cost_summary).
+    """
+    factor = SUPPLIER_FACTORS.get(supplier, 1.0)
+    for c in bom:
+        net = _num(c.get("weight_kg"))
+        qty = max(_num(c.get("qty")) or 1, 1)
+        gross = round(net * _gross_factor(c), 3)
+        rate = _num(rate_map.get(str(c.get("id")), rate_map.get(c.get("id"), 0)))
+        raw = gross * rate
+        labour = gross * _num(labour_rate_per_kg)
+        unit = (raw + labour) * factor
+        total = unit * qty
+        c.update({
+            "gross_weight_kg": gross,
+            "raw_material_rate": int(rate),
+            "raw_material_inr": int(raw * factor),
+            "machining_inr": int(labour * factor),
+            "unit_cost_inr": int(unit),
+            "total_cost_inr": int(total),
+            "gst_18pct": int(total * gst),
+            "price_with_gst": int(total * (1 + gst)),
+            "price_confidence": "user",
+            "price_source": f"{supplier} | ₹{int(rate)}/kg RM + ₹{int(_num(labour_rate_per_kg))}/kg labour ×{factor}",
+            "price_notes": f"gross {gross}kg",
+            "component_type": c.get("type", c.get("component_type", "")),
+            "supplier_type": supplier,
+        })
+    return bom, _build_should_cost(bom)
+
+
 def _build_should_cost(bom):
     if not bom: return {}
     def s(k): return int(sum(_num(c.get(k)) for c in bom))
@@ -1055,7 +1139,7 @@ def _confidence(bom, schema, validation):
 # AGENT LOOP — orchestrates all steps
 # ═══════════════════════════════════════════════════════════════════
 
-def run_agent(pdf_text, progress_callback=None):
+def run_agent(pdf_text, progress_callback=None, price=True):
     """
     Full agentic loop. Claude/free LLMs decide schema and components; the
     engine validates and loops to fill gaps, then prices and scores.
@@ -1106,9 +1190,12 @@ def run_agent(pdf_text, progress_callback=None):
     _log(agent_log, cb, "VALIDATE", "done",
          f"completeness {int(validation['completeness']*100)}% after {iterations} iteration(s)")
 
-    # 5 — PRICE
+    # 5 — PRICE (optional; new blueprint prices manually in the UI)
+    if not price:
+        _log(agent_log, cb, "PRICE", "skipped", "manual costing in UI (buyer enters rates)")
     try:
-        bom = _price_bom(equipment_type, key_specs, bom, agent_log, cb)
+        if price:
+            bom = _price_bom(equipment_type, key_specs, bom, agent_log, cb)
     except Exception as e:
         _log(agent_log, cb, "PRICE", "error", str(e)[:120])
         for c in bom:
