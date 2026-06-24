@@ -15,6 +15,7 @@ import streamlit as st
 
 from claude_engine import (
     extract_pdf_text, run_agent, bom_to_dataframe, export_excel, _get_key,
+    price_manual, SUPPLIER_FACTORS,
 )
 
 # ═══════════════════════════════════════════════════════════════════
@@ -221,7 +222,7 @@ if run_btn and uploaded_file:
         st.stop()
 
     try:
-        result = run_agent(pdf_text, progress_callback=on_progress)
+        result = run_agent(pdf_text, progress_callback=on_progress, price=False)
         st.session_state["result"] = result
         st.rerun()
     except Exception as e:
@@ -289,49 +290,77 @@ if result:
             st.caption(f"Manufactured: {types.get('manufactured',0)} | "
                        f"Bought-out: {types.get('bought_out',0)}")
 
-    # --- Tab 2: SHOULD-COST ---
+    # --- Tab 2: SHOULD-COST (interactive manual costing) ---
     with tab2:
-        total_ex = max(sc.get("total_ex_gst", 0), 1)
-        left, right = st.columns([3, 2])
+        bom = result.get("bom", [])
+        if not bom:
+            st.info("No components to price.")
+        else:
+            st.markdown("Enter the **raw-material rate (₹/kg)** for each component "
+                        "(from your live market source), set **labour/manufacturing**, "
+                        "and pick the **supplier type**. Cost updates instantly.")
 
-        with left:
-            sub_totals = sc.get("sub_totals", {})
+            c1, c2 = st.columns([1, 1])
+            supplier = c1.radio("Supplier type", list(SUPPLIER_FACTORS.keys()),
+                                horizontal=True,
+                                help="International applies a higher cost factor "
+                                     f"(×{SUPPLIER_FACTORS['International']}).")
+            labour = c2.slider("Labour / manufacturing (₹/kg of gross weight)",
+                               0, 500, 90, step=10)
+
+            # Editable raw-material rate per component
+            edit_df = pd.DataFrame([{
+                "id": c.get("id"),
+                "Component": c.get("description", ""),
+                "Material": c.get("material", ""),
+                "Type": c.get("type", ""),
+                "Weight_kg": c.get("weight_kg", 0),
+                "Raw_Rate_₹/kg": float(c.get("raw_material_rate", 0) or 0),
+            } for c in bom])
+
+            edited = st.data_editor(
+                edit_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "id": None,
+                    "Raw_Rate_₹/kg": st.column_config.NumberColumn(
+                        "Raw Rate ₹/kg", min_value=0, step=10,
+                        help="Enter the live raw-material price per kg"),
+                    "Weight_kg": st.column_config.NumberColumn("Weight kg", disabled=True),
+                    "Component": st.column_config.TextColumn(disabled=True),
+                    "Material": st.column_config.TextColumn(disabled=True),
+                    "Type": st.column_config.TextColumn(disabled=True),
+                },
+                key="rate_editor", height=320)
+
+            rate_map = {str(int(r["id"])): float(r["Raw_Rate_₹/kg"] or 0)
+                        for _, r in edited.iterrows()}
+
+            # Price deterministically from the buyer's inputs
+            priced_bom, sc2 = price_manual([dict(c) for c in bom], rate_map,
+                                           labour_rate_per_kg=labour, supplier=supplier)
+            # write back so Export uses the priced BOM
+            st.session_state.result["bom"] = priced_bom
+            st.session_state.result["should_cost"] = sc2
+
+            total_ex = max(sc2.get("total_ex_gst", 0), 1)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Raw Material", f"₹{sc2.get('total_raw_material',0):,}")
+            m2.metric("Labour/Mfg", f"₹{sc2.get('total_machining',0):,}")
+            m3.metric("Total ex-GST", f"₹{sc2.get('total_ex_gst',0):,}")
+            m4.metric("Total incl-GST", f"₹{sc2.get('total_incl_gst',0):,}")
+
+            sub_totals = sc2.get("sub_totals", {})
             if sub_totals:
-                sub_df = pd.DataFrame([
+                st.markdown("**By sub-assembly**")
+                st.dataframe(pd.DataFrame([
                     {"Sub-assembly": k, "Cost (₹)": f"₹{int(v):,}",
                      "% Share": f"{int(int(v)/total_ex*100)}%"}
                     for k, v in sub_totals.items()
-                ])
-                st.dataframe(sub_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No cost breakdown available.")
+                ]), use_container_width=True, hide_index=True)
 
-        with right:
-            for label, key in [
-                ("Raw Material", "total_raw_material"),
-                ("Machining", "total_machining"),
-                ("Total ex-GST", "total_ex_gst"),
-                ("GST 18%", "total_gst"),
-                ("Total incl-GST", "total_incl_gst"),
-            ]:
-                cl, cr = st.columns([3, 2])
-                cl.markdown(
-                    f"<span style='font-size:11px;color:rgba(232,228,219,0.5);"
-                    f"letter-spacing:0.1em;text-transform:uppercase'>{label}</span>",
-                    unsafe_allow_html=True)
-                cr.markdown(
-                    f"<span style='font-size:14px;font-weight:500;color:#e8a020'>"
-                    f"₹{int(sc.get(key,0)):,}</span>", unsafe_allow_html=True)
-
-        st.caption(sc.get("note", ""))
-
-        top5 = sc.get("top5_drivers", [])
-        if top5:
-            st.markdown("**Top 5 cost drivers**")
-            for item in top5:
-                st.markdown(f"`{item.get('description','')}` — "
-                            f"₹{int(item.get('total_cost_inr',0)):,} "
-                            f"({item.get('confidence','')})")
+            st.caption(f"Supplier: {supplier} (×{SUPPLIER_FACTORS[supplier]}) · "
+                       f"Labour ₹{labour}/kg · Raw rates entered by buyer. "
+                       "Cost = (raw material + labour) × supplier factor. No AI pricing, no hallucination.")
 
     # --- Tab 3: AGENT LOG ---
     with tab3:
