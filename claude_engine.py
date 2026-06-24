@@ -171,12 +171,13 @@ _PROVIDERS = [
     ("OpenRouter", _openrouter), ("Mistral", _mistral),
 ]
 
-def _call_llm(prompt, system="", max_tokens=4000, want_json=False):
+def _call_llm(prompt, system="", max_tokens=4000, want_json=False, extra_errors=None):
     """Try free providers in order. Returns (text, name). If want_json, a
     provider's response is only accepted when it parses as JSON — otherwise the
-    chain moves to the next provider. On total failure, raises with a
+    chain moves to the next provider. extra_errors (e.g. a failed Claude attempt)
+    are prepended to the failure detail. On total failure, raises with a
     per-provider reason so the user can see what to fix."""
-    errors = []
+    errors = list(extra_errors or [])
     for name, fn in _PROVIDERS:
         try:
             r = fn(prompt, system, max_tokens)
@@ -222,14 +223,18 @@ def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
 
 def _smart_call(prompt, system="", max_tokens=4000, want_json=False):
     """Claude first (if key set), else free LLMs. Returns (text, provider).
-    If want_json, Claude output is only accepted when it parses as JSON."""
+    If want_json, Claude output is only accepted when it parses as JSON.
+    A failed Claude attempt's reason is surfaced in the final error."""
+    pre = []
     if _get_key("ANTHROPIC_API_KEY"):
         try:
             r = _call_claude(prompt, system, max_tokens)
             if r and len(r) > 10 and (not want_json or _parse_json(r) is not None):
                 return r, "Claude"
-        except: pass
-    return _call_llm(prompt, system, max_tokens, want_json)
+            pre.append("Claude: empty/unparseable response")
+        except Exception as e:
+            pre.append(f"Claude: {str(e)[:120]}")
+    return _call_llm(prompt, system, max_tokens, want_json, pre)
 
 
 def _cheap_call(prompt, system="", max_tokens=4000, want_json=False):
