@@ -450,15 +450,27 @@ def extract_pdf_text(file_bytes):
     pages, tables, kv = [], [], {}
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            for p in pdf.pages:
-                t = p.extract_text()
-                if t: pages.append(t)
+            for pi, p in enumerate(pdf.pages):
+                if pi >= 40:           # safety cap on very large PDFs
+                    break
                 try:
-                    for tbl in (p.extract_tables() or []):
-                        rows = [[("" if c is None else str(c).strip()) for c in row]
-                                for row in tbl if any(c not in (None, "") for c in row)]
-                        if len(rows) >= 1 and any(len(r) >= 2 for r in rows):
-                            tables.append(rows)
+                    t = p.extract_text()
+                    if t: pages.append(t)
+                except Exception:
+                    pass
+                # Table extraction is memory-heavy on image-rich PDFs — bound it
+                # to the first few pages and cap count to avoid OOM crashes.
+                if pi < 6 and len(tables) < 12:
+                    try:
+                        for tbl in (p.extract_tables() or []):
+                            rows = [[("" if c is None else str(c).strip()) for c in row]
+                                    for row in tbl if any(c not in (None, "") for c in row)]
+                            if len(rows) >= 1 and any(len(r) >= 2 for r in rows):
+                                tables.append(rows)
+                    except Exception:
+                        pass
+                try:
+                    p.flush_cache()    # free per-page memory as we go
                 except Exception:
                     pass
     except Exception as e:
