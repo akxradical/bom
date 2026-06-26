@@ -25,6 +25,49 @@ import pandas as pd
 from io import BytesIO
 
 # ═══════════════════════════════════════════════════════════════════
+# TOKEN USAGE TRACKING (live counter + ₹ cost)
+# ═══════════════════════════════════════════════════════════════════
+
+_USAGE = {"input": 0, "output": 0, "cached": 0, "calls": 0, "model": ""}
+
+# ₹ per 1M tokens (input, output) — approx, ₹85/$. Picked by model family.
+_RATES_INR = {
+    "haiku": (85, 425), "sonnet": (255, 1275), "opus": (1275, 6375),
+    "fable": (255, 1275), "free": (0, 0),
+}
+
+def _reset_usage():
+    _USAGE.update(input=0, output=0, cached=0, calls=0, model="")
+
+def _rate_key(model):
+    m = (model or "").lower()
+    for k in ("haiku", "sonnet", "opus", "fable"):
+        if k in m:
+            return k
+    return "free"
+
+def _track(inp, out, cached=0, model="free"):
+    _USAGE["input"] += int(inp or 0)
+    _USAGE["output"] += int(out or 0)
+    _USAGE["cached"] += int(cached or 0)
+    _USAGE["calls"] += 1
+    if model and model != "free":
+        _USAGE["model"] = model
+
+def _est_tokens(*texts):
+    return sum(len(str(t)) for t in texts) // 4   # ~4 chars/token
+
+def usage_cost_inr():
+    rk = _rate_key(_USAGE["model"])
+    ri, ro = _RATES_INR.get(rk, (0, 0))
+    return round(_USAGE["input"] / 1e6 * ri + _USAGE["output"] / 1e6 * ro, 2)
+
+def usage_snapshot():
+    return {**_USAGE, "total_tokens": _USAGE["input"] + _USAGE["output"],
+            "est_cost_inr": usage_cost_inr()}
+
+
+# ═══════════════════════════════════════════════════════════════════
 # LLM PROVIDERS — Claude primary, free LLMs as fallback
 # ═══════════════════════════════════════════════════════════════════
 
@@ -65,7 +108,11 @@ def _oai(url, key, model, prompt, system="", mt=4000):
     d = _http_post(url, {"Content-Type": "application/json",
         "Authorization": f"Bearer {key}"},
         {"model": model, "messages": msgs, "max_tokens": mt, "temperature": 0.1})
-    return d["choices"][0]["message"]["content"].strip()
+    out = d["choices"][0]["message"]["content"].strip()
+    u = d.get("usage") or {}
+    _track(u.get("prompt_tokens") or _est_tokens(system, prompt),
+           u.get("completion_tokens") or _est_tokens(out), 0, "free")
+    return out
 
 
 def _gemini_parse(d):
@@ -81,6 +128,9 @@ def _gemini_parse(d):
     text = " ".join(p.get("text", "") for p in parts if "text" in p).strip()
     if not text:
         raise Exception(f"empty text (finishReason={cand.get('finishReason')})")
+    um = d.get("usageMetadata") or {}
+    _track(um.get("promptTokenCount") or _est_tokens(text) * 3,
+           um.get("candidatesTokenCount") or _est_tokens(text), 0, "free")
     return text
 
 
@@ -234,6 +284,10 @@ def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
         for attempt in range(3):
             try:
                 resp = client.messages.create(**kw)
+                u = getattr(resp, "usage", None)
+                if u:
+                    _track(getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
+                           getattr(u, "cache_read_input_tokens", 0) or 0, model)
                 return "\n".join(b.text for b in resp.content if hasattr(b, "text")).strip()
             except Exception as e:
                 es = str(e)
@@ -718,14 +772,77 @@ Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
     return norm
 
 
+def _generate_bom_batch(equipment_type, key_specs, schema, agent_log, cb, doc=""):
+    """Generate the WHOLE BOM in ONE LLM call (all sub-assemblies at once).
+    ~7-10× fewer calls than per-sub-assembly → big token/cost saving.
+    Returns a normalized list, or [] if the single call didn't produce enough."""
+    _log(agent_log, cb, "BOM", "Generating full BOM (single call)...", running=True)
+    sub_list = [{"id": s["id"], "name": s["name"], "scope": s.get("description", ""),
+                 "approx_count": s.get("typical_components_count", 4)} for s in schema]
+    prompt = f"""Product: {equipment_type}
+Specs: {json.dumps(key_specs or {}, default=str)[:1000]}
+
+ACTUAL DATASHEET TEXT:
+{doc[:7000]}
+
+Sub-assemblies to populate (cover EVERY one):
+{json.dumps(sub_list, default=str)}
+
+Produce the COMPLETE BOM in a SINGLE JSON array. For each sub-assembly include its
+real components (use sub_assembly_id to tag each). Exact MOC grades / part classes
+and realistic kg weights for THIS product's actual size/scale.
+
+Return ONLY a JSON array (no prose):
+[{{"sub_assembly_id":"A","description":"component (<=45 chars)","material":"grade or 'bought-out item'",
+"qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,"standards_applicable":""}}]"""
+    try:
+        raw, prov = _smart_call(prompt, BOM_SYS, 4096, want_json=True)
+    except Exception as e:
+        _populate_subassembly.last_error = str(e)
+        _log(agent_log, cb, "BOM", "single-call failed", str(e)[:90])
+        return []
+    data = _parse_json(raw)
+    if isinstance(data, dict):
+        for k in ("components", "bom", "items", "data"):
+            if isinstance(data.get(k), list): data = data[k]; break
+        else: data = []
+    if not isinstance(data, list):
+        data = _recover_truncated(raw.replace("```json", "").replace("```", "")) if raw else []
+    sub_by_id = {s["id"]: s for s in schema}
+    norm = []
+    for c in data:
+        if not isinstance(c, dict) or not c.get("description"): continue
+        sid = str(c.get("sub_assembly_id", "")).strip()
+        sub = sub_by_id.get(sid) or schema[0]
+        ctype = str(c.get("type", "")).lower()
+        if ctype not in ("manufactured", "bought_out"):
+            ctype = _classify(c.get("description", ""))
+        norm.append({
+            "description": str(c.get("description", "")).strip()[:60],
+            "material": str(c.get("material", c.get("moc", ""))).strip(),
+            "qty": str(c.get("qty", "1")).strip() or "1",
+            "unit": str(c.get("unit", "no")).strip() or "no",
+            "type": ctype,
+            "weight_kg": _num(c.get("weight_kg", c.get("weight"))),
+            "standards_applicable": str(c.get("standards_applicable", c.get("standards", ""))).strip(),
+            "sub_assembly_id": sub["id"], "sub_assembly_name": sub["name"],
+        })
+    return norm
+
+
 def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
     _populate_subassembly.last_error = ""
-    bom = []
     n = len(schema)
-    for i, sub in enumerate(schema, 1):
-        comps = _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, n, i, doc)
-        bom.extend(comps)
-    # assign ids
+    # 1) Try the cheap single-call path first.
+    bom = _generate_bom_batch(equipment_type, key_specs, schema, agent_log, cb, doc)
+    covered = len({c["sub_assembly_id"] for c in bom})
+    # 2) Fall back to per-sub-assembly only if the batch was thin/incomplete.
+    if len(bom) < max(5, n) or covered < max(1, n // 2):
+        _log(agent_log, cb, "BOM", "expanding per sub-assembly...", running=True)
+        bom = []
+        for i, sub in enumerate(schema, 1):
+            bom.extend(_populate_subassembly(equipment_type, key_specs, sub,
+                                             agent_log, cb, n, i, doc))
     for j, c in enumerate(bom, 1):
         c["id"] = j
     if not bom:
@@ -1186,8 +1303,14 @@ def run_agent(pdf_text, progress_callback=None, price=True):
     }
     """
     _T0[0] = time.time()
+    _reset_usage()
     agent_log, cb = [], progress_callback
     doc = pdf_text or ""
+
+    def _toks():
+        s = usage_snapshot()
+        _log(agent_log, cb, "TOKENS", "usage",
+             f"{s['calls']} calls · {s['total_tokens']:,} tokens · ~₹{s['est_cost_inr']}")
 
     # 1 — IDENTIFY
     ident = _identify(pdf_text, agent_log, cb)
@@ -1206,16 +1329,17 @@ def run_agent(pdf_text, progress_callback=None, price=True):
     except Exception as e:
         _log(agent_log, cb, "VERIFY", "skipped", str(e)[:60])
 
-    # 4 — VALIDATION LOOP (max 2 iterations)
+    # 4 — VALIDATION LOOP (one pass; refill only genuinely EMPTY sub-assemblies
+    #     to keep cost down — re-populating low-count subs is rarely worth the tokens)
     iterations = 0
     validation = _validate_bom(bom, equipment_type, schema)
-    while validation["completeness"] < 0.80 and iterations < 2:
-        iterations += 1
+    if validation["completeness"] < 0.80 and validation["gaps"]:
+        iterations = 1
         _log(agent_log, cb, "VALIDATE",
-             f"completeness {int(validation['completeness']*100)}% → looping (iter {iterations})",
+             f"completeness {int(validation['completeness']*100)}% → filling {len(validation['gaps'])} empty sub-assemblies",
              f"{int(validation['completeness']*100)}% — filling {len(validation['gaps'])} gaps")
         bom = _fill_gaps(equipment_type, key_specs, schema, bom,
-                         validation["gaps"] + validation["warnings"], agent_log, cb, doc)
+                         validation["gaps"], agent_log, cb, doc)
         validation = _validate_bom(bom, equipment_type, schema)
     _log(agent_log, cb, "VALIDATE", "done",
          f"completeness {int(validation['completeness']*100)}% after {iterations} iteration(s)")
@@ -1235,6 +1359,10 @@ def run_agent(pdf_text, progress_callback=None, price=True):
 
     # 6 — CONFIDENCE
     confidence = _confidence(bom, schema, validation)
+    usage = usage_snapshot()
+    _log(agent_log, cb, "TOKENS", "total",
+         f"{usage['calls']} calls · {usage['total_tokens']:,} tokens "
+         f"(in {usage['input']:,} / out {usage['output']:,}) · ~₹{usage['est_cost_inr']}")
     _log(agent_log, cb, "DONE", "done",
          f"confidence {int(confidence*100)}% | {len(bom)} components | ₹{should_cost.get('total_ex_gst',0):,}")
 
@@ -1247,6 +1375,7 @@ def run_agent(pdf_text, progress_callback=None, price=True):
         "bom": bom,
         "should_cost": should_cost,
         "confidence": confidence,
+        "usage": usage,
         "agent_log": agent_log,
         "gaps": validation["gaps"],
         "warnings": validation["warnings"],
@@ -1335,6 +1464,15 @@ def export_excel(result):
         ("Should-Cost incl-GST (₹)", f"{sc.get('total_incl_gst',0):,}"),
         ("Date", datetime.date.today().isoformat()),
     ]
+    gt = result.get("grand_total")
+    if gt:
+        summary += [
+            ("Components (RM+Mfg) (₹)", f"{gt.get('components_ex_gst',0):,}"),
+            ("Freight (₹)", f"{gt.get('freight',0):,}"),
+            ("Overhead (₹)", f"{gt.get('overhead',0):,}"),
+            ("GRAND TOTAL ex-GST (₹)", f"{gt.get('total_ex_gst',0):,}"),
+            ("GRAND TOTAL incl-GST (₹)", f"{gt.get('total_incl_gst',0):,}"),
+        ]
     r = 3
     for lbl, val in summary:
         ws0.cell(r, 1, lbl).font = Font(name="Arial", bold=True, size=10)
