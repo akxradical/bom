@@ -138,7 +138,7 @@ st.markdown(f"""
 # RUN PHASE  (only show uploader/terminal until a result exists)
 # ═══════════════════════════════════════════════════════════════════
 if not LIGHT:
-    uploaded = st.file_uploader("", type=["pdf"], label_visibility="collapsed")
+    uploaded = st.file_uploader("Datasheet PDF", type=["pdf"], label_visibility="collapsed")
     st.caption("PDF datasheets, GA drawings, spec sheets — any engineered product")
     run = st.button("◈ RUN AGENT", disabled=uploaded is None)
 
