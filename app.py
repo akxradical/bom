@@ -47,22 +47,21 @@ ss.setdefault("result", None)
 ss.setdefault("agent_lines", [])
 ss.setdefault("rates", {})        # {component_id: raw ₹/kg}
 ss.setdefault("supplier", "Indian")
-ss.setdefault("labour", 90)
+ss.setdefault("mfg_pct", 80)
 ss.setdefault("overhead", 0)
 ss.setdefault("per_km", 35)
 ss.setdefault("supplier_loc", "")
 ss.setdefault("site_loc", "")
 ss.setdefault("freight", None)    # {km, mode, cost, a:{lat,lon}, b:{lat,lon}}
 
-LIGHT = ss.result is not None   # phase switch: light once a BOM exists
+LIGHT = ss.result is not None   # phase flag: results exist → show data layout
 
 # ═══════════════════════════════════════════════════════════════════
-# THEME  (dark during run, light once results are in)
+# THEME  — ONE consistent light theme (matches .streamlit/config.toml).
+# The "command-center" feel comes from the dark terminal PANEL, not from
+# flipping the page background (which made light text invisible).
 # ═══════════════════════════════════════════════════════════════════
-if LIGHT:
-    BG, FG, MUT, CARD, BORDER, PRIMARY = "#f4f6f9", "#1a1f29", "#5b6472", "#ffffff", "#e3e8ef", "#0a6ed1"
-else:
-    BG, FG, MUT, CARD, BORDER, PRIMARY = "#0a0a0f", "#e8e4db", "#8b8b9b", "#12121a", "#23232f", "#e8a020"
+BG, FG, MUT, CARD, BORDER, PRIMARY = "#f4f6f9", "#1a1f29", "#5b6472", "#ffffff", "#e3e8ef", "#0a6ed1"
 
 st.markdown(f"""
 <style>
@@ -185,15 +184,16 @@ else:
             ss.rates[cid] = float(default)
 
     # ── controls
-    cc1, cc2, cc3 = st.columns([1.2, 1.4, 1])
+    cc1, cc2 = st.columns([1, 1.4])
     ss.supplier = cc1.radio("Supplier", list(SUPPLIER_FACTORS.keys()),
                             index=list(SUPPLIER_FACTORS).index(ss.supplier), horizontal=True)
-    ss.labour = cc2.slider("Labour / mfg (₹/kg)", 0, 500, ss.labour, 10)
-    cc3.markdown(" ")
+    ss.mfg_pct = cc2.slider("Manufacturing cost (% of raw material)", 0, 200, ss.mfg_pct, 5,
+                            help="Machining/casting/fabrication added on top of raw material. "
+                                 "Not applied to bought-out items.")
 
     # ── price with current inputs
     priced, sc = price_manual([dict(c) for c in bom], ss.rates,
-                              labour_rate_per_kg=ss.labour, supplier=ss.supplier)
+                              mfg_pct=ss.mfg_pct, supplier=ss.supplier)
     ss.result["bom"] = priced
     ss.result["should_cost"] = sc
 
@@ -217,40 +217,41 @@ else:
 
     # ── COSTING: SAP-style form, grouped by sub-assembly ──────────
     with tab_cost:
-        st.markdown(f"Fill the **raw-material rate (₹/kg)** per component. "
-                    f"Supplier **{ss.supplier}** (×{SUPPLIER_FACTORS[ss.supplier]}), "
-                    f"labour **₹{ss.labour}/kg**. Totals update live.")
+        st.markdown(f"**Manufactured** parts → enter **raw-material ₹/kg** "
+                    f"(manufacturing = {ss.mfg_pct}% of raw material). "
+                    f"**Bought-out** parts → enter the **purchase price ₹/unit**. "
+                    f"Supplier **{ss.supplier}** (×{SUPPLIER_FACTORS[ss.supplier]}). "
+                    f"Cost is ₹0 until you enter a value.")
         by_sub = {}
         for c in priced:
             by_sub.setdefault((c.get("sub_assembly_id"), c.get("sub_assembly_name")), []).append(c)
 
         for s in schema:
-            key = (s["id"], s["name"])
-            items = by_sub.get(key, [])
+            items = by_sub.get((s["id"], s["name"]), [])
             if not items:
                 continue
             sub_total = sum(int(x.get("total_cost_inr", 0)) for x in items)
-            st.markdown(f'<div class="sa-head">{s["id"]}. {s["name"]} '
-                        f'&nbsp;·&nbsp; ₹{sub_total:,}</div>', unsafe_allow_html=True)
-            st.markdown('<div class="sa-body">', unsafe_allow_html=True)
-            # column headers
-            h = st.columns([3, 1.6, 0.8, 1.2, 1.2])
-            for col, t in zip(h, ["Component", "Material", "Wt kg", "Rate ₹/kg", "Cost ₹"]):
-                col.markdown(f"<span class='row-m'>{t}</span>", unsafe_allow_html=True)
-            for c in items:
-                r = st.columns([3, 1.6, 0.8, 1.2, 1.2])
-                r[0].markdown(f"<span class='row-c'>{html.escape(str(c.get('description','')))}</span>",
-                              unsafe_allow_html=True)
-                r[1].markdown(f"<span class='row-m'>{html.escape(str(c.get('material','') or '—'))}</span>",
-                              unsafe_allow_html=True)
-                r[2].markdown(f"<span class='row-m'>{c.get('weight_kg',0)}</span>", unsafe_allow_html=True)
-                cid = str(c.get("id"))
-                ss.rates[cid] = r[3].number_input(
-                    "rate", min_value=0.0, step=10.0, value=float(ss.rates.get(cid, 0) or 0),
-                    key=f"rate_{cid}", label_visibility="collapsed")
-                r[4].markdown(f"<span class='row-c'><b>₹{int(c.get('total_cost_inr',0)):,}</b></span>",
-                              unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+            with st.container(border=True):
+                st.markdown(f"#### {s['id']}. {s['name']}  ·  ₹{sub_total:,}")
+                h = st.columns([2.6, 1.6, 0.7, 0.6, 1.5, 1.3])
+                for col, t in zip(h, ["Component", "Material", "Unit kg", "Qty",
+                                      "Rate ₹/kg  •  Price ₹/unit", "Cost ₹"]):
+                    col.caption(t)
+                for c in items:
+                    cid = str(c.get("id"))
+                    bo = str(c.get("component_type", c.get("type", ""))).lower() == "bought_out"
+                    r = st.columns([2.6, 1.6, 0.7, 0.6, 1.5, 1.3])
+                    r[0].markdown(f"**{html.escape(str(c.get('description','')))}**"
+                                  + ("  🛒" if bo else ""))
+                    r[1].caption(html.escape(str(c.get("material", "") or "—")))
+                    r[2].markdown(str(c.get("weight_kg", 0)))
+                    r[3].markdown(str(c.get("qty", "1")))
+                    ss.rates[cid] = r[4].number_input(
+                        ("purchase ₹/unit" if bo else "raw ₹/kg"),
+                        min_value=0.0, step=(1000.0 if bo else 10.0),
+                        value=float(ss.rates.get(cid, 0) or 0),
+                        key=f"rate_{cid}", label_visibility="collapsed")
+                    r[5].markdown(f"**₹{int(c.get('total_cost_inr',0)):,}**")
 
         # save entered rates to the persistent database
         if st.button("💾 Save rates to database"):
