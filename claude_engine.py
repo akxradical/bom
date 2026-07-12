@@ -254,6 +254,11 @@ def _claude_models():
     Current (2026) models are listed first — older dated IDs are retired and
     404 on new accounts, so they're only kept as last-resort fallbacks."""
     override = _get_key("CLAUDE_MODEL")
+    if _WORKING_MODEL[0]:
+        # Pin the model that already worked this run: avoids re-trying dead
+        # model IDs per call AND keeps the prompt cache hitting (cache is
+        # model-scoped — switching models mid-run would miss every time).
+        return [_WORKING_MODEL[0]]
     base = [
         "claude-sonnet-4-6",            # current Sonnet (best value)
         "claude-haiku-4-5-20251001",    # current Haiku (cheapest)
@@ -267,9 +272,23 @@ def _claude_models():
     return ([override] + base) if override else base
 
 
-def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
+_WORKING_MODEL = [None]   # first Claude model that succeeds this run
+
+_DOC_PREAMBLE = ("You are given an engineered-product datasheet (pre-extracted). "
+                 "Treat it as ground truth for every task.\n\nDATASHEET:\n")
+
+
+def _call_claude(prompt, system="", max_tokens=4000, use_search=False,
+                 force_json=False, doc=""):
     """Claude API with optional web search. Tries multiple model IDs so an
-    account that lacks one model still works on another."""
+    account that lacks one model still works on another.
+
+    force_json=True → forces a generic 'emit' tool call, so the reply is ALWAYS
+    valid JSON (no markdown fences, no prose, no parse retries).
+    doc → sent as a prompt-cached system block: the datasheet is billed in full
+    once, then every later step re-reads it from cache at ~10% of the price.
+    The emit tool + doc block are byte-identical across steps on purpose —
+    that's what makes the cache prefix hit."""
     k = _get_key("ANTHROPIC_API_KEY")
     if not k: raise ValueError("ANTHROPIC_API_KEY not set")
     try: import anthropic
@@ -277,17 +296,36 @@ def _call_claude(prompt, system="", max_tokens=4000, use_search=False):
     client = anthropic.Anthropic(api_key=k)
     last_err = "no model tried"
     for model in _claude_models():
-        kw = {"model": model, "max_tokens": min(max_tokens, 4096),
+        kw = {"model": model, "max_tokens": min(max_tokens, 8192),
               "messages": [{"role": "user", "content": prompt}]}
-        if system: kw["system"] = system
-        if use_search: kw["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        if doc:
+            blocks = [{"type": "text", "text": _DOC_PREAMBLE + doc,
+                       "cache_control": {"type": "ephemeral"}}]
+            if system: blocks.append({"type": "text", "text": system})
+            kw["system"] = blocks
+        elif system:
+            kw["system"] = system
+        if force_json:
+            kw["tools"] = [{"name": "emit",
+                            "description": "Emit the final result as a JSON object.",
+                            "input_schema": {"type": "object", "additionalProperties": True}}]
+            kw["tool_choice"] = {"type": "tool", "name": "emit"}
+        elif use_search:
+            kw["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
         for attempt in range(3):
             try:
                 resp = client.messages.create(**kw)
+                _WORKING_MODEL[0] = model
                 u = getattr(resp, "usage", None)
                 if u:
-                    _track(getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
+                    _track((getattr(u, "input_tokens", 0) or 0) +
+                           (getattr(u, "cache_creation_input_tokens", 0) or 0),
+                           getattr(u, "output_tokens", 0),
                            getattr(u, "cache_read_input_tokens", 0) or 0, model)
+                if force_json:
+                    for b in resp.content:
+                        if getattr(b, "type", "") == "tool_use":
+                            return b.input
                 return "\n".join(b.text for b in resp.content if hasattr(b, "text")).strip()
             except Exception as e:
                 es = str(e)
@@ -314,6 +352,29 @@ def _smart_call(prompt, system="", max_tokens=4000, want_json=False):
         except Exception as e:
             pre.append(f"Claude: {str(e)[:120]}")
     return _call_llm(prompt, system, max_tokens, want_json, pre)
+
+
+def _smart_json(prompt, system="", max_tokens=4000, doc=""):
+    """Structured-JSON call: Claude with forced tool use (guaranteed valid JSON
+    + prompt-cached datasheet), falling back to free providers + tolerant
+    parsing. Returns (parsed_object_or_None, provider). The datasheet goes in
+    `doc` — NOT in the prompt — so Claude can cache it across steps; for free
+    providers it is appended to the prompt."""
+    pre = []
+    if _get_key("ANTHROPIC_API_KEY"):
+        try:
+            r = _call_claude(prompt, system, max_tokens, force_json=True, doc=doc)
+            if isinstance(r, (dict, list)) and r:
+                return r, "Claude"
+            if isinstance(r, str):
+                p = _parse_json(r)
+                if p: return p, "Claude"
+            pre.append("Claude: empty structured response")
+        except Exception as e:
+            pre.append(f"Claude: {str(e)[:120]}")
+    full = f"{prompt}\n\nDATASHEET (ground truth):\n{doc}" if doc else prompt
+    raw, name = _call_llm(full, system, max_tokens, want_json=True, extra_errors=pre)
+    return _parse_json(raw), name
 
 
 def _cheap_call(prompt, system="", max_tokens=4000, want_json=False):
@@ -552,45 +613,29 @@ spec sheet) and identify the product. Never guess wildly — if unsure, say so
 in key_specs. Return strict JSON only."""
 
 
-def _identify(pdf_text, agent_log, cb):
+def _identify(doc, agent_log, cb):
     _log(agent_log, cb, "IDENTIFY", "Reading document structure...", running=True)
-    prompt = f"""Identify the engineered product described in this document.
+    prompt = """Identify the engineered product described in the datasheet.
 Read carefully — the SAME word can mean different products (e.g. "pump" may be a
 large centrifugal process pump OR a tiny diaphragm sampling pump inside a handheld
 gas detector). Judge from the WHOLE document (size, weight, power source, sensors,
 display, wireless, housing) what the product really is.
 
-DOCUMENT TEXT:
-{pdf_text[:14000]}
-
 Return ONLY this JSON object:
-{{
-  "equipment_type": "specific product class incl. standard/class if present (e.g. 'Centrifugal Pump (API 610 OH2)', 'Portable Multi-Gas Detector', 'Shell & Tube Heat Exchanger (TEMA AES)', 'Distribution Transformer')",
+{
+  "equipment_type": "specific product class incl. standard/class if present (e.g. 'Centrifugal Pump (API 610 OH2)', 'Portable Multi-Gas Detector', 'Shell & Tube Heat Exchanger (TEMA AES)')",
   "manufacturer": "name or null",
   "model": "model/tag or null",
   "is_engineered_product": true,
-  "key_specs": {{ "any": "important rating/size/duty/feature parameters you find as key:value" }}
-}}"""
-    raw, prov = "", "none"
+  "key_specs": { "<parameter>": "<value>" }
+}"""
+    data, prov = {}, "none"
     try:
-        raw, prov = _cheap_call(prompt, IDENTIFY_SYS, 1500, want_json=True)
+        data, prov = _smart_json(prompt, IDENTIFY_SYS, 1200, doc=doc)
     except Exception as e:
         _log(agent_log, cb, "IDENTIFY", "llm error", str(e)[:140])
-    data = _parse_json(raw) or {}
     if not isinstance(data, dict): data = {}
     et = (data.get("equipment_type") or "").strip()
-    # Retry with a stronger model if identification failed or was generic.
-    if not et or et.lower() in ("engineered product", "unknown", "n/a", "product"):
-        if raw and not et:
-            _log(agent_log, cb, "IDENTIFY", "unparseable", f"got {len(raw)} chars, no equipment_type")
-        try:
-            raw2, prov = _smart_call(prompt, IDENTIFY_SYS, 1500, want_json=True)
-            d2 = _parse_json(raw2)
-            if isinstance(d2, dict) and (d2.get("equipment_type") or "").strip():
-                data = d2
-                et = data["equipment_type"].strip()
-        except Exception as e:
-            _log(agent_log, cb, "IDENTIFY", "retry failed", str(e)[:140])
     if not et:
         et = "Engineered Product"
     data["equipment_type"] = et
@@ -630,43 +675,30 @@ Return strict JSON array only."""
 def _build_schema(equipment_type, key_specs, agent_log, cb, doc=""):
     _log(agent_log, cb, "SCHEMA", "Building sub-assembly schema...", running=True)
     prompt = f"""Product: {equipment_type}
-Known specs: {json.dumps(key_specs or {}, default=str)[:1500]}
+Known specs: {json.dumps(key_specs or {}, default=str, separators=(',', ':'))[:1200]}
 
-ACTUAL DATASHEET TEXT (decompose THIS specific product, not a generic category):
-{doc[:6000]}
-
-Step 1 (think): based on the datasheet above, what kind of engineered product is
-this, and which engineering disciplines does it involve? (mechanical? electronic?
-hydraulic? optical? chemical/process? structural? a mix?) Beware: the same word
-(e.g. "pump") can mean very different things depending on the product.
+Step 1 (think): from the datasheet, what kind of engineered product is this and
+which engineering disciplines does it involve? (mechanical? electronic? hydraulic?
+optical? chemical/process? structural? a mix?) Beware: the same word (e.g. "pump")
+can mean very different things depending on the product.
 
 Step 2: list ALL sub-assemblies (functional groups) THIS specific product
 contains, derived from what the product actually is — not from a fixed template.
-Be exhaustive for this product and include every discipline it needs.
+e.g. a centrifugal pump → hydraulics, rotating assembly, bearings, sealing, drive,
+structural; a portable gas monitor → sensors, main PCB, power/battery, display,
+wireless, enclosure; a transformer → core, windings, tank, bushings, cooling, OLTC.
+Invent the right groups for THIS product.
 
-For reference, different products decompose very differently, e.g.:
-- a centrifugal pump → hydraulics, rotating assembly, bearings, sealing, drive, structural
-- a portable gas monitor → sensors, main PCB, power/battery, display, wireless, enclosure
-- a power transformer → core, windings, tank, bushings, cooling, OLTC, protection
-- a shell & tube heat exchanger → shell, tube bundle, channels, tubesheets, baffles, nozzles
-- a hydraulic press → frame, cylinder, power pack, valves, controls, tooling
-- a telescope/optical instrument → optics, opto-mechanics, mount/drive, electronics, housing
-Use the pattern that fits THIS product; invent the right groups for it.
-
-Return ONLY a JSON array:
-[
-  {{"id": "A", "name": "specific sub-assembly name",
-    "description": "what it contains",
-    "typical_components_count": 5}}
-]
+Return ONLY this JSON:
+{{"sub_assemblies": [{{"id": "A", "name": "specific sub-assembly name",
+  "description": "what it contains", "typical_components_count": 5}}]}}
 Use single-letter ids A, B, C, ... in order. 6-14 sub-assemblies typical."""
     try:
-        raw, prov = _smart_call(prompt, SCHEMA_SYS, 2500, want_json=True)
+        data, prov = _smart_json(prompt, SCHEMA_SYS, 2000, doc=doc)
     except Exception as e:
         # LLM totally unavailable — degrade to neutral schema, do not crash.
         _log(agent_log, cb, "SCHEMA", "llm unavailable", f"using fallback schema ({str(e)[:60]})")
-        raw = ""
-    data = _parse_json(raw)
+        data = None
     # Free LLMs often wrap the array in an object — unwrap it.
     if isinstance(data, dict):
         for k in ("sub_assemblies", "subassemblies", "schema", "groups", "data", "items"):
@@ -723,35 +755,31 @@ def _populate_subassembly(equipment_type, key_specs, sub, agent_log, cb, total, 
     _log(agent_log, cb, "BOM",
          f"Populating: {sub['id']}. {sub['name']} ({idx}/{total})...", running=True)
     prompt = f"""Product: {equipment_type}
-Specs: {json.dumps(key_specs or {}, default=str)[:1200]}
-
-ACTUAL DATASHEET TEXT (components must fit THIS product, at THIS size/scale):
-{doc[:4500]}
+Specs: {json.dumps(key_specs or {}, default=str, separators=(',', ':'))[:1000]}
 
 Sub-assembly to populate:
 id={sub['id']} | name={sub['name']} | scope={sub.get('description','')}
 
-List every real component in THIS sub-assembly, consistent with the datasheet
-above. Use exact MOC grades / part classes and realistic kg weights for this
+List every real component in THIS sub-assembly, consistent with the datasheet.
+Use exact MOC grades / part classes and realistic PER-UNIT kg weights for this
 product's actual size/duty (a handheld device has gram-scale parts; a process
 skid has kg/tonne-scale parts — match the real product).
 
-Return ONLY a JSON array:
-[{{"description":"component name (<=45 chars)","material":"ASTM/IS/EN grade or 'bought-out item'",
+Return ONLY this JSON:
+{{"components":[{{"description":"component name (<=45 chars)","material":"ASTM/IS/EN grade or 'bought-out item'",
 "qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,
-"standards_applicable":"std or empty"}}]
-Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
+"standards_applicable":"std or empty"}}]}}
+Aim for ~{sub.get('typical_components_count',4)} components."""
     try:
-        raw, prov = _smart_call(prompt, BOM_SYS, 2500, want_json=True)
+        data, prov = _smart_json(prompt, BOM_SYS, 2500, doc=doc)
     except Exception as e:
         # Surface WHY — do not fail silently (this is what made "no components"
         # impossible to diagnose). Record the reason for the run summary.
         _populate_subassembly.last_error = str(e)
         _log(agent_log, cb, "BOM", "populate failed", f"{sub['id']}: {str(e)[:90]}")
         return []
-    data = _parse_json(raw)
     if not data:
-        _populate_subassembly.last_error = f"unparseable response (got {len(raw or '')} chars)"
+        _populate_subassembly.last_error = "empty/unparseable response"
         _log(agent_log, cb, "BOM", "populate empty", f"{sub['id']}: response not JSON")
     items = []
     if isinstance(data, list):
@@ -762,9 +790,6 @@ Aim for ~{sub.get('typical_components_count',4)} components. JSON array ONLY."""
                 items = [x for x in data[k] if isinstance(x, dict)]; break
         else:
             if "description" in data: items = [data]
-    # Recover from truncation if too few
-    if len(items) < 1 and raw:
-        items = _recover_truncated(raw.replace("```json", "").replace("```", ""))
     norm = []
     for c in items:
         ctype = str(c.get("type", "")).lower()
@@ -792,34 +817,30 @@ def _generate_bom_batch(equipment_type, key_specs, schema, agent_log, cb, doc=""
     sub_list = [{"id": s["id"], "name": s["name"], "scope": s.get("description", ""),
                  "approx_count": s.get("typical_components_count", 4)} for s in schema]
     prompt = f"""Product: {equipment_type}
-Specs: {json.dumps(key_specs or {}, default=str)[:1000]}
-
-ACTUAL DATASHEET TEXT:
-{doc[:7000]}
+Specs: {json.dumps(key_specs or {}, default=str, separators=(',', ':'))[:1000]}
 
 Sub-assemblies to populate (cover EVERY one):
-{json.dumps(sub_list, default=str)}
+{json.dumps(sub_list, default=str, separators=(',', ':'))}
 
-Produce the COMPLETE BOM in a SINGLE JSON array. For each sub-assembly include its
-real components (use sub_assembly_id to tag each). Exact MOC grades / part classes
-and realistic kg weights for THIS product's actual size/scale.
+Produce the COMPLETE BOM. For each sub-assembly include its real components
+(tag each with sub_assembly_id). Exact MOC grades / part classes and realistic
+PER-UNIT kg weights for THIS product's actual size/scale.
 
-Return ONLY a JSON array (no prose):
-[{{"sub_assembly_id":"A","description":"component (<=45 chars)","material":"grade or 'bought-out item'",
-"qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,"standards_applicable":""}}]"""
+Return ONLY this JSON:
+{{"components":[{{"sub_assembly_id":"A","description":"component (<=45 chars)","material":"grade or 'bought-out item'",
+"qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,"standards_applicable":""}}]}}"""
     try:
-        raw, prov = _smart_call(prompt, BOM_SYS, 4096, want_json=True)
+        data, prov = _smart_json(prompt, BOM_SYS, 8000, doc=doc)
     except Exception as e:
         _populate_subassembly.last_error = str(e)
         _log(agent_log, cb, "BOM", "single-call failed", str(e)[:90])
         return []
-    data = _parse_json(raw)
     if isinstance(data, dict):
         for k in ("components", "bom", "items", "data"):
             if isinstance(data.get(k), list): data = data[k]; break
         else: data = []
     if not isinstance(data, list):
-        data = _recover_truncated(raw.replace("```json", "").replace("```", "")) if raw else []
+        data = []
     sub_by_id = {s["id"]: s for s in schema}
     norm = []
     for c in data:
@@ -850,11 +871,18 @@ def _generate_bom(equipment_type, key_specs, schema, agent_log, cb, doc=""):
     covered = len({c["sub_assembly_id"] for c in bom})
     # 2) Fall back to per-sub-assembly only if the batch was thin/incomplete.
     if len(bom) < max(5, n) or covered < max(1, n // 2):
-        _log(agent_log, cb, "BOM", "expanding per sub-assembly...", running=True)
-        bom = []
-        for i, sub in enumerate(schema, 1):
+        # KEEP what the (already paid-for) batch call produced; only populate
+        # the sub-assemblies it left empty or thin.
+        by_sub = {}
+        for c in bom:
+            by_sub.setdefault(c["sub_assembly_id"], []).append(c)
+        thin = [s for s in schema if len(by_sub.get(s["id"], [])) < 2]
+        _log(agent_log, cb, "BOM",
+             f"expanding {len(thin)} thin sub-assemblies...", running=True)
+        for i, sub in enumerate(thin, 1):
+            bom = [c for c in bom if c.get("sub_assembly_id") != sub["id"]]
             bom.extend(_populate_subassembly(equipment_type, key_specs, sub,
-                                             agent_log, cb, n, i, doc))
+                                             agent_log, cb, len(thin), i, doc))
     for j, c in enumerate(bom, 1):
         c["id"] = j
     if not bom:
@@ -888,31 +916,27 @@ def _verify_completeness(equipment_type, key_specs, schema, bom, agent_log, cb, 
     present = sorted({str(c.get("description", "")).strip() for c in bom if c.get("description")})
     sub_list = [{"id": s["id"], "name": s["name"]} for s in schema]
     prompt = f"""Product: {equipment_type}
-Specs: {json.dumps(key_specs or {}, default=str)[:800]}
-
-DATASHEET (ground truth):
-{doc[:4000]}
+Specs: {json.dumps(key_specs or {}, default=str, separators=(',', ':'))[:800]}
 
 Sub-assemblies (use these ids for placement):
-{json.dumps(sub_list, default=str)}
+{json.dumps(sub_list, default=str, separators=(',', ':'))}
 
 The CURRENT BOM already contains these components:
-{json.dumps(present, default=str)[:3500]}
+{json.dumps(present, default=str, separators=(',', ':'))[:3000]}
 
 Task: per applicable standards and normal build practice for THIS product, list ONLY
 the MANDATORY components that are MISSING from the list above. Do not repeat anything
-already present. If nothing is missing, return [].
+already present. If nothing is missing, return {{"missing":[]}}.
 
-Return ONLY a JSON array:
-[{{"description":"component (<=45 chars)","material":"grade or 'bought-out item'",
+Return ONLY this JSON:
+{{"missing":[{{"description":"component (<=45 chars)","material":"grade or 'bought-out item'",
 "qty":"1","unit":"no","type":"manufactured|bought_out","weight_kg":0,
-"standards_applicable":"std or empty","sub_assembly_id":"best-fit id from list"}}]"""
+"standards_applicable":"std or empty","sub_assembly_id":"best-fit id from list"}}]}}"""
     try:
-        raw, prov = _smart_call(prompt, VERIFY_SYS, 2500, want_json=True)
+        data, prov = _smart_json(prompt, VERIFY_SYS, 2000, doc=doc)
     except Exception as e:
         _log(agent_log, cb, "VERIFY", "skipped", f"critic unavailable ({str(e)[:50]})")
         return bom, 0
-    data = _parse_json(raw)
     if isinstance(data, dict):
         for k in ("missing", "components", "items", "data"):
             if isinstance(data.get(k), list):
@@ -1334,8 +1358,11 @@ def run_agent(pdf_text, progress_callback=None, price=True):
     """
     _T0[0] = time.time()
     _reset_usage()
+    _WORKING_MODEL[0] = None
     agent_log, cb = [], progress_callback
-    doc = pdf_text or ""
+    # ONE canonical slice reused by every step — must be byte-identical so the
+    # Anthropic prompt-cache block hits on steps 2..N (paid full price once).
+    doc = (pdf_text or "")[:12000]
 
     def _toks():
         s = usage_snapshot()
@@ -1343,7 +1370,7 @@ def run_agent(pdf_text, progress_callback=None, price=True):
              f"{s['calls']} calls · {s['total_tokens']:,} tokens · ~₹{s['est_cost_inr']}")
 
     # 1 — IDENTIFY
-    ident = _identify(pdf_text, agent_log, cb)
+    ident = _identify(doc, agent_log, cb)
     equipment_type = ident.get("equipment_type", "Engineered Product")
     key_specs = ident.get("key_specs", {}) or {}
 
