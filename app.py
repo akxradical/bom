@@ -57,11 +57,52 @@ ss.setdefault("freight", None)    # {km, mode, cost, a:{lat,lon}, b:{lat,lon}}
 LIGHT = ss.result is not None   # phase flag: results exist → show data layout
 
 # ═══════════════════════════════════════════════════════════════════
-# THEME  — ONE consistent light theme (matches .streamlit/config.toml).
-# The "command-center" feel comes from the dark terminal PANEL, not from
-# flipping the page background (which made light text invisible).
+# THEME — golden dark "command center" while the agent runs, light
+# SAP-style once results exist. RULE: every override pairs background
+# AND text color, so nothing can dissolve into the page regardless of
+# the base theme in .streamlit/config.toml.
 # ═══════════════════════════════════════════════════════════════════
-BG, FG, MUT, CARD, BORDER, PRIMARY = "#f4f6f9", "#1a1f29", "#5b6472", "#ffffff", "#e3e8ef", "#0a6ed1"
+if LIGHT:
+    BG, FG, MUT, CARD, BORDER, PRIMARY = "#f4f6f9", "#1a1f29", "#5b6472", "#ffffff", "#e3e8ef", "#0a6ed1"
+else:
+    BG, FG, MUT, CARD, BORDER, PRIMARY = "#0a0a0f", "#e8e4db", "#9a96a8", "#12121a", "#26262f", "#e8a020"
+
+# Phase-specific widget overrides. Streamlit's base theme is LIGHT (dark text),
+# so in the dark phase every text element must be explicitly forced light —
+# and every forced-light element sits on an explicitly dark surface.
+if LIGHT:
+    PHASE_CSS = f"""
+[data-testid="stWidgetLabel"] p {{ color:{FG}; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+[data-testid="stCaptionContainer"] span {{ color:{MUT} !important; }}
+.stTabs [data-baseweb="tab"] p {{ color:{MUT} !important; }}
+.stTabs [aria-selected="true"] p {{ color:{PRIMARY} !important; }}
+.stTabs [data-baseweb="tab-highlight"] {{ background:{PRIMARY} !important; }}
+.stNumberInput input, .stTextInput input {{ background:#ffffff; color:{FG}; }}
+[data-testid="stSidebar"] {{ background:#ffffff; color:{FG}; }}
+"""
+else:
+    PHASE_CSS = f"""
+[data-testid="stMain"] p, [data-testid="stMain"] span, [data-testid="stMain"] label,
+[data-testid="stMain"] li, [data-testid="stMain"] [data-testid="stMarkdownContainer"] {{ color:{FG}; }}
+[data-testid="stMain"] [data-testid="stCaptionContainer"],
+[data-testid="stMain"] [data-testid="stCaptionContainer"] p,
+[data-testid="stMain"] small {{ color:{MUT} !important; }}
+[data-testid="stFileUploaderDropzone"] {{
+    background:{CARD} !important; border:1px dashed rgba(232,160,32,0.45) !important; }}
+[data-testid="stFileUploaderDropzone"] span, [data-testid="stFileUploaderDropzone"] small,
+[data-testid="stFileUploaderDropzone"] div,
+[data-testid="stFileUploaderDropzoneInstructions"] * {{ color:{FG} !important; }}
+[data-testid="stFileUploaderDropzone"] svg {{ fill:{MUT} !important; }}
+[data-testid="stFileUploaderDropzone"] button {{
+    background:{PRIMARY} !important; color:#0a0a0f !important; border:none !important; }}
+[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] * {{ color:{FG} !important; }}
+[data-testid="stSidebar"] {{ background:#0e0e14; border-right:1px solid {BORDER}; }}
+[data-testid="stSidebar"] * {{ color:{FG}; }}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{ color:{MUT} !important; }}
+[data-testid="stAlert"] * {{ color:#1a1f29; }}
+"""
 
 st.markdown(f"""
 <style>
@@ -70,7 +111,7 @@ st.markdown(f"""
 #MainMenu, footer, header {{ visibility:hidden; }}
 [data-testid="collapsedControl"] {{ display:none; }}
 .block-container {{ max-width:1200px; padding-top:2rem; font-family:'Inter',sans-serif; }}
-h1,h2,h3 {{ font-family:'Syne',sans-serif; color:{FG}; }}
+h1,h2,h3,h4 {{ font-family:'Syne',sans-serif; color:{FG}; }}
 
 .stButton > button {{
     background:{PRIMARY} !important; color:{'#fff' if LIGHT else '#0a0a0f'} !important;
@@ -80,15 +121,9 @@ h1,h2,h3 {{ font-family:'Syne',sans-serif; color:{FG}; }}
 .kpi {{ background:{CARD}; border:1px solid {BORDER}; border-radius:10px; padding:14px 16px; }}
 .kpi .v {{ font-family:'Syne',sans-serif; font-size:24px; font-weight:800; color:{PRIMARY}; }}
 .kpi .l {{ font-size:10px; letter-spacing:0.12em; text-transform:uppercase; color:{MUT}; margin-top:2px; }}
-.sa-head {{ background:{PRIMARY}; color:#fff; padding:8px 14px; border-radius:8px 8px 0 0;
-           font-family:'Inter',sans-serif; font-weight:700; font-size:14px; letter-spacing:0.02em; }}
-.sa-body {{ background:{CARD}; border:1px solid {BORDER}; border-top:none; border-radius:0 0 8px 8px;
-           padding:6px 14px 12px 14px; margin-bottom:14px; }}
-.row-c {{ font-size:13px; color:{FG}; }}
-.row-m {{ font-size:12px; color:{MUT}; }}
 [data-testid="stDataFrame"] {{ font-family:'IBM Plex Mono',monospace; font-size:12px; }}
 hr {{ border-color:{BORDER} !important; }}
-.stNumberInput input {{ background:{'#fff' if LIGHT else '#1b2030'}; color:{FG}; }}
+{PHASE_CSS}
 </style>
 """, unsafe_allow_html=True)
 
