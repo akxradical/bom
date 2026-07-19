@@ -73,6 +73,25 @@ def freight_cost(distance_km, per_km_cost, trips=1):
         return 0
 
 
+# Distance-slab freight: freight is a % of package VALUE, where the % itself
+# scales with distance — the middle ground between pure ₹/km (ignores value)
+# and a flat % (ignores distance). Buyer can override the suggested %.
+FREIGHT_SLABS = [(250, 1.0), (750, 2.0), (1500, 3.0), (2500, 4.0)]
+FREIGHT_PCT_MAX = 5.0
+
+
+def freight_pct(distance_km):
+    """Suggested freight % of package value for a given road distance."""
+    try:
+        km = float(distance_km)
+    except Exception:
+        return FREIGHT_SLABS[0][1]
+    for limit, pct in FREIGHT_SLABS:
+        if km < limit:
+            return pct
+    return FREIGHT_PCT_MAX
+
+
 # ───────────────────────────────────────────────────────────────────
 # RATE DATABASE (persists buyer-entered raw-material rates)
 # ───────────────────────────────────────────────────────────────────
