@@ -45,11 +45,11 @@ st.set_page_config(page_title="Agentic BOM", page_icon="◈", layout="wide",
 ss = st.session_state
 ss.setdefault("result", None)
 ss.setdefault("agent_lines", [])
-ss.setdefault("rates", {})        # {component_id: raw ₹/kg}
+ss.setdefault("rates", {})        # {component_id: raw ₹/kg (mfd) or ₹/unit (bought-out)}
+ss.setdefault("pcts", {})         # {component_id: manufacturing % for THAT row}
 ss.setdefault("supplier", "Indian")
-ss.setdefault("mfg_pct", 80)
+ss.setdefault("mfg_pct", 80)      # default % seeded into new rows
 ss.setdefault("overhead", 0)
-ss.setdefault("per_km", 35)
 ss.setdefault("supplier_loc", "")
 ss.setdefault("site_loc", "")
 ss.setdefault("freight", None)    # {km, mode, cost, a:{lat,lon}, b:{lat,lon}}
@@ -72,14 +72,30 @@ else:
 # and every forced-light element sits on an explicitly dark surface.
 if LIGHT:
     PHASE_CSS = f"""
-[data-testid="stWidgetLabel"] p {{ color:{FG}; }}
+/* theme-proof: force paired colors even if config.toml theme is dark */
+[data-testid="stMain"] h1, [data-testid="stMain"] h2, [data-testid="stMain"] h3,
+[data-testid="stMain"] h4, [data-testid="stMain"] h5 {{ color:{FG} !important; }}
+[data-testid="stMain"] p, [data-testid="stMain"] span, [data-testid="stMain"] label,
+[data-testid="stMain"] li, [data-testid="stMain"] [data-testid="stMarkdownContainer"] {{ color:{FG}; }}
+[data-testid="stWidgetLabel"] p {{ color:{FG} !important; }}
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
 [data-testid="stCaptionContainer"] span {{ color:{MUT} !important; }}
 .stTabs [data-baseweb="tab"] p {{ color:{MUT} !important; }}
 .stTabs [aria-selected="true"] p {{ color:{PRIMARY} !important; }}
 .stTabs [data-baseweb="tab-highlight"] {{ background:{PRIMARY} !important; }}
-.stNumberInput input, .stTextInput input {{ background:#ffffff; color:{FG}; }}
+.stNumberInput input, .stTextInput input,
+[data-baseweb="input"], [data-baseweb="input"] input {{
+    background:#ffffff !important; color:{FG} !important; }}
+.stNumberInput button {{ background:#ffffff !important; color:{FG} !important; }}
+[data-baseweb="select"] > div {{ background:#ffffff !important; color:{FG} !important; }}
+[data-testid="stExpander"] summary {{ background:{CARD}; color:{FG} !important; }}
+[data-testid="stExpander"] summary p {{ color:{FG} !important; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-color:{BORDER} !important;
+    background:{CARD}; }}
 [data-testid="stSidebar"] {{ background:#ffffff; color:{FG}; }}
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] span {{ color:{FG}; }}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {{ color:{MUT} !important; }}
 """
 else:
     PHASE_CSS = f"""
@@ -208,7 +224,9 @@ else:
     usage = result.get("usage", {})
     conf_pct = int(round(result.get("confidence", 0) * 100))
 
-    # initialise rate store — prefill from DB history, else standard rate table
+    # initialise rate + mfg-% stores, then SYNC from widget state BEFORE pricing
+    # (widget session values update at rerun start; syncing here keeps every
+    # displayed cost live with the latest keystroke — no one-edit lag)
     for c in bom:
         cid = str(c.get("id"))
         if cid not in ss.rates:
@@ -217,17 +235,30 @@ else:
             if not default:
                 default = float(_rate_for_material(mat)[0] or 0)
             ss.rates[cid] = float(default)
+        if cid not in ss.pcts:
+            ss.pcts[cid] = float(ss.mfg_pct)
+        if f"rate_{cid}" in st.session_state:
+            ss.rates[cid] = float(st.session_state[f"rate_{cid}"] or 0)
+        if f"pct_{cid}" in st.session_state:
+            ss.pcts[cid] = float(st.session_state[f"pct_{cid}"] or 0)
 
     # ── controls
-    cc1, cc2 = st.columns([1, 1.4])
+    cc1, cc2, cc3 = st.columns([1, 1.2, 0.9])
     ss.supplier = cc1.radio("Supplier", list(SUPPLIER_FACTORS.keys()),
                             index=list(SUPPLIER_FACTORS).index(ss.supplier), horizontal=True)
-    ss.mfg_pct = cc2.slider("Manufacturing cost (% of raw material)", 0, 200, ss.mfg_pct, 5,
-                            help="Machining/casting/fabrication added on top of raw material. "
-                                 "Not applied to bought-out items.")
+    ss.mfg_pct = cc2.slider("Default manufacturing % (labour + machining)", 0, 200,
+                            ss.mfg_pct, 5,
+                            help="Starting % for new rows. Each row has its own % "
+                                 "you can edit. Not applied to bought-out items.")
+    cc3.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
+    if cc3.button("Apply % to all rows"):
+        for c in bom:
+            cid = str(c.get("id"))
+            ss.pcts[cid] = float(ss.mfg_pct)
+            st.session_state[f"pct_{cid}"] = float(ss.mfg_pct)
 
     # ── price with current inputs
-    priced, sc = price_manual([dict(c) for c in bom], ss.rates,
+    priced, sc = price_manual([dict(c) for c in bom], ss.rates, pct_map=ss.pcts,
                               mfg_pct=ss.mfg_pct, supplier=ss.supplier)
     ss.result["bom"] = priced
     ss.result["should_cost"] = sc
@@ -252,15 +283,16 @@ else:
 
     # ── COSTING: SAP-style form, grouped by sub-assembly ──────────
     with tab_cost:
-        st.markdown(f"**Manufactured** parts → enter **raw-material ₹/kg** "
-                    f"(manufacturing = {ss.mfg_pct}% of raw material). "
-                    f"**Bought-out** parts → enter the **purchase price ₹/unit**. "
+        st.markdown(f"**Manufactured**: enter **raw-material ₹/kg** and the row's "
+                    f"**Mfg %** → Raw = kg × rate; Mfg (labour+machining) = % × Raw; "
+                    f"Cost = Raw + Mfg. **Bought-out** 🛒: enter **purchase ₹/unit**. "
                     f"Supplier **{ss.supplier}** (×{SUPPLIER_FACTORS[ss.supplier]}). "
                     f"Cost is ₹0 until you enter a value.")
         by_sub = {}
         for c in priced:
             by_sub.setdefault((c.get("sub_assembly_id"), c.get("sub_assembly_name")), []).append(c)
 
+        COLW = [2.1, 1.15, 0.55, 0.45, 1.1, 0.75, 1.0, 1.0, 1.1]
         for s in schema:
             items = by_sub.get((s["id"], s["name"]), [])
             if not items:
@@ -268,14 +300,20 @@ else:
             sub_total = sum(int(x.get("total_cost_inr", 0)) for x in items)
             with st.container(border=True):
                 st.markdown(f"#### {s['id']}. {s['name']}  ·  ₹{sub_total:,}")
-                h = st.columns([2.6, 1.6, 0.7, 0.6, 1.5, 1.3])
-                for col, t in zip(h, ["Component", "Material", "Unit kg", "Qty",
-                                      "Rate ₹/kg  •  Price ₹/unit", "Cost ₹"]):
+                h = st.columns(COLW)
+                for col, t in zip(h, ["Component", "Material", "kg", "Qty",
+                                      "Rate ₹/kg • ₹/unit", "Mfg %",
+                                      "Raw ₹", "Mfg ₹", "Cost ₹"]):
                     col.caption(t)
                 for c in items:
                     cid = str(c.get("id"))
                     bo = str(c.get("component_type", c.get("type", ""))).lower() == "bought_out"
-                    r = st.columns([2.6, 1.6, 0.7, 0.6, 1.5, 1.3])
+                    # seed widget state once, then instantiate without value=
+                    if f"rate_{cid}" not in st.session_state:
+                        st.session_state[f"rate_{cid}"] = float(ss.rates.get(cid, 0) or 0)
+                    if not bo and f"pct_{cid}" not in st.session_state:
+                        st.session_state[f"pct_{cid}"] = float(ss.pcts.get(cid, ss.mfg_pct))
+                    r = st.columns(COLW)
                     r[0].markdown(f"**{html.escape(str(c.get('description','')))}**"
                                   + ("  🛒" if bo else ""))
                     r[1].caption(html.escape(str(c.get("material", "") or "—")))
@@ -284,9 +322,16 @@ else:
                     ss.rates[cid] = r[4].number_input(
                         ("purchase ₹/unit" if bo else "raw ₹/kg"),
                         min_value=0.0, step=(1000.0 if bo else 10.0),
-                        value=float(ss.rates.get(cid, 0) or 0),
                         key=f"rate_{cid}", label_visibility="collapsed")
-                    r[5].markdown(f"**₹{int(c.get('total_cost_inr',0)):,}**")
+                    if bo:
+                        r[5].markdown("—")
+                    else:
+                        ss.pcts[cid] = r[5].number_input(
+                            "mfg %", min_value=0.0, max_value=500.0, step=5.0,
+                            key=f"pct_{cid}", label_visibility="collapsed")
+                    r[6].markdown(f"₹{int(c.get('raw_material_inr', 0)):,}")
+                    r[7].markdown("—" if bo else f"₹{int(c.get('machining_inr', 0)):,}")
+                    r[8].markdown(f"**₹{int(c.get('total_cost_inr', 0)):,}**")
 
         # save entered rates to the persistent database
         if st.button("💾 Save rates to database"):
@@ -300,17 +345,16 @@ else:
 
         comp_ex = int(sc.get("total_ex_gst", 0))
 
-        # ── FREIGHT ────────────────────────────────────────────────
+        # ── FREIGHT — distance-slab % of package value ─────────────
         st.markdown("### 🚚 Freight")
+        st.caption("Freight = % of package value; the % is suggested from the "
+                   "supplier→site road distance and can be overridden.")
         fc1, fc2 = st.columns(2)
         ss.supplier_loc = fc1.text_input("Supplier location", ss.supplier_loc,
                                          placeholder="e.g. KSB Pimpri, Pune")
         ss.site_loc = fc2.text_input("Delivery / site location", ss.site_loc,
                                      placeholder="e.g. Hindustan Zinc, Udaipur")
-        fc3, fc4 = st.columns([1, 1])
-        ss.per_km = fc3.number_input("Freight rate (₹ per km)", min_value=0, step=5,
-                                     value=int(ss.per_km))
-        if fc4.button("📍 Calculate distance"):
+        if st.button("📍 Calculate distance"):
             a = _geo(ss.supplier_loc); b = _geo(ss.site_loc)
             if not a or not b:
                 st.error("Could not locate one of the addresses. Be more specific (add city/state).")
@@ -318,14 +362,24 @@ else:
             else:
                 km, mode = _road(a["lat"], a["lon"], b["lat"], b["lon"])
                 ss.freight = {"km": km, "mode": mode, "a": a, "b": b}
+                # distance changed → refresh the suggested slab %
+                st.session_state["fr_pct_w"] = float(geo_cost.freight_pct(km))
 
         freight_cost = 0
+        fr_pct = 0.0
         if ss.freight:
             km = ss.freight["km"]
-            freight_cost = geo_cost.freight_cost(km, ss.per_km)
+            if "fr_pct_w" not in st.session_state:
+                st.session_state["fr_pct_w"] = float(geo_cost.freight_pct(km))
+            fp1, fp2 = st.columns([1, 2.2])
+            fr_pct = fp1.number_input("Freight % of package value",
+                                      min_value=0.0, max_value=25.0, step=0.5,
+                                      key="fr_pct_w")
+            freight_cost = int(comp_ex * fr_pct / 100.0)
             badge = "road" if ss.freight["mode"] == "road" else "estimated (×1.3)"
-            st.markdown(f"**Distance: {km:,} km** ({badge}) &nbsp;·&nbsp; "
-                        f"**Freight = {km:,} × ₹{ss.per_km} = ₹{freight_cost:,}**")
+            fp2.markdown(f"**Distance: {km:,} km** ({badge}) → suggested "
+                         f"**{geo_cost.freight_pct(km)}%**  ·  "
+                         f"**Freight = ₹{comp_ex:,} × {fr_pct}% = ₹{freight_cost:,}**")
             a, b = ss.freight["a"], ss.freight["b"]
             mid = [(a["lat"] + b["lat"]) / 2, (a["lon"] + b["lon"]) / 2]
             pts = [{"name": "Supplier", "lat": a["lat"], "lon": a["lon"]},
@@ -343,10 +397,6 @@ else:
                               get_radius=18000, get_fill_color=[232, 160, 32], pickable=True),
                 ],
                 tooltip={"text": "{name}"}))
-            fuel = geo_cost.get_fuel_prices()
-            st.caption(f"Fuel reference (editable defaults): diesel ₹{fuel['diesel']}/L · "
-                       f"petrol ₹{fuel['petrol']}/L. A guaranteed-free live India fuel feed "
-                       "isn't available — set DIESEL_PRICE in secrets to override.")
 
         # ── OVERHEAD (optional) ────────────────────────────────────
         st.markdown("### 🧾 Overhead (optional)")
@@ -375,13 +425,13 @@ else:
         ss.result["grand_total"] = {"components_ex_gst": comp_ex, "freight": int(freight_cost),
                                     "overhead": int(ss.overhead), "total_ex_gst": grand_ex,
                                     "gst": gst, "total_incl_gst": grand_incl,
-                                    "freight_detail": ss.freight, "per_km": ss.per_km}
+                                    "freight_detail": ss.freight, "freight_pct": fr_pct}
 
         # ── reference panels ───────────────────────────────────────
         with st.expander("📚 Rate database (saved buyer rates)"):
             rows = geo_cost.rate_db_table()
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
                 st.caption("Defaults for new BOMs are auto-suggested from this history. "
                            "Note: resets on app redeploy unless RATE_DB_PATH is a persistent volume.")
             else:
@@ -393,7 +443,7 @@ else:
         opts = ["All"] + [f"{s['id']}. {s['name']}" for s in schema]
         pick = st.selectbox("Filter sub-assembly", opts)
         view = df if pick == "All" else df[df["Sub_Assembly"] == pick]
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.dataframe(view, width='stretch', hide_index=True)
 
     # ── Agent log ─────────────────────────────────────────────────
     with tab_log:
