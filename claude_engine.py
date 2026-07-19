@@ -1211,7 +1211,7 @@ def _apply_price(c, raw_c, mach, total, ctype, conf, source, notes):
 
 # ═══════════════════════════════════════════════════════════════════
 # MANUAL / USER-DRIVEN PRICING (no LLM, no web search)
-# Buyer enters raw-material ₹/kg per component; labour via slider;
+# Buyer enters raw-material ₹/kg + a per-row manufacturing %;
 # supplier (Indian/International) scales the cost. Deterministic.
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1228,28 +1228,32 @@ def _gross_factor(c):
     return 1.10
 
 
-def price_manual(bom, rate_map, mfg_pct=80.0, supplier="Indian", gst=0.18):
+def price_manual(bom, rate_map, pct_map=None, mfg_pct=80.0, supplier="Indian", gst=0.18):
     """Deterministic costing from buyer inputs (% method).
 
     rate_map: {component_id: value}
         • manufactured part → value = raw-material ₹/kg
         • bought-out part   → value = purchase price ₹/unit
-    mfg_pct: manufacturing cost as a % of raw material (manufactured parts only)
+    pct_map:  {component_id: manufacturing % for THAT component} — per-row,
+              buyer-editable. mfg_pct is the default when a row has no entry.
     supplier: 'Indian' or 'International' (SUPPLIER_FACTORS multiplier)
 
-    Manufactured:  raw = (weight × qty) × ₹/kg ;  mfg = raw × mfg_pct ;
+    Manufactured:  raw = (weight × qty) × ₹/kg
+                   mfg = raw × row_pct   (labour + machining)
                    cost = (raw + mfg) × supplier_factor
     Bought-out:    cost = price × qty × supplier_factor   (NO manufacturing)
     Nothing is charged when the buyer's value is 0.
     Returns (bom, should_cost_summary).
     """
     factor = SUPPLIER_FACTORS.get(supplier, 1.0)
-    pct = _num(mfg_pct) / 100.0
+    pct_map = pct_map or {}
     for c in bom:
         net = _num(c.get("weight_kg"))
         qty = max(_num(c.get("qty")) or 1, 1)
         total_kg = round(net * qty, 3)
-        v = _num(rate_map.get(str(c.get("id")), rate_map.get(c.get("id"), 0)))
+        cid = str(c.get("id"))
+        v = _num(rate_map.get(cid, rate_map.get(c.get("id"), 0)))
+        row_pct = _num(pct_map.get(cid, pct_map.get(c.get("id"), mfg_pct)))
         ctype = str(c.get("type", c.get("component_type", ""))).lower()
 
         if ctype == "bought_out":
@@ -1257,16 +1261,18 @@ def price_manual(bom, rate_map, mfg_pct=80.0, supplier="Indian", gst=0.18):
             raw = int(purchase * factor)
             mfg = 0
             total = int(purchase * factor)
+            row_pct = 0
             src = f"{supplier} | bought-out ₹{int(v):,}/unit × {int(qty)}"
         else:
             raw_material = total_kg * v              # v = ₹/kg
-            manufacturing = raw_material * pct
+            manufacturing = raw_material * row_pct / 100.0
             raw = int(raw_material * factor)
             mfg = int(manufacturing * factor)
             total = int((raw_material + manufacturing) * factor)
-            src = f"{supplier} | {total_kg}kg × ₹{int(v)}/kg + {int(mfg_pct)}% mfg"
+            src = f"{supplier} | {total_kg}kg × ₹{int(v)}/kg + {int(row_pct)}% mfg"
 
         c.update({
+            "mfg_pct": int(row_pct),
             "total_kg": total_kg,
             "raw_material_rate": int(v),
             "raw_material_inr": raw,
