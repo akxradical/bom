@@ -171,16 +171,44 @@ with st.sidebar:
             ss.result = None; ss.agent_lines = []; ss.rates = {}; st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════
-# HEADER
+# HEADER  — ignition animation plays on first render of each session
+# (i.e. every page load / refresh), then the diamond sits still on
+# subsequent reruns so button clicks don't retrigger the glow.
 # ═══════════════════════════════════════════════════════════════════
+_first_load = "_logo_played" not in ss
+ss["_logo_played"] = True
+ig_class = "bom-ig" if _first_load else "bom-still"
+tt_class = "bom-tt" if _first_load else ""
 st.markdown(f"""
-<div style="padding:6px 0 18px 0;">
-  <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.3em;
-              color:{PRIMARY};text-transform:uppercase;">Zetwerk · Central Procurement · Category 2</div>
-  <div style="font-family:'Syne',sans-serif;font-size:46px;font-weight:800;line-height:1;color:{FG};">
-    AGENTIC&nbsp;BOM</div>
-  <div style="font-size:14px;color:{MUT};margin-top:8px;">
-    Drop any engineered-product datasheet → complete BOM → buyer-driven should-cost.</div>
+<style>
+@keyframes bom-ignite {{
+  0%   {{ opacity:0; transform:scale(.45) rotate(-8deg);
+         text-shadow:0 0 0 rgba(232,160,32,0); }}
+  55%  {{ opacity:1; transform:scale(1.08) rotate(0);
+         text-shadow:0 0 30px rgba(232,160,32,.9),0 0 80px rgba(232,160,32,.55); }}
+  100% {{ opacity:1; transform:scale(1) rotate(0);
+         text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
+}}
+@keyframes bom-title {{
+  from {{ opacity:0; transform:translateY(10px); }}
+  to   {{ opacity:1; transform:none; }}
+}}
+.bom-ig {{ animation:bom-ignite 1.8s cubic-bezier(.16,1,.3,1) both; }}
+.bom-tt {{ animation:bom-title  1.2s ease .6s both; }}
+.bom-still {{ opacity:1;
+  text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
+</style>
+<div style="padding:6px 0 18px 0;display:flex;align-items:center;gap:22px;">
+  <div class="{ig_class}" style="font-family:'Syne',sans-serif;font-size:64px;line-height:1;color:#e8a020;
+              flex-shrink:0;">◈</div>
+  <div class="{tt_class}">
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.3em;
+                color:{PRIMARY};text-transform:uppercase;">Zetwerk · Central Procurement · Category 2</div>
+    <div style="font-family:'Syne',sans-serif;font-size:46px;font-weight:800;line-height:1;color:{FG};">
+      AGENTIC&nbsp;BOM</div>
+    <div style="font-size:14px;color:{MUT};margin-top:8px;">
+      Drop any engineered-product datasheet → complete BOM → buyer-driven should-cost.</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
