@@ -177,31 +177,51 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════
 _first_load = "_logo_played" not in ss
 ss["_logo_played"] = True
-ig_class = "bom-ig" if _first_load else "bom-still"
-tt_class = "bom-tt" if _first_load else ""
-st.markdown(f"""
+_ignite_cls = "bom-ig" if _first_load else "bom-still"
+_title_cls  = "bom-tt" if _first_load else ""
+
+# keyframes are injected once — the classes are swapped per state
+st.markdown("""
 <style>
-@keyframes bom-ignite {{
-  0%   {{ opacity:0; transform:scale(.45) rotate(-8deg);
-         text-shadow:0 0 0 rgba(232,160,32,0); }}
-  55%  {{ opacity:1; transform:scale(1.08) rotate(0);
-         text-shadow:0 0 30px rgba(232,160,32,.9),0 0 80px rgba(232,160,32,.55); }}
-  100% {{ opacity:1; transform:scale(1) rotate(0);
-         text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
-}}
-@keyframes bom-title {{
-  from {{ opacity:0; transform:translateY(10px); }}
-  to   {{ opacity:1; transform:none; }}
-}}
-.bom-ig {{ animation:bom-ignite 1.8s cubic-bezier(.16,1,.3,1) both; }}
-.bom-tt {{ animation:bom-title  1.2s ease .6s both; }}
-.bom-still {{ opacity:1;
-  text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
+@keyframes bom-ignite {
+  0%   { opacity:0; transform:scale(.45) rotate(-8deg);
+         text-shadow:0 0 0 rgba(232,160,32,0); }
+  55%  { opacity:1; transform:scale(1.08) rotate(0);
+         text-shadow:0 0 30px rgba(232,160,32,.9),0 0 80px rgba(232,160,32,.55); }
+  100% { opacity:1; transform:scale(1) rotate(0);
+         text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }
+}
+@keyframes bom-title {
+  from { opacity:0; transform:translateY(10px); }
+  to   { opacity:1; transform:none; }
+}
+@keyframes bom-breathe {
+  0%,100% { text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28);
+            transform:scale(1); }
+  50%     { text-shadow:0 0 32px rgba(232,160,32,.95),0 0 88px rgba(232,160,32,.55),
+                        0 0 140px rgba(232,160,32,.30);
+            transform:scale(1.06); }
+}
+.bom-ig    { animation:bom-ignite 1.8s cubic-bezier(.16,1,.3,1) both; }
+.bom-tt    { animation:bom-title  1.2s ease .6s both; }
+.bom-still { opacity:1;
+  text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }
+/* sustained golden breathing while the agent is running,
+   just like the ignition-and-embers glow in the launch film */
+.bom-pulse { opacity:1;
+  animation:bom-breathe 2.2s ease-in-out infinite; }
 </style>
+""", unsafe_allow_html=True)
+
+_hdr_ph = st.empty()
+
+def _render_header(pulse: bool = False):
+    diamond_cls = "bom-pulse" if pulse else _ignite_cls
+    _hdr_ph.markdown(f"""
 <div style="padding:6px 0 18px 0;display:flex;align-items:center;gap:22px;">
-  <div class="{ig_class}" style="font-family:'Syne',sans-serif;font-size:64px;line-height:1;color:#e8a020;
-              flex-shrink:0;">◈</div>
-  <div class="{tt_class}">
+  <div class="{diamond_cls}" style="font-family:'Syne',sans-serif;font-size:64px;line-height:1;
+              color:#e8a020;flex-shrink:0;">◈</div>
+  <div class="{_title_cls}">
     <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.3em;
                 color:{PRIMARY};text-transform:uppercase;">Zetwerk · Central Procurement · Category 2</div>
     <div style="font-family:'Syne',sans-serif;font-size:46px;font-weight:800;line-height:1;color:{FG};">
@@ -211,6 +231,8 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+_render_header(pulse=False)
 
 # ═══════════════════════════════════════════════════════════════════
 # RUN PHASE  (only show uploader/terminal until a result exists)
@@ -231,6 +253,7 @@ if not LIGHT:
     if run and uploaded:
         ss.agent_lines = ["[00:00] ◈ AGENT      Starting..."]
         term.markdown(terminal(ss.agent_lines), unsafe_allow_html=True)
+        _render_header(pulse=True)   # ◈ breathes while the agent works
         pdf_text, err = extract_pdf_text(uploaded.read())
         if err or len(pdf_text.strip()) < 100:
             st.error(f"Could not read PDF. {err or 'Try a text-based PDF.'}"); st.stop()
