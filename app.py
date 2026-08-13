@@ -9,9 +9,17 @@ Two phases:
                  rates, sets labour, and picks supplier — proper cards, not a grid.
 
 Backend: claude_engine.run_agent(price=False) + price_manual()
+History:  every generated BOM is saved to bom_history.db (SQLite) and can be
+          reloaded from the sidebar.
 """
 
+import os
 import html
+import hashlib
+import json as _json
+import sqlite3 as _sql
+from datetime import datetime as _dt
+from pathlib import Path as _Path
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -19,12 +27,100 @@ import pydeck as pdk
 from claude_engine import (
     extract_pdf_text, run_agent, bom_to_dataframe, export_excel, _get_key,
     price_manual, SUPPLIER_FACTORS,
+    supplier_should_cost, SUPPLIER_BOOK_DEFAULTS,
 )
 import geo_cost
 try:
     from pricing import _rate_for_material
 except Exception:
     def _rate_for_material(m): return (0, "")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BOM HISTORY  — SQLite, one file on disk (bom_history.db next to app.py)
+# Every generated BOM is saved here so it can be reloaded later from the
+# sidebar. On Streamlit Cloud the container filesystem resets on redeploy;
+# set env var BOM_HISTORY_DB to a persistent volume path to keep history.
+# ═══════════════════════════════════════════════════════════════════
+_HIST_DB = _Path(os.environ.get("BOM_HISTORY_DB",
+                                _Path(__file__).parent / "bom_history.db"))
+
+
+def _hist_conn():
+    c = _sql.connect(_HIST_DB, check_same_thread=False)
+    c.execute("""CREATE TABLE IF NOT EXISTS bom_runs(
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts            TEXT NOT NULL,
+        product       TEXT,
+        source_pdf    TEXT,
+        n_components  INTEGER,
+        content_hash  TEXT,
+        payload       TEXT NOT NULL)""")
+    # migrate older DBs that predate the content_hash column
+    try:
+        c.execute("ALTER TABLE bom_runs ADD COLUMN content_hash TEXT")
+    except Exception:
+        pass
+    return c
+
+
+def datasheet_hash(pdf_text: str) -> str:
+    """Stable fingerprint of a datasheet's content (whitespace-normalised),
+    so the same datasheet always maps to the same key even if re-saved."""
+    norm = " ".join((pdf_text or "").split())
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def history_find_by_hash(content_hash: str):
+    """Return the id of the most recent BOM generated for this exact datasheet,
+    or None if we've never costed it before."""
+    if not content_hash:
+        return None
+    try:
+        with _hist_conn() as c:
+            row = c.execute("SELECT id FROM bom_runs WHERE content_hash=? "
+                            "ORDER BY id DESC LIMIT 1", (content_hash,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def history_save(result: dict, source_pdf: str = "", content_hash: str = ""):
+    """Persist a completed BOM run (the dict returned by run_agent)."""
+    if not result:
+        return
+    bom = result.get("bom") or []
+    product = str(result.get("equipment_type") or "Unnamed")
+    try:
+        with _hist_conn() as c:
+            c.execute("INSERT INTO bom_runs(ts,product,source_pdf,n_components,content_hash,payload) "
+                      "VALUES(?,?,?,?,?,?)",
+                      (_dt.utcnow().isoformat(timespec="seconds"),
+                       product, source_pdf, len(bom), content_hash,
+                       _json.dumps(result, default=str)))
+    except Exception as e:
+        st.warning(f"Could not save to history: {e}")
+
+
+def history_list(limit: int = 50):
+    try:
+        with _hist_conn() as c:
+            return c.execute(
+                "SELECT id, ts, product, source_pdf, n_components "
+                "FROM bom_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    except Exception:
+        return []
+
+
+def history_load(row_id: int):
+    with _hist_conn() as c:
+        row = c.execute("SELECT payload FROM bom_runs WHERE id=?", (row_id,)).fetchone()
+    return _json.loads(row[0]) if row else None
+
+
+def history_delete(row_id: int):
+    with _hist_conn() as c:
+        c.execute("DELETE FROM bom_runs WHERE id=?", (row_id,))
 
 
 @st.cache_data(show_spinner=False)
@@ -48,11 +144,18 @@ ss.setdefault("agent_lines", [])
 ss.setdefault("rates", {})        # {component_id: raw ₹/kg (mfd) or ₹/unit (bought-out)}
 ss.setdefault("pcts", {})         # {component_id: manufacturing % for THAT row}
 ss.setdefault("supplier", "Indian")
-ss.setdefault("mfg_pct", 80)      # default % seeded into new rows
+ss.setdefault("mfg_pct", 80)      # default COGS % (conversion+consumables) seeded into new rows
 ss.setdefault("overhead", 0)
 ss.setdefault("supplier_loc", "")
 ss.setdefault("site_loc", "")
 ss.setdefault("freight", None)    # {km, mode, cost, a:{lat,lon}, b:{lat,lon}}
+# supplier-book (margin stack on top of COGS) — benchmark defaults, buyer-editable
+ss.setdefault("sga_pct", SUPPLIER_BOOK_DEFAULTS["sga_pct"])
+ss.setdefault("depr_pct", SUPPLIER_BOOK_DEFAULTS["depr_pct"])
+ss.setdefault("amort_inr", SUPPLIER_BOOK_DEFAULTS["amort_inr"])
+ss.setdefault("ebitda_pct", SUPPLIER_BOOK_DEFAULTS["ebitda_pct"])
+ss.setdefault("package_cbm", 0.0)     # total shipment volume (m³) for freight
+ss.setdefault("freight_rate", 3.5)    # ₹ per chargeable-tonne per km
 
 LIGHT = ss.result is not None   # phase flag: results exist → show data layout
 
@@ -165,10 +268,33 @@ with st.sidebar:
         st.caption(f"{'🟢' if _get_key(k) else '⚪'} {nm}")
     model = _get_key("CLAUDE_MODEL") or "auto"
     st.caption(f"Model: `{model}`")
+
     if ss.result:
         st.divider()
         if st.button("↺ New BOM"):
-            ss.result = None; ss.agent_lines = []; ss.rates = {}; st.rerun()
+            ss.result = None; ss.agent_lines = []; ss.rates = {}; ss.pcts = {}; st.rerun()
+
+    # ── History: every generated BOM, click to reload ───────────────
+    st.divider()
+    st.markdown("**History**")
+    _hist_rows = history_list(limit=50)
+    st.caption(f"{len(_hist_rows)} saved" if _hist_rows else "No saved BOMs yet")
+    for _rid, _ts, _prod, _pdf, _n in _hist_rows:
+        try:
+            _when = _dt.fromisoformat(_ts).strftime("%d %b · %H:%M")
+        except Exception:
+            _when = str(_ts)
+        _label = f"{str(_prod)[:24]}  ·  {_n} parts\n{_when}"
+        _hc1, _hc2 = st.columns([5, 1])
+        if _hc1.button(_label, key=f"hist_load_{_rid}", use_container_width=True):
+            _r = history_load(_rid)
+            if _r:
+                ss.result = _r
+                ss.rates = {}; ss.pcts = {}; ss.agent_lines = []
+                st.rerun()
+        if _hc2.button("×", key=f"hist_del_{_rid}", help="Delete this saved BOM"):
+            history_delete(_rid)
+            st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════
 # HEADER  — ignition animation plays on first render of each session
@@ -177,51 +303,31 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════
 _first_load = "_logo_played" not in ss
 ss["_logo_played"] = True
-_ignite_cls = "bom-ig" if _first_load else "bom-still"
-_title_cls  = "bom-tt" if _first_load else ""
-
-# keyframes are injected once — the classes are swapped per state
-st.markdown("""
+ig_class = "bom-ig" if _first_load else "bom-still"
+tt_class = "bom-tt" if _first_load else ""
+st.markdown(f"""
 <style>
-@keyframes bom-ignite {
-  0%   { opacity:0; transform:scale(.45) rotate(-8deg);
-         text-shadow:0 0 0 rgba(232,160,32,0); }
-  55%  { opacity:1; transform:scale(1.08) rotate(0);
-         text-shadow:0 0 30px rgba(232,160,32,.9),0 0 80px rgba(232,160,32,.55); }
-  100% { opacity:1; transform:scale(1) rotate(0);
-         text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }
-}
-@keyframes bom-title {
-  from { opacity:0; transform:translateY(10px); }
-  to   { opacity:1; transform:none; }
-}
-@keyframes bom-breathe {
-  0%,100% { text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28);
-            transform:scale(1); }
-  50%     { text-shadow:0 0 32px rgba(232,160,32,.95),0 0 88px rgba(232,160,32,.55),
-                        0 0 140px rgba(232,160,32,.30);
-            transform:scale(1.06); }
-}
-.bom-ig    { animation:bom-ignite 1.8s cubic-bezier(.16,1,.3,1) both; }
-.bom-tt    { animation:bom-title  1.2s ease .6s both; }
-.bom-still { opacity:1;
-  text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }
-/* sustained golden breathing while the agent is running,
-   just like the ignition-and-embers glow in the launch film */
-.bom-pulse { opacity:1;
-  animation:bom-breathe 2.2s ease-in-out infinite; }
+@keyframes bom-ignite {{
+  0%   {{ opacity:0; transform:scale(.45) rotate(-8deg);
+         text-shadow:0 0 0 rgba(232,160,32,0); }}
+  55%  {{ opacity:1; transform:scale(1.08) rotate(0);
+         text-shadow:0 0 30px rgba(232,160,32,.9),0 0 80px rgba(232,160,32,.55); }}
+  100% {{ opacity:1; transform:scale(1) rotate(0);
+         text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
+}}
+@keyframes bom-title {{
+  from {{ opacity:0; transform:translateY(10px); }}
+  to   {{ opacity:1; transform:none; }}
+}}
+.bom-ig {{ animation:bom-ignite 1.8s cubic-bezier(.16,1,.3,1) both; }}
+.bom-tt {{ animation:bom-title  1.2s ease .6s both; }}
+.bom-still {{ opacity:1;
+  text-shadow:0 0 14px rgba(232,160,32,.55),0 0 42px rgba(232,160,32,.28); }}
 </style>
-""", unsafe_allow_html=True)
-
-_hdr_ph = st.empty()
-
-def _render_header(pulse: bool = False):
-    diamond_cls = "bom-pulse" if pulse else _ignite_cls
-    _hdr_ph.markdown(f"""
 <div style="padding:6px 0 18px 0;display:flex;align-items:center;gap:22px;">
-  <div class="{diamond_cls}" style="font-family:'Syne',sans-serif;font-size:64px;line-height:1;
-              color:#e8a020;flex-shrink:0;">◈</div>
-  <div class="{_title_cls}">
+  <div class="{ig_class}" style="font-family:'Syne',sans-serif;font-size:64px;line-height:1;color:#e8a020;
+              flex-shrink:0;">◈</div>
+  <div class="{tt_class}">
     <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.3em;
                 color:{PRIMARY};text-transform:uppercase;">Zetwerk · Central Procurement · Category 2</div>
     <div style="font-family:'Syne',sans-serif;font-size:46px;font-weight:800;line-height:1;color:{FG};">
@@ -232,15 +338,19 @@ def _render_header(pulse: bool = False):
 </div>
 """, unsafe_allow_html=True)
 
-_render_header(pulse=False)
-
 # ═══════════════════════════════════════════════════════════════════
 # RUN PHASE  (only show uploader/terminal until a result exists)
 # ═══════════════════════════════════════════════════════════════════
 if not LIGHT:
     uploaded = st.file_uploader("Datasheet PDF", type=["pdf"], label_visibility="collapsed")
     st.caption("PDF datasheets, GA drawings, spec sheets — any engineered product")
-    run = st.button("◈ RUN AGENT", disabled=uploaded is None)
+    rc1, rc2 = st.columns([1, 2])
+    run = rc1.button("◈ RUN AGENT", disabled=uploaded is None)
+    force_fresh = rc2.checkbox(
+        "Re-generate even if this datasheet was costed before",
+        value=False,
+        help="Off (default): the same datasheet always returns the same saved BOM — "
+             "consistent and free. On: run the agent again from scratch.")
 
     term = st.empty()
     if ss.agent_lines:
@@ -251,15 +361,28 @@ if not LIGHT:
         term.markdown(terminal(ss.agent_lines), unsafe_allow_html=True)
 
     if run and uploaded:
-        ss.agent_lines = ["[00:00] ◈ AGENT      Starting..."]
-        term.markdown(terminal(ss.agent_lines), unsafe_allow_html=True)
-        _render_header(pulse=True)   # ◈ breathes while the agent works
         pdf_text, err = extract_pdf_text(uploaded.read())
         if err or len(pdf_text.strip()) < 100:
             st.error(f"Could not read PDF. {err or 'Try a text-based PDF.'}"); st.stop()
+
+        # DETERMINISTIC REUSE: identical datasheet → identical BOM (unless forced)
+        chash = datasheet_hash(pdf_text)
+        cached_id = None if force_fresh else history_find_by_hash(chash)
+        if cached_id:
+            cached = history_load(cached_id)
+            if cached:
+                ss.result = cached
+                ss.rates = {}; ss.pcts = {}; ss.agent_lines = []
+                ss["_reused_from"] = uploaded.name
+                st.rerun()
+
+        ss.agent_lines = ["[00:00] ◈ AGENT      Starting..."]
+        term.markdown(terminal(ss.agent_lines), unsafe_allow_html=True)
         try:
             ss.result = run_agent(pdf_text, progress_callback=on_progress, price=False)
             ss.rates = {}
+            ss.pop("_reused_from", None)
+            history_save(ss.result, source_pdf=uploaded.name, content_hash=chash)
             st.rerun()
         except Exception as e:
             import traceback
@@ -274,6 +397,11 @@ else:
     schema = result.get("schema", [])
     usage = result.get("usage", {})
     conf_pct = int(round(result.get("confidence", 0) * 100))
+
+    if ss.get("_reused_from"):
+        st.info(f"↺ Reused the saved BOM for **{ss['_reused_from']}** — this datasheet "
+                f"was costed before, so you get the same result (no new AI run). "
+                f"Tick **Re-generate** on the upload screen to force a fresh run.")
 
     # initialise rate + mfg-% stores, then SYNC from widget state BEFORE pricing
     # (widget session values update at rerun start; syncing here keeps every
@@ -335,10 +463,12 @@ else:
     # ── COSTING: SAP-style form, grouped by sub-assembly ──────────
     with tab_cost:
         st.markdown(f"**Manufactured**: enter **raw-material ₹/kg** and the row's "
-                    f"**Mfg %** → Raw = kg × rate; Mfg (labour+machining) = % × Raw; "
-                    f"Cost = Raw + Mfg. **Bought-out** 🛒: enter **purchase ₹/unit**. "
+                    f"**COGS %** → Raw = kg × rate; Conversion (labour + machining + "
+                    f"consumables) = COGS % × Raw; **Component COGS = Raw + Conversion**. "
+                    f"**Bought-out** 🛒: enter **purchase ₹/unit**. "
                     f"Supplier **{ss.supplier}** (×{SUPPLIER_FACTORS[ss.supplier]}). "
-                    f"Cost is ₹0 until you enter a value.")
+                    f"COGS is ₹0 until you enter a value. The supplier's margin "
+                    f"(SG&A · depreciation · amortization · EBITDA) is added below.")
         by_sub = {}
         for c in priced:
             by_sub.setdefault((c.get("sub_assembly_id"), c.get("sub_assembly_name")), []).append(c)
@@ -353,8 +483,8 @@ else:
                 st.markdown(f"#### {s['id']}. {s['name']}  ·  ₹{sub_total:,}")
                 h = st.columns(COLW)
                 for col, t in zip(h, ["Component", "Material", "kg", "Qty",
-                                      "Rate ₹/kg • ₹/unit", "Mfg %",
-                                      "Raw ₹", "Mfg ₹", "Cost ₹"]):
+                                      "Rate ₹/kg • ₹/unit", "COGS %",
+                                      "Raw ₹", "Conversion ₹", "COGS ₹"]):
                     col.caption(t)
                 for c in items:
                     cid = str(c.get("id"))
@@ -378,7 +508,7 @@ else:
                         r[5].markdown("—")
                     else:
                         ss.pcts[cid] = r[5].number_input(
-                            "mfg %", min_value=0.0, max_value=500.0, step=5.0,
+                            "cogs %", min_value=0.0, max_value=500.0, step=5.0,
                             key=f"pct_{cid}", label_visibility="collapsed")
                     r[6].markdown(f"₹{int(c.get('raw_material_inr', 0)):,}")
                     r[7].markdown("—" if bo else f"₹{int(c.get('machining_inr', 0)):,}")
@@ -394,17 +524,46 @@ else:
                     n += 1
             st.success(f"Saved {n} raw-material rates to the database.")
 
-        comp_ex = int(sc.get("total_ex_gst", 0))
+        cogs_ex = int(sc.get("total_ex_gst", 0))    # Σ component COGS (raw + conversion)
+        total_wt_kg = sum(float(c.get("total_kg", 0) or 0) for c in priced)
 
-        # ── FREIGHT — distance-slab % of package value ─────────────
-        st.markdown("### 🚚 Freight")
-        st.caption("Freight = % of package value; the % is suggested from the "
-                   "supplier→site road distance and can be overridden.")
+        # ── SUPPLIER'S BOOK — margin stack added on top of COGS ────
+        st.markdown("### 📗 Supplier's book — margin on top of COGS")
+        st.caption("What the supplier adds above COGS to cover its P&L. These are "
+                   "benchmark defaults for Indian fabrication — override with the "
+                   "supplier's real figures (MCA / Tofler filing, annual report) when "
+                   "you have them. All values are estimates until you do.")
+        sb1, sb2, sb3, sb4 = st.columns(4)
+        ss.sga_pct = sb1.number_input("SG&A % of COGS", min_value=0.0, max_value=100.0,
+                                      value=float(ss.sga_pct), step=1.0,
+                                      help="Selling, general & admin + fixed-cost absorption")
+        ss.depr_pct = sb2.number_input("Depreciation % of COGS", min_value=0.0, max_value=100.0,
+                                       value=float(ss.depr_pct), step=0.5,
+                                       help="Plant & machinery depreciation")
+        ss.amort_inr = sb3.number_input("Amortization ₹", min_value=0, step=1000,
+                                        value=int(ss.amort_inr),
+                                        help="Tooling / NRE ÷ order quantity (absolute ₹)")
+        ss.ebitda_pct = sb4.number_input("EBITDA %", min_value=0.0, max_value=100.0,
+                                         value=float(ss.ebitda_pct), step=1.0,
+                                         help="Supplier operating margin — what they keep")
+
+        # ── FREIGHT — chargeable weight × ₹/tonne-km × distance ────
+        st.markdown("### 🚚 Freight — weight × distance")
+        st.caption("Freight = chargeable weight × ₹/tonne·km × road distance. "
+                   "Chargeable weight = max(actual weight, volume × 250 kg/m³).")
         fc1, fc2 = st.columns(2)
         ss.supplier_loc = fc1.text_input("Supplier location", ss.supplier_loc,
                                          placeholder="e.g. KSB Pimpri, Pune")
         ss.site_loc = fc2.text_input("Delivery / site location", ss.site_loc,
                                      placeholder="e.g. Hindustan Zinc, Udaipur")
+        fr1, fr2 = st.columns(2)
+        ss.package_cbm = fr1.number_input("Total package volume (m³ / CBM)", min_value=0.0,
+                                          value=float(ss.package_cbm), step=0.5,
+                                          help="Total crate / shipment volume. Leave 0 to bill "
+                                               "on actual weight only.")
+        ss.freight_rate = fr2.number_input("Freight rate ₹ per tonne-km", min_value=0.0,
+                                           value=float(ss.freight_rate), step=0.5,
+                                           help="Default ₹3.5/tonne·km for Indian road PTL/FTL.")
         if st.button("📍 Calculate distance"):
             a = _geo(ss.supplier_loc); b = _geo(ss.site_loc)
             if not a or not b:
@@ -413,24 +572,22 @@ else:
             else:
                 km, mode = _road(a["lat"], a["lon"], b["lat"], b["lon"])
                 ss.freight = {"km": km, "mode": mode, "a": a, "b": b}
-                # distance changed → refresh the suggested slab %
-                st.session_state["fr_pct_w"] = float(geo_cost.freight_pct(km))
 
         freight_cost = 0
-        fr_pct = 0.0
+        freight_detail = {}
         if ss.freight:
             km = ss.freight["km"]
-            if "fr_pct_w" not in st.session_state:
-                st.session_state["fr_pct_w"] = float(geo_cost.freight_pct(km))
-            fp1, fp2 = st.columns([1, 2.2])
-            fr_pct = fp1.number_input("Freight % of package value",
-                                      min_value=0.0, max_value=25.0, step=0.5,
-                                      key="fr_pct_w")
-            freight_cost = int(comp_ex * fr_pct / 100.0)
+            freight_cost, freight_detail = geo_cost.freight_cost(
+                total_wt_kg, km, volume_cbm=ss.package_cbm,
+                rate_per_tonne_km=ss.freight_rate)
             badge = "road" if ss.freight["mode"] == "road" else "estimated (×1.3)"
-            fp2.markdown(f"**Distance: {km:,} km** ({badge}) → suggested "
-                         f"**{geo_cost.freight_pct(km)}%**  ·  "
-                         f"**Freight = ₹{comp_ex:,} × {fr_pct}% = ₹{freight_cost:,}**")
+            vol_note = (f" · volumetric {freight_detail['volumetric_kg']:,.0f} kg"
+                        if ss.package_cbm else "")
+            st.markdown(
+                f"**Distance {km:,} km** ({badge}) · actual "
+                f"{freight_detail['actual_kg']:,.0f} kg{vol_note} → "
+                f"**chargeable {freight_detail['chargeable_kg']:,.0f} kg**  \n"
+                f"**Freight = {freight_detail['formula']} = ₹{freight_cost:,}**")
             a, b = ss.freight["a"], ss.freight["b"]
             mid = [(a["lat"] + b["lat"]) / 2, (a["lon"] + b["lon"]) / 2]
             pts = [{"name": "Supplier", "lat": a["lat"], "lon": a["lon"]},
@@ -455,28 +612,58 @@ else:
                                       value=int(ss.overhead),
                                       help="Any extra charges — testing, packing, documentation, etc.")
 
-        # ── GRAND TOTAL ────────────────────────────────────────────
-        grand_ex = comp_ex + int(freight_cost) + int(ss.overhead)
-        gst = int(grand_ex * 0.18)
-        grand_incl = grand_ex + gst
-        st.markdown("---")
-        g1, g2, g3, g4, g5 = st.columns(5)
-        g1.markdown(f'<div class="kpi"><div class="v">₹{comp_ex:,}</div>'
-                    f'<div class="l">Components (RM+Mfg)</div></div>', unsafe_allow_html=True)
-        g2.markdown(f'<div class="kpi"><div class="v">₹{int(freight_cost):,}</div>'
-                    f'<div class="l">Freight</div></div>', unsafe_allow_html=True)
-        g3.markdown(f'<div class="kpi"><div class="v">₹{int(ss.overhead):,}</div>'
-                    f'<div class="l">Overhead</div></div>', unsafe_allow_html=True)
-        g4.markdown(f'<div class="kpi"><div class="v">₹{grand_ex:,}</div>'
-                    f'<div class="l">Total ex-GST</div></div>', unsafe_allow_html=True)
-        g5.markdown(f'<div class="kpi"><div class="v">₹{grand_incl:,}</div>'
-                    f'<div class="l">Grand Total (incl 18% GST)</div></div>', unsafe_allow_html=True)
+        # ── SHOULD-COST LADDER  (COGS → supplier margin → landed) ──
+        ladder = supplier_should_cost(
+            cogs_ex, sga_pct=ss.sga_pct, depr_pct=ss.depr_pct,
+            amort_inr=ss.amort_inr, ebitda_pct=ss.ebitda_pct,
+            freight_inr=int(freight_cost), overhead_inr=int(ss.overhead), gst=0.18)
 
-        # store grand total for export
-        ss.result["grand_total"] = {"components_ex_gst": comp_ex, "freight": int(freight_cost),
-                                    "overhead": int(ss.overhead), "total_ex_gst": grand_ex,
-                                    "gst": gst, "total_incl_gst": grand_incl,
-                                    "freight_detail": ss.freight, "freight_pct": fr_pct}
+        st.markdown("---")
+        gcols = st.columns(5)
+        milestones = [
+            (ladder["cogs"], "Total COGS"),
+            (ladder["ex_works_price"], "Ex-Works (should-cost)"),
+            (ladder["freight"], "Freight"),
+            (ladder["gst"], f"GST {ladder['gst_pct']}%"),
+            (ladder["landed_price"], "Landed Price"),
+        ]
+        for col, (v, l) in zip(gcols, milestones):
+            col.markdown(f'<div class="kpi"><div class="v">₹{v:,}</div>'
+                         f'<div class="l">{l}</div></div>', unsafe_allow_html=True)
+
+        ladder_rows = [
+            ("Total COGS  (raw material + conversion)", ladder["cogs"]),
+            (f"+ SG&A  ({ladder['sga_pct']:.0f}% of COGS)", ladder["sga"]),
+            (f"+ Depreciation  ({ladder['depr_pct']:.0f}% of COGS)", ladder["depreciation"]),
+            ("+ Amortization  (tooling / NRE)", ladder["amortization"]),
+            ("= Supplier total cost", ladder["supplier_total_cost"]),
+            (f"+ EBITDA  ({ladder['ebitda_pct']:.0f}% margin)", ladder["ebitda"]),
+            ("= Ex-Works price  (reconstructed should-cost)", ladder["ex_works_price"]),
+            ("+ Freight", ladder["freight"]),
+            ("+ Overhead", ladder["overhead"]),
+            ("= Total ex-GST", ladder["total_ex_gst"]),
+            (f"+ GST  ({ladder['gst_pct']}%)", ladder["gst"]),
+            ("= LANDED PRICE", ladder["landed_price"]),
+        ]
+        with st.expander("🧮 Full should-cost ladder (COGS → supplier margin → landed)", expanded=True):
+            st.dataframe(
+                pd.DataFrame([{"Line item": k, "₹": f"{v:,}"} for k, v in ladder_rows]),
+                width='stretch', hide_index=True)
+            st.caption("Ex-Works price is the reconstructed should-cost — compare it "
+                       "against the supplier's actual quote; the gap is your negotiation room.")
+
+        # store the full ladder for export
+        ss.result["grand_total"] = {
+            "cogs": ladder["cogs"],
+            "supplier_total_cost": ladder["supplier_total_cost"],
+            "ex_works_price": ladder["ex_works_price"],
+            "freight": ladder["freight"], "overhead": ladder["overhead"],
+            "total_ex_gst": ladder["total_ex_gst"], "gst": ladder["gst"],
+            "landed_price": ladder["landed_price"],
+            "book": {"sga_pct": ss.sga_pct, "depr_pct": ss.depr_pct,
+                     "amort_inr": int(ss.amort_inr), "ebitda_pct": ss.ebitda_pct},
+            "freight_detail": freight_detail,
+        }
 
         # ── reference panels ───────────────────────────────────────
         with st.expander("📚 Rate database (saved buyer rates)"):
