@@ -107,7 +107,7 @@ def _oai(url, key, model, prompt, system="", mt=4000):
     msgs.append({"role": "user", "content": prompt})
     d = _http_post(url, {"Content-Type": "application/json",
         "Authorization": f"Bearer {key}"},
-        {"model": model, "messages": msgs, "max_tokens": mt, "temperature": 0.1})
+        {"model": model, "messages": msgs, "max_tokens": mt, "temperature": 0})
     out = d["choices"][0]["message"]["content"].strip()
     u = d.get("usage") or {}
     _track(u.get("prompt_tokens") or _est_tokens(system, prompt),
@@ -143,7 +143,7 @@ def _gemini(p, s="", mt=8000):
     k = _get_key("GEMINI_API_KEY")
     if not k: raise ValueError("no key")
     b = {"contents": [{"parts": [{"text": p}]}],
-         "generationConfig": {"maxOutputTokens": mt, "temperature": 0.1}}
+         "generationConfig": {"maxOutputTokens": mt, "temperature": 0}}
     if s: b["systemInstruction"] = {"parts": [{"text": s}]}
     d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={k}",
                    {"Content-Type": "application/json"}, b)
@@ -158,7 +158,7 @@ def _gemini_grounded(p, s="", mt=4000):
     if not k: raise ValueError("GEMINI_API_KEY not set")
     b = {"contents": [{"parts": [{"text": p}]}],
          "tools": [{"google_search": {}}],
-         "generationConfig": {"maxOutputTokens": mt, "temperature": 0.1}}
+         "generationConfig": {"maxOutputTokens": mt, "temperature": 0}}
     if s: b["systemInstruction"] = {"parts": [{"text": s}]}
     d = _http_post(f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={k}",
                    {"Content-Type": "application/json"}, b, timeout=120)
@@ -193,7 +193,7 @@ def _openrouter(p, s="", mt=4000):
             d = _http_post("https://openrouter.ai/api/v1/chat/completions",
                 {"Content-Type": "application/json", "Authorization": f"Bearer {k}",
                  "HTTP-Referer": "https://pumpbom.streamlit.app"},
-                {"model": m, "messages": msgs, "max_tokens": mt, "temperature": 0.1})
+                {"model": m, "messages": msgs, "max_tokens": mt, "temperature": 0})
             r = d["choices"][0]["message"]["content"].strip()
             if r and len(r) > 10: return r
             last = "empty response"
@@ -297,6 +297,7 @@ def _call_claude(prompt, system="", max_tokens=4000, use_search=False,
     last_err = "no model tried"
     for model in _claude_models():
         kw = {"model": model, "max_tokens": min(max_tokens, 8192),
+              "temperature": 0,   # deterministic: same datasheet → same BOM
               "messages": [{"role": "user", "content": prompt}]}
         if doc:
             blocks = [{"type": "text", "text": _DOC_PREAMBLE + doc,
@@ -1288,6 +1289,64 @@ def price_manual(bom, rate_map, pct_map=None, mfg_pct=80.0, supplier="Indian", g
             "supplier_type": supplier,
         })
     return bom, _build_should_cost(bom)
+
+
+# Benchmark supplier-book defaults (Indian engineering / fabrication).
+# These are INDUSTRY ESTIMATES — override with the supplier's real financials
+# (MCA/Tofler filing, annual report) when you have them.
+SUPPLIER_BOOK_DEFAULTS = {
+    "sga_pct": 10.0,      # selling, general & admin + fixed-cost absorption
+    "depr_pct": 4.0,      # plant & machinery depreciation
+    "amort_inr": 0,       # tooling / NRE ÷ order qty (absolute ₹)
+    "ebitda_pct": 15.0,   # supplier operating margin (what they "keep")
+}
+
+
+def supplier_should_cost(cogs_inr, sga_pct=10.0, depr_pct=4.0, amort_inr=0,
+                         ebitda_pct=15.0, freight_inr=0, overhead_inr=0, gst=0.18):
+    """Reconstruct the supplier's price from total COGS upward (clean-sheet).
+
+        COGS
+          + SG&A%          (of COGS)   selling/admin + fixed cost
+          + Depreciation%  (of COGS)   plant & machinery
+          + Amortization₹              tooling / NRE ÷ order qty
+        = Supplier total cost
+          + EBITDA%        (of total cost)  supplier's operating margin
+        = EX-WORKS PRICE   ← the reconstructed should-cost to compare vs a quote
+          + Freight + Overhead
+        = Total ex-GST
+          + GST%
+        = LANDED PRICE
+
+    All %s are estimates unless fed the supplier's real book. Returns a dict
+    with every rung so the UI/Excel can show the full ladder.
+    """
+    cogs = int(round(cogs_inr or 0))
+    sga = int(round(cogs * (sga_pct or 0) / 100.0))
+    depr = int(round(cogs * (depr_pct or 0) / 100.0))
+    amort = int(round(amort_inr or 0))
+    supplier_cost = cogs + sga + depr + amort
+    ebitda = int(round(supplier_cost * (ebitda_pct or 0) / 100.0))
+    ex_works = supplier_cost + ebitda
+    freight = int(round(freight_inr or 0))
+    overhead = int(round(overhead_inr or 0))
+    total_ex_gst = ex_works + freight + overhead
+    gst_amt = int(round(total_ex_gst * gst))
+    landed = total_ex_gst + gst_amt
+    return {
+        "cogs": cogs,
+        "sga_pct": float(sga_pct or 0), "sga": sga,
+        "depr_pct": float(depr_pct or 0), "depreciation": depr,
+        "amortization": amort,
+        "supplier_total_cost": supplier_cost,
+        "ebitda_pct": float(ebitda_pct or 0), "ebitda": ebitda,
+        "ex_works_price": ex_works,
+        "freight": freight,
+        "overhead": overhead,
+        "total_ex_gst": total_ex_gst,
+        "gst_pct": int(round(gst * 100)), "gst": gst_amt,
+        "landed_price": landed,
+    }
 
 
 def _build_should_cost(bom):
