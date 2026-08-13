@@ -81,7 +81,8 @@ FREIGHT_PCT_MAX = 5.0
 
 
 def freight_pct(distance_km):
-    """Suggested freight % of package value for a given road distance."""
+    """Suggested freight % of package value for a given road distance.
+    (Legacy %-of-value method — kept for reference / fallback.)"""
     try:
         km = float(distance_km)
     except Exception:
@@ -90,6 +91,52 @@ def freight_pct(distance_km):
         if km < limit:
             return pct
     return FREIGHT_PCT_MAX
+
+
+# Road-freight volumetric factor: kg charged per CBM (m³). Indian road
+# convention is ~250–333 kg/m³; 250 is the common conservative value.
+VOLUMETRIC_KG_PER_CBM = 250.0
+FREIGHT_RATE_PER_TONNE_KM = 3.5   # ₹ per chargeable-tonne per km (buyer-overridable)
+
+
+def chargeable_weight_kg(actual_kg, volume_cbm=0.0, vol_factor=VOLUMETRIC_KG_PER_CBM):
+    """Freight is billed on the greater of actual weight and volumetric weight.
+    volumetric_kg = volume(m³) × vol_factor."""
+    try:
+        actual = max(float(actual_kg or 0), 0.0)
+    except Exception:
+        actual = 0.0
+    try:
+        volumetric = max(float(volume_cbm or 0), 0.0) * float(vol_factor)
+    except Exception:
+        volumetric = 0.0
+    return max(actual, volumetric)
+
+
+def freight_cost(actual_kg, distance_km, volume_cbm=0.0,
+                 rate_per_tonne_km=FREIGHT_RATE_PER_TONNE_KM,
+                 vol_factor=VOLUMETRIC_KG_PER_CBM):
+    """Weight-&-distance freight:
+        chargeable_wt = max(actual_kg, volume_cbm × vol_factor)
+        freight ₹     = (chargeable_wt / 1000) × rate_per_tonne_km × distance_km
+    Returns (freight_inr:int, detail:dict)."""
+    try:
+        km = max(float(distance_km or 0), 0.0)
+    except Exception:
+        km = 0.0
+    ch_kg = chargeable_weight_kg(actual_kg, volume_cbm, vol_factor)
+    tonnes = ch_kg / 1000.0
+    cost = int(round(tonnes * float(rate_per_tonne_km) * km))
+    return cost, {
+        "actual_kg": round(float(actual_kg or 0), 1),
+        "volume_cbm": round(float(volume_cbm or 0), 3),
+        "volumetric_kg": round(float(volume_cbm or 0) * float(vol_factor), 1),
+        "chargeable_kg": round(ch_kg, 1),
+        "chargeable_tonnes": round(tonnes, 3),
+        "rate_per_tonne_km": float(rate_per_tonne_km),
+        "distance_km": round(km, 1),
+        "formula": f"{round(tonnes,3)} t × ₹{rate_per_tonne_km}/t·km × {round(km,1)} km",
+    }
 
 
 # ───────────────────────────────────────────────────────────────────
